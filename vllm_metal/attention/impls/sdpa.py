@@ -785,8 +785,9 @@ def sdpa_forward(
                 q_3d,
                 kernel_k_cache,
                 kernel_v_cache,
+                ctx,
+                None if ctx.kv_groups is None else group_index,
                 raw_block_tables,
-                ctx.context_lens,
                 cache_block_size,
                 cache_kv_heads,
                 attn_scale,
@@ -842,7 +843,7 @@ _GQA_DECODE_PASS1_TEMPLATE = """
     if (t0 >= seq) { return; }
     int t_end = min(t0 + TILE, seq);
 
-    const device bfloat16_t* qg = q + ((kv * GROUP + group) * D);
+    const device STOR_T* qg = q + ((kv * GROUP + group) * D);
 
     float qv[SLICE];
     for (int i = 0; i < SLICE; i++) qv[i] = float(qg[lane * SLICE + i]);
@@ -854,10 +855,10 @@ _GQA_DECODE_PASS1_TEMPLATE = """
     for (int t = t0; t < t_end; t++) {
         int blk = int(block_table[t / BLOCK]);
         int off = t % BLOCK;
-        const device bfloat16_t* krow = k_cache + ((blk * BLOCK + off) * KVH + kv) * D;
+        const device STOR_T* krow = k_cache + ((blk * BLOCK + off) * KVH + kv) * D;
 
         float dot = 0.0f;
-        const device bfloat16_t* kl = krow + lane * SLICE;
+        const device STOR_T* kl = krow + lane * SLICE;
         for (int i = 0; i < SLICE; i++)
             dot += qv[i] * float(kl[i]);
 
@@ -866,7 +867,7 @@ _GQA_DECODE_PASS1_TEMPLATE = """
         float alpha = (m > -1e29f) ? exp(m - m_new) : 0.0f;
         float p = exp(s - m_new);
         l = l * alpha + p;
-        const device bfloat16_t* vl = v_cache + ((blk * BLOCK + off) * KVH + kv) * D + lane * SLICE;
+        const device STOR_T* vl = v_cache + ((blk * BLOCK + off) * KVH + kv) * D + lane * SLICE;
         for (int i = 0; i < SLICE; i++)
             acc[i] = acc[i] * alpha + p * float(vl[i]);
         m = m_new;
@@ -902,38 +903,44 @@ _GQA_DECODE_MERGE_TEMPLATE = """
         for (int i = 0; i < SLICE; i++) acc[i] += a[i] * w;
     }
     float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
-    device bfloat16_t* o = out + (size_t)hg * D + lane * SLICE;
-    for (int i = 0; i < SLICE; i++) o[i] = bfloat16_t(acc[i] * inv);
+    device STOR_T* o = out + (size_t)hg * D + lane * SLICE;
+    for (int i = 0; i < SLICE; i++) o[i] = STOR_T(acc[i] * inv);
 """
 
 _GQA_TILE = 128
 _gqa_kernel_cache: dict = {}
 
 
-def _gqa_decode_kernels(kv_heads: int, group: int, dim: int, block: int, scale: float):
-    import mlx.core as mx
-
-    key = (kv_heads, group, dim, block, scale)
+def _gqa_decode_kernels(
+    kv_heads: int, group: int, dim: int, block: int, scale: float, dtype
+):
+    key = (kv_heads, group, dim, block, scale, dtype)
     kernels = _gqa_kernel_cache.get(key)
     if kernels is not None:
         return kernels
     if dim % 32:
         raise ValueError("head dim must be divisible by 32")
+    if dtype == mx.bfloat16:
+        stor_t, tag = "bfloat16_t", "bf16"
+    elif dtype == mx.float16:
+        stor_t, tag = "float16_t", "fp16"
+    else:
+        raise ValueError(f"unsupported storage dtype {dtype}")
     defines = (
         f"#define D {dim}\n#define SLICE {dim // 32}\n#define KVH {kv_heads}\n"
         f"#define GROUP {group}\n#define BLOCK {block}\n#define TILE {_GQA_TILE}\n"
-        f"#define SCALE {scale!r}f\n"
+        f"#define SCALE {scale!r}f\n#define STOR_T {stor_t}\n"
     )
     header = _GQA_DECODE_HEADER + defines
     pass1 = mx.fast.metal_kernel(
-        name=f"vllm_metal_gqa_decode_p1_k{kv_heads}g{group}d{dim}b{block}",
+        name=f"vllm_metal_gqa_decode_p1_k{kv_heads}g{group}d{dim}b{block}_{tag}",
         input_names=["q", "k_cache", "v_cache", "block_table", "seq"],
         output_names=["partial_m", "partial_l", "partial_acc"],
         header=header,
         source=_GQA_DECODE_PASS1_TEMPLATE,
     )
     merge = mx.fast.metal_kernel(
-        name=f"vllm_metal_gqa_decode_mg_k{kv_heads}g{group}d{dim}",
+        name=f"vllm_metal_gqa_decode_mg_k{kv_heads}g{group}d{dim}_{tag}",
         input_names=["partial_m", "partial_l", "partial_acc", "seq"],
         output_names=["out"],
         header=header,
@@ -945,45 +952,62 @@ def _gqa_decode_kernels(kv_heads: int, group: int, dim: int, block: int, scale: 
 
 
 _NATIVE_FP_STATS = {"hit": 0, "miss": {}}
-_SDPA_LDIST = {}
 
 
 def _native_fp_miss(reason: str) -> None:
     _NATIVE_FP_STATS["miss"][reason] = _NATIVE_FP_STATS["miss"].get(reason, 0) + 1
 
 
-_table_arr_cache: dict = {}
+@dataclass(frozen=True, eq=False)
+class _NativeDecodePlan:
+    """Per-forward dispatch decision for the native decode fast path.
 
-
-def _table_array_cache(raw_block_tables, cache_block_size):
-    """mx.array for the first sequence's block table, cached per forward step.
-
-    The same host list object is shared by every layer of one forward, so
-    keying on ``id`` lets the H2D upload happen once per step instead of once
-    per layer per token. The list object dies with the request's scheduler
-    state, so ids cannot be confused across steps in practice; the first
-    element is stored for a cheap sanity check.
+    The block table and context length only change between forward steps, so
+    the contiguity scan and the block-table H2D upload run once per step (on
+    the first attention layer) and are memoized on the paged context — the
+    per-layer hot path is a dict lookup instead of an O(blocks) list compare
+    plus an upload per layer. ``eq=False``: identity comparison only (the
+    default ``__eq__`` would compare mx arrays, which raises on ``bool()``).
     """
-    import mlx.core as mx
 
-    tbl = raw_block_tables[0]
-    key = id(tbl)
-    hit = _table_arr_cache.get(key)
-    if hit is not None and hit[0] == tbl[0] and hit[2] == len(tbl):
-        return hit[1]
-    arr = mx.array(tbl, dtype=mx.int32)
-    _table_arr_cache[key] = (tbl[0], arr, len(tbl))
-    if len(_table_arr_cache) > 64:
-        _table_arr_cache.clear()
-    return arr
+    seq: int  # context length of the single sequence (includes current token)
+    n_blocks: int  # blocks covered by the sequence's run
+    contig_first: int  # first physical block when the run is contiguous, else -1
+    table_arr: mx.array | None  # raw block-table upload when non-contiguous
+
+
+def _native_decode_plan(
+    ctx: PagedAttentionContext,
+    group_index: int | None,
+    raw_block_tables: list[list[int]],
+    cache_block_size: int,
+) -> _NativeDecodePlan:
+    key = ("native_decode", group_index, cache_block_size)
+    plan = ctx.kernel_metadata_cache.get(key)
+    if plan is None:
+        seq = ctx.context_lens[0]
+        table = raw_block_tables[0]
+        n_blocks = (seq + cache_block_size - 1) // cache_block_size
+        contig_first = -1
+        table_arr = None
+        if n_blocks <= len(table):
+            first = table[0]
+            if table[:n_blocks] == list(range(first, first + n_blocks)):
+                contig_first = first
+            else:
+                table_arr = mx.array(table, dtype=mx.int32)
+        plan = _NativeDecodePlan(seq, n_blocks, contig_first, table_arr)
+        ctx.kernel_metadata_cache[key] = plan
+    return plan
 
 
 def _native_sdpa_decode_fast_path(
     q_3d,
     k_cache,
     v_cache,
+    ctx: PagedAttentionContext,
+    group_index: int | None,
     raw_block_tables,
-    context_lens,
     cache_block_size,
     cache_kv_heads,
     attn_scale,
@@ -1001,21 +1025,25 @@ def _native_sdpa_decode_fast_path(
     bandwidth (~200 GB/s on M5 Pro) is several times the paged Metal
     kernel's at long contexts, which dominates single-stream decode.
 
-    ``raw_block_tables`` / ``context_lens`` are host-side Python lists, so
-    the contiguity check costs no GPU synchronisation.
+    Non-contiguous runs (hybrid GDN interleave, prefix-cache restores) go
+    through a block-table-driven flash-decode kernel built with
+    ``mx.fast.metal_kernel`` (~190 GB/s), and everything else falls back to
+    the paged kernel.
+
+    The contiguity scan is memoized per forward step on the paged context
+    (see :func:`_native_decode_plan`), so the hot path adds no GPU
+    synchronisation and no per-layer Python rescans.
 
     Returns the attention output ``(L, heads, cache_head_dim)`` or ``None``
     when the fast path does not apply (falls back to the paged kernel).
     """
-    import mlx.core as mx
-
     from vllm_metal import envs
 
     if not envs.VLLM_METAL_NATIVE_SDPA_DECODE:
         return None
     if (
         q_3d.shape[0] != 1  # decode single token
-        or len(context_lens) != 1  # single sequence in the batch
+        or len(ctx.context_lens) != 1  # single sequence in the batch
         or attn_softcap  # softcap unsupported on the native path
         or sinks is not None
         # No-window layers use the sentinel -1 (see kv_cache.py); only a real
@@ -1030,26 +1058,21 @@ def _native_sdpa_decode_fast_path(
         _native_fp_miss("conditions")
         return None
 
-    seq = int(context_lens[0])
-    table = raw_block_tables[0]
-    n_blocks_needed = (seq + cache_block_size - 1) // cache_block_size
-    if n_blocks_needed > len(table):
-        _native_fp_miss("table_short")
-        return None
-    run = table[:n_blocks_needed]
-    first = run[0]
-
     heads = q_3d.shape[1]
     if heads % cache_kv_heads:
+        _native_fp_miss("gqa")
         return None
     group = heads // cache_kv_heads
     dim = q_3d.shape[2]
 
-    if run == list(range(first, first + n_blocks_needed)):
+    plan = _native_decode_plan(ctx, group_index, raw_block_tables, cache_block_size)
+    seq = plan.seq
+
+    if plan.contig_first >= 0:
         # Contiguous run: zero-copy strided views straight into native SDPA.
         flat_k = k_cache.reshape(-1, cache_kv_heads, k_cache.shape[-1])
         flat_v = v_cache.reshape(-1, cache_kv_heads, v_cache.shape[-1])
-        row0 = first * cache_block_size
+        row0 = plan.contig_first * cache_block_size
         k_view = flat_k[row0 : row0 + seq].transpose(1, 0, 2)[:, None]
         v_view = flat_v[row0 : row0 + seq].transpose(1, 0, 2)[:, None]
         q_sdpa = q_3d.reshape(cache_kv_heads, group, 1, dim)
@@ -1061,30 +1084,34 @@ def _native_sdpa_decode_fast_path(
 
     # Non-contiguous run (hybrid GDN interleave): custom flash-decode kernel
     # over the block table.
+    if plan.table_arr is None:
+        _native_fp_miss("table_short")
+        return None
     try:
-        block_arr = _table_array_cache(raw_block_tables, cache_block_size)
         pass1, merge = _gqa_decode_kernels(
-            cache_kv_heads, group, dim, cache_block_size, float(attn_scale)
+            cache_kv_heads, group, dim, cache_block_size, float(attn_scale), q_3d.dtype
         )
         nt = (seq + _GQA_TILE - 1) // _GQA_TILE
         q = q_3d.reshape(cache_kv_heads * group, dim)
         pm, pl, pacc = pass1(
-            inputs=[q, k_cache, v_cache, block_arr, seq],
+            inputs=[q, k_cache, v_cache, plan.table_arr, seq],
             output_shapes=[
                 (nt, cache_kv_heads, group),
                 (nt, cache_kv_heads, group),
                 (nt, cache_kv_heads, group, dim),
             ],
             output_dtypes=[mx.float32, mx.float32, mx.float32],
-            grid=(nt, cache_kv_heads, 1),
+            # grid is in threads (mx.fast.metal_kernel convention): one
+            # threadgroup per (tile, kv_head), each with `group` simdgroups.
+            grid=(nt * 32, cache_kv_heads * group, 1),
             threadgroup=(32, group, 1),
             stream=mx.gpu,
         )
         out = merge(
             inputs=[pm, pl, pacc, seq],
             output_shapes=[(cache_kv_heads * group, dim)],
-            output_dtypes=[mx.bfloat16 if q.dtype == mx.bfloat16 else mx.float16],
-            grid=(cache_kv_heads * group, 1, 1),
+            output_dtypes=[q_3d.dtype],
+            grid=(cache_kv_heads * group * 32, 1, 1),
             threadgroup=(32, 1, 1),
             stream=mx.gpu,
         )[0]

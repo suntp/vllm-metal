@@ -95,13 +95,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAL_MLA_KERNEL": lambda: os.getenv("VLLM_METAL_MLA_KERNEL", "0") == "1",
     # Emergency override for automatic M5 NAX prefill attention.
     "VLLM_METAL_DISABLE_NAX": lambda: os.getenv("VLLM_METAL_DISABLE_NAX", "0") == "1",
-    # Route single-sequence decode attention through MLX's native SDPA
-    # (zero-copy strided view over the paged cache) instead of the paged
-    # Metal kernel. The native kernel reaches ~200GB/s effective KV scan
-    # bandwidth vs ~40GB/s for the paged kernel at long contexts, and is
-    # only taken when the sequence's blocks are physically contiguous
-    # (the common single-request case). Set to "0" to force the paged
-    # kernel everywhere.
+    # Route single-sequence decode attention through faster paths instead of
+    # the paged Metal kernel: contiguous block runs go to MLX's native SDPA
+    # via zero-copy strided views (~200GB/s effective KV-scan bandwidth vs
+    # ~40GB/s for the paged kernel at long contexts), non-contiguous runs
+    # (hybrid GDN interleave) go through a block-table-driven flash-decode
+    # kernel (~190GB/s). Set to "0" to force the paged kernel everywhere.
     "VLLM_METAL_NATIVE_SDPA_DECODE": lambda: (
         os.getenv("VLLM_METAL_NATIVE_SDPA_DECODE", "1") == "1"
     ),
