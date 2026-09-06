@@ -817,6 +817,7 @@ def sdpa_forward(
             quant_type=kv_cache.k_quant,
             v_bits=kv_cache.v_bits,
             window_seqlen_q=ctx.verify_window_q,
+            num_decode_requests=ctx.num_decode_requests,
         )
     else:
         ops.paged_attention_primitive(
@@ -835,6 +836,7 @@ def sdpa_forward(
             out,
             window_seqlen_q=ctx.verify_window_q,
             sinks=sinks,
+            num_decode_requests=ctx.num_decode_requests,
         )
 
     # Gemma 4 vision: rows of image blocks attend bidirectionally on the
