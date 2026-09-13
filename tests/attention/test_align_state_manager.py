@@ -228,7 +228,7 @@ class TestAlignStateManager:
         # shrinks, so allocating first would grow the pool to cover the
         # dst that this step's about-to-be-freed slot could have served.
         cache = _make_cache(num_blocks=8, initial_blocks=0)
-        manager = AlignGDNStateManager(cache, BLOCK)
+        manager = AlignStateManager(cache, BLOCK)
         self._populate(manager, ["req-A"], [[[2]]], [(3, 1)])
         self._populate(manager, ["req-B"], [[[3]]], [(3, 1)])
         assert manager.occupied_slots == 2
@@ -249,7 +249,7 @@ class TestAlignStateManager:
         # before that slot's block retires inside the same CoW step — the
         # drain settles writes into rows about to be handed out again.
         cache = _make_cache(num_blocks=8, initial_blocks=0)
-        manager = AlignGDNStateManager(cache, BLOCK)
+        manager = AlignStateManager(cache, BLOCK)
         self._populate(manager, ["req-A"], [[[2]]], [(3, 1)])
         self._populate(manager, ["req-B"], [[[3]]], [(3, 1)])
         _fill_slab(cache, 0, manager.slot_for(3), 5.0)
@@ -278,7 +278,7 @@ class TestAlignStateManager:
         cache = _make_cache(num_layers=2, num_blocks=8, initial_blocks=0)
         cache.set_layer_layout([0, 1], [0, 0])
         assert cache.num_state_pools == 1
-        manager = AlignGDNStateManager(cache, BLOCK)
+        manager = AlignStateManager(cache, BLOCK)
         self._populate(manager, ["req-A"], [[[2, 6], [3, 4]]], [(4, 1)])
         freed_slot = manager.slot_for(3)
         _fill_slab(cache, 0, manager.slot_for(2), 5.0)
