@@ -2563,14 +2563,11 @@ class MetalModelRunner:
             raise RuntimeError(
                 "bounded GDN state pool requires scheduler state catalog"
             )
-        if runtime.requires_state_cache_barrier(state_step):
-            # Resolving here fills the pipeline's single cached-output slot.
-            # The engine consumes that old output only after this step, so
-            # this step must sample synchronously instead of submitting a new
-            # deferred sample into the still-occupied slot.
-            self._decode_pipeline.begin_step(
-                PipelineGateDecision(eligible=False, reason="state cache retirement")
-            )
+        # Retirement drains state writes and fences the GPU before slot reuse.
+        # Keep the independent pending token buffer in the decode pipeline:
+        # resolving it here would fill the single cached-output slot early and
+        # force this step onto a different sampling path. Normal submit/resolve
+        # ordering still owns token delivery; it never reads retired GDN rows.
         runtime.prepare_state_cache_step(state_step)
 
     def execute_model(

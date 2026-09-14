@@ -397,19 +397,20 @@ class TestHybridAlignRuntime:
                 metal_state_cache=StateCacheStep(2, ()),
             ),
         )
-        runner._decode_pipeline.begin_step.assert_called_once()
-        assert not runner._decode_pipeline.begin_step.call_args.args[0].eligible
+        runner._decode_pipeline.begin_step.assert_not_called()
         assert runtime.state_manager.occupied_slots == 0
         assert runtime.state_cache_telemetry()["retired_slots"] == 2
 
-    def test_retirement_flushes_pending_sample_without_reentering_deferred_path(
+    def test_retirement_preserves_pending_tokens_and_future_delivery_order(
         self, monkeypatch
     ) -> None:
         # Exercise the real pipeline owner without allocating GPU arrays.
-        # Resolving early while leaving step_eligible=True used to make the
-        # next submit fail on its occupied single resolved-output slot.
+        # State-slot reuse must not resolve an independent token output early:
+        # the engine consumes step 1's future only after step 2 is submitted.
         from vllm_metal.v1.decode_pipeline import (
+            PENDING_TOKEN_PLACEHOLDER,
             DecodePipeline,
+            PendingBackfillEntry,
             PendingSampleStep,
             PipelineGateDecision,
         )
@@ -423,35 +424,51 @@ class TestHybridAlignRuntime:
         runner = SimpleNamespace(
             _paged_attention_runtime=runtime, _decode_pipeline=pipeline
         )
-        first_output = object()
+        first_output = Mock()
+        first_state = SimpleNamespace(token_ids=[PENDING_TOKEN_PLACEHOLDER])
+        requests = {"finished": first_state}
         first_step = PendingSampleStep(
-            tokens=SimpleNamespace(tolist=lambda: []),
-            entries=(),
+            tokens=SimpleNamespace(tolist=lambda: [42]),
+            entries=(
+                PendingBackfillEntry(
+                    req_id="finished",
+                    state=first_state,
+                    row=0,
+                    token_index=0,
+                    output_idx=0,
+                ),
+            ),
             batch=first_output,
             scheduler_output=SimpleNamespace(),
         )
         pipeline.begin_step(PipelineGateDecision(True, "eligible"))
         first_future = pipeline.submit(first_step)
         pipeline.begin_step(PipelineGateDecision(True, "eligible"))
+        del requests["finished"]  # pending entry owns the direct state reference
 
         MetalModelRunner._prepare_state_cache_step(
             runner, SimpleNamespace(metal_state_cache=StateCacheStep(2, ()))
         )
 
-        assert not pipeline.step_eligible  # runner.sample_tokens uses the sync path
-        assert not pipeline.has_pending
-        runtime.prepare_state_cache_step.assert_called_once()
-        assert first_future.get_output() is first_output
-
-        # Subsequent steps without retirement retain normal deferred sampling.
-        runtime.requires_state_cache_barrier.return_value = False
-        pipeline.begin_step(PipelineGateDecision(True, "eligible"))
-        MetalModelRunner._prepare_state_cache_step(
-            runner, SimpleNamespace(metal_state_cache=StateCacheStep(3, ()))
-        )
         assert pipeline.step_eligible
-        next_future = pipeline.submit(first_step)
-        assert next_future.get_output() is first_output
+        assert pipeline.has_pending
+        assert pipeline._pending is first_step
+        assert pipeline._resolved is None
+        assert first_state.token_ids == [PENDING_TOKEN_PLACEHOLDER]
+        runtime.prepare_state_cache_step.assert_called_once()
+
+        second_output = object()
+        second_step = PendingSampleStep(
+            tokens=SimpleNamespace(tolist=lambda: []),
+            entries=(),
+            batch=second_output,
+            scheduler_output=SimpleNamespace(),
+        )
+        next_future = pipeline.submit(second_step)
+        assert first_state.token_ids == [42]
+        first_output.set_output.assert_called_once_with(0, [42])
+        assert first_future.get_output() is first_output
+        assert next_future.get_output() is second_output
 
 
 class TestBoundedAlignStateManager:

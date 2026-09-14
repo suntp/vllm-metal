@@ -92,8 +92,8 @@ order. Eviction removes every prefix-hash alias. Active requests, pending GPU
 work and the checkpoint selected for an incoming restore remain protected.
 Worker steps carry ordered block generations, so an old global block ID cannot
 silently restore the state of its next owner. State-slot reuse settles pending
-writes; a retirement step temporarily uses synchronous sampling before the
-normal decode pipeline resumes.
+state writes and waits for the GPU. The independent pending token buffer keeps
+its normal decode-pipeline delivery order and sampling path.
 
 Each running request reserves room for its completed source plus one new state
 per possible in-flight batch, across all GDN groups. The effective running
