@@ -1,14 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import mlx.core as mx
 import numpy as np
+import pytest
 
 from tests.stub_runner import make_gdn_hybrid_plan
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.state import AlignStateManager
+from vllm_metal.state_budget import StateCacheStep
 
 BLOCK = 4
 
@@ -300,7 +305,7 @@ class TestAlignStateManager:
 
 
 class TestHybridAlignRuntime:
-    def _make_runtime(self) -> HybridPagedAttentionRuntime:
+    def _make_runtime(self, capacity=None) -> HybridPagedAttentionRuntime:
         return HybridPagedAttentionRuntime(
             hybrid_plan=make_gdn_hybrid_plan(
                 4,
@@ -317,6 +322,7 @@ class TestHybridAlignRuntime:
             block_size=BLOCK,
             dtype=mx.float32,
             mamba_cache_mode="align",
+            state_slot_capacity=capacity,
         )
 
     def test_adopts_shared_layout_before_materializing_state(self) -> None:
@@ -339,3 +345,258 @@ class TestHybridAlignRuntime:
             runtime.state_cache.recurrent_states[0]
             is runtime.state_cache.recurrent_states[1]
         )
+
+    def test_bounded_pool_preallocates_only_after_adopting_shared_layout(self) -> None:
+        runtime = self._make_runtime(capacity=3)
+        runtime.initialize(num_blocks=200)
+        assert runtime.state_cache.max_seqs == 3
+        assert runtime.state_cache.allocated_seqs == 0
+        assert runtime.num_blocks() == 200
+
+        runtime.adopt_scheduler_group(
+            0,
+            BLOCK,
+            state_group_indices=(1, 2),
+            layer_group_ordinals=[0, 1],
+            layer_pool_ordinals=[0, 0],
+        )
+        cache = runtime.state_cache
+        assert cache.num_state_pools == 1
+        assert cache.allocated_seqs == 3
+        assert cache.conv_states[0] is cache.conv_states[1]
+        expected_bytes = cache.conv_states[0].nbytes + cache.recurrent_states[0].nbytes
+        assert runtime.state_cache_telemetry()["stable_bytes"] == expected_bytes
+
+    def test_runner_consumes_cleanup_only_catalog_and_requires_metadata(self) -> None:
+        from vllm_metal.v1.model_runner import MetalModelRunner
+
+        runtime = self._make_runtime(capacity=2)
+        runtime.initialize(num_blocks=8)
+        runtime.adopt_scheduler_group(
+            0,
+            BLOCK,
+            state_group_indices=(1, 2),
+            layer_group_ordinals=[0, 1],
+            layer_pool_ordinals=[0, 0],
+        )
+        runner = SimpleNamespace(
+            _paged_attention_runtime=runtime, _decode_pipeline=Mock()
+        )
+        with pytest.raises(RuntimeError, match="requires scheduler state catalog"):
+            MetalModelRunner._prepare_state_cache_step(runner, SimpleNamespace())
+
+        runtime.prepare_state_cache_step(StateCacheStep(1, ((5, 1), (6, 1))))
+        TestAlignStateManager()._populate(
+            runtime.state_manager, ["a"], [[[5], [6]]], [(0, 1)]
+        )
+        assert runtime.state_manager.occupied_slots == 2
+        MetalModelRunner._prepare_state_cache_step(
+            runner,
+            SimpleNamespace(
+                total_num_scheduled_tokens=0,
+                metal_state_cache=StateCacheStep(2, ()),
+            ),
+        )
+        runner._decode_pipeline.begin_step.assert_called_once()
+        assert not runner._decode_pipeline.begin_step.call_args.args[0].eligible
+        assert runtime.state_manager.occupied_slots == 0
+        assert runtime.state_cache_telemetry()["retired_slots"] == 2
+
+    def test_retirement_flushes_pending_sample_without_reentering_deferred_path(
+        self, monkeypatch
+    ) -> None:
+        # Exercise the real pipeline owner without allocating GPU arrays.
+        # Resolving early while leaving step_eligible=True used to make the
+        # next submit fail on its occupied single resolved-output slot.
+        from vllm_metal.v1.decode_pipeline import (
+            DecodePipeline,
+            PendingSampleStep,
+            PipelineGateDecision,
+        )
+        from vllm_metal.v1.model_runner import MetalModelRunner
+
+        monkeypatch.setattr(mx, "eval", lambda *args: None)
+        pipeline = DecodePipeline(build_output=lambda batch: batch, validate=Mock())
+        runtime = Mock(spec=HybridPagedAttentionRuntime)
+        runtime.state_slot_capacity = 2
+        runtime.requires_state_cache_barrier.return_value = True
+        runner = SimpleNamespace(
+            _paged_attention_runtime=runtime, _decode_pipeline=pipeline
+        )
+        first_output = object()
+        first_step = PendingSampleStep(
+            tokens=SimpleNamespace(tolist=lambda: []),
+            entries=(),
+            batch=first_output,
+            scheduler_output=SimpleNamespace(),
+        )
+        pipeline.begin_step(PipelineGateDecision(True, "eligible"))
+        first_future = pipeline.submit(first_step)
+        pipeline.begin_step(PipelineGateDecision(True, "eligible"))
+
+        MetalModelRunner._prepare_state_cache_step(
+            runner, SimpleNamespace(metal_state_cache=StateCacheStep(2, ()))
+        )
+
+        assert not pipeline.step_eligible  # runner.sample_tokens uses the sync path
+        assert not pipeline.has_pending
+        runtime.prepare_state_cache_step.assert_called_once()
+        assert first_future.get_output() is first_output
+
+        # Subsequent steps without retirement retain normal deferred sampling.
+        runtime.requires_state_cache_barrier.return_value = False
+        pipeline.begin_step(PipelineGateDecision(True, "eligible"))
+        MetalModelRunner._prepare_state_cache_step(
+            runner, SimpleNamespace(metal_state_cache=StateCacheStep(3, ()))
+        )
+        assert pipeline.step_eligible
+        next_future = pipeline.submit(first_step)
+        assert next_future.get_output() is first_output
+
+
+class TestBoundedAlignStateManager:
+    _populate = TestAlignStateManager._populate
+
+    def _make_manager(self, capacity=2, shared=False):
+        cache = _make_cache(num_blocks=capacity)
+        if shared:
+            cache.set_layer_layout([0, 1], [0, 0])
+        manager = AlignStateManager(cache, BLOCK, state_slot_capacity=capacity)
+        return cache, manager
+
+    def test_catalog_only_advertises_blocks_and_does_not_create_restore_sources(self):
+        cache, manager = self._make_manager()
+        manager.prepare_state_cache_step(StateCacheStep(1, ((100, 1), (200, 1))))
+        assert manager.resident_blocks == 2
+        assert manager.occupied_slots == 0
+        with pytest.raises(RuntimeError, match="missing state source"):
+            self._populate(manager, ["restore"], [[[100, 200]]], [(4, 1)])
+        assert manager.occupied_slots == 0
+        assert cache.allocated_seqs == 2
+
+    def test_targets_must_be_in_catalog(self):
+        _, manager = self._make_manager()
+        with pytest.raises(RuntimeError, match="absent from scheduler catalog"):
+            self._populate(manager, ["a"], [[[100]]], [(0, 1)])
+        manager.prepare_state_cache_step(StateCacheStep(1, ((100, 1),)))
+        with pytest.raises(RuntimeError, match="absent from scheduler catalog"):
+            self._populate(manager, ["a"], [[[200]]], [(0, 1)])
+        assert manager.occupied_slots == 0
+
+    def test_crossing_preserves_live_source_and_capacity(self):
+        cache, manager = self._make_manager()
+        manager.prepare_state_cache_step(StateCacheStep(1, ((100, 1),)))
+        self._populate(manager, ["a"], [[[100]]], [(0, 4)])
+        _fill_slab(cache, 0, manager.slot_for(100), 7.0)
+        manager.prepare_state_cache_step(StateCacheStep(2, ((100, 1), (200, 1))))
+        self._populate(manager, ["a"], [[[100, 200]]], [(4, 1)])
+        for block in (100, 200):
+            conv, rec = _slab(cache, 0, manager.slot_for(block))
+            np.testing.assert_array_equal(conv, 7.0)
+            np.testing.assert_array_equal(rec, 7.0)
+        assert cache.allocated_seqs == 2
+
+    def test_full_pool_retirement_reuses_slot_without_growth(self):
+        cache, manager = self._make_manager()
+        manager.prepare_state_cache_step(StateCacheStep(1, ((5, 1), (6, 1))))
+        self._populate(manager, ["a", "b"], [[[5]], [[6]]], [(0, 1), (0, 1)])
+        freed_slot = manager.slot_for(5)
+        _fill_slab(cache, 0, freed_slot, 13.0)
+        manager.prepare_state_cache_step(StateCacheStep(2, ((6, 1), (900, 1))))
+        self._populate(manager, ["new"], [[[900]]], [(0, 1)])
+        assert manager.slot_for(5) is None
+        assert manager.slot_for(900) == freed_slot
+        assert manager.retired_slots == 1
+        assert manager.occupied_slots == cache.allocated_seqs == 2
+        conv, rec = _slab(cache, 0, freed_slot)
+        np.testing.assert_array_equal(conv, 0.0)
+        np.testing.assert_array_equal(rec, 0.0)
+
+    def test_generation_change_cannot_restore_previous_lifes_bytes(self):
+        cache, manager = self._make_manager()
+        manager.prepare_state_cache_step(StateCacheStep(1, ((5, 1),)))
+        self._populate(manager, ["old"], [[[5]]], [(0, 1)])
+        _fill_slab(cache, 0, manager.slot_for(5), 17.0)
+        manager.prepare_state_cache_step(StateCacheStep(2, ((5, 2),)))
+        with pytest.raises(RuntimeError, match="missing state source"):
+            self._populate(manager, ["wrong-restore"], [[[5]]], [(1, 1)])
+        self._populate(manager, ["new"], [[[5]]], [(0, 1)])
+        conv, rec = _slab(cache, 0, manager.slot_for(5))
+        np.testing.assert_array_equal(conv, 0.0)
+        np.testing.assert_array_equal(rec, 0.0)
+
+    @pytest.mark.parametrize("sequence", [0, 1, 3])
+    def test_catalog_sequence_is_strictly_ordered(self, sequence):
+        _, manager = self._make_manager()
+        manager.prepare_state_cache_step(StateCacheStep(1, ((5, 1),)))
+        with pytest.raises(RuntimeError, match="out-of-order"):
+            manager.prepare_state_cache_step(StateCacheStep(sequence, ()))
+        assert manager.step_sequence == 1
+        assert manager.resident_blocks == 1
+
+    def test_stale_generation_and_resurrection_are_rejected(self):
+        _, manager = self._make_manager()
+        manager.prepare_state_cache_step(StateCacheStep(1, ((5, 2),)))
+        with pytest.raises(RuntimeError, match="stale state generation"):
+            manager.prepare_state_cache_step(StateCacheStep(2, ((5, 1),)))
+        manager.prepare_state_cache_step(StateCacheStep(2, ()))
+        with pytest.raises(RuntimeError, match="stale state generation"):
+            manager.prepare_state_cache_step(StateCacheStep(3, ((5, 2),)))
+        manager.prepare_state_cache_step(StateCacheStep(3, ((5, 3),)))
+
+    def test_oversized_catalog_is_rejected_before_retirement(self):
+        _, manager = self._make_manager()
+        manager.prepare_state_cache_step(StateCacheStep(1, ((5, 1),)))
+        self._populate(manager, ["a"], [[[5]]], [(0, 1)])
+        slot = manager.slot_for(5)
+        with pytest.raises(RuntimeError, match="exceeds capacity"):
+            manager.prepare_state_cache_step(
+                StateCacheStep(2, ((6, 1), (7, 1), (8, 1)))
+            )
+        assert manager.slot_for(5) == slot
+        assert manager.step_sequence == 1
+        assert manager.retired_slots == 0
+
+    def test_pending_updates_finish_before_reuse_and_keep_pool_aliases(
+        self, monkeypatch
+    ):
+        cache, manager = self._make_manager(shared=True)
+        manager.prepare_state_cache_step(StateCacheStep(1, ((5, 1), (6, 1))))
+        self._populate(manager, ["a"], [[[5], [6]]], [(0, 1)])
+        retired_slot = manager.slot_for(5)
+        survivor_slot = manager.slot_for(6)
+        _fill_slab(cache, 1, survivor_slot, 11.0)
+        update = mx.full((1,) + cache.recurrent_states[0].shape[1:], 9.0)
+        cache.set_pending_recurrent_state(0, [retired_slot], update)
+        events = []
+        original_sync = mx.synchronize
+
+        def synchronize():
+            assert not cache.has_pending_recurrent_state(0)
+            assert manager.slot_for(5) == retired_slot
+            events.append("fence-before-retirement")
+            original_sync()
+
+        monkeypatch.setattr(mx, "synchronize", synchronize)
+        manager.prepare_state_cache_step(StateCacheStep(2, ((6, 1), (7, 1))))
+        manager.apply_block_copies([(6, 7)])
+        assert manager.slot_for(7) == retired_slot
+        assert events == ["fence-before-retirement"]
+        assert cache.recurrent_states[0] is cache.recurrent_states[1]
+        for layer in (0, 1):
+            conv, rec = _slab(cache, layer, manager.slot_for(7))
+            np.testing.assert_array_equal(conv, 11.0)
+            np.testing.assert_array_equal(rec, 11.0)
+        assert cache.allocated_seqs == 2
+
+    def test_cow_requires_valid_source_and_catalog_destination(self):
+        _, manager = self._make_manager()
+        manager.prepare_state_cache_step(StateCacheStep(1, ((5, 1), (6, 1))))
+        with pytest.raises(RuntimeError, match="missing state source"):
+            manager.apply_block_copies([(5, 6)])
+        self._populate(manager, ["a"], [[[5]]], [(0, 1)])
+        with pytest.raises(RuntimeError, match="absent from scheduler catalog"):
+            manager.apply_block_copies([(5, 7)])
+        manager.apply_block_copies([(100, 200)])
+        assert manager.slot_for(100) is None
+        assert manager.slot_for(200) is None

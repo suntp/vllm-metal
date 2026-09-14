@@ -3,8 +3,8 @@
 
 With ``mamba_cache_mode="align"`` the scheduler's mamba cache groups carry a
 position-indexed block table per request, exactly like upstream: the state
-slab for a request is the block covering its last token, and prefix caching
-checkpoints a slab whenever a scheduler step ends on a block boundary.  This
+slab for a request is the block covering its last token. Prefix retention may
+register a completed slab at an eligible boundary for later reuse. This
 manager owns the two per-step motions upstream runs in
 ``preprocess_state`` (vllm's Triton
 ``preprocess_mamba_align_fused_kernel`` + pre-copy):
@@ -34,6 +34,8 @@ can never be restored from again and the id is safe to forget.  Rebirth of a
 reclaimed slot is always a full overwrite (zero-init or copy-forward) before
 any read, so stale bytes are never observable.
 
+With an explicit state budget, ordered scheduler catalogs replace KV-role
+scanning as the retirement authority and keep a fixed-capacity physical pool.
 Requests never own slabs here — the scheduler's block lifecycle does — so
 release/materialize become no-ops apart from keeping the lazy pending-state
 machinery drained.
@@ -47,6 +49,7 @@ from typing import TYPE_CHECKING
 import mlx.core as mx
 
 from vllm_metal.attention.caches.protocol import PagedStateCache
+from vllm_metal.state_budget import StateCacheStep
 
 if TYPE_CHECKING:
     from vllm_metal.attention.context import PagedAttentionContext
@@ -55,9 +58,27 @@ if TYPE_CHECKING:
 class AlignStateManager:
     """Drive block-indexed state for align-mode prefix caching."""
 
-    def __init__(self, state_cache: PagedStateCache, block_size: int) -> None:
+    def __init__(
+        self,
+        state_cache: PagedStateCache,
+        block_size: int,
+        *,
+        state_slot_capacity: int | None = None,
+    ) -> None:
+        if state_slot_capacity is not None and (
+            type(state_slot_capacity) is not int
+            or state_slot_capacity <= 0
+            or state_slot_capacity != state_cache.max_seqs
+        ):
+            raise ValueError("state slot capacity must match the positive cache limit")
         self._state_cache = state_cache
         self._block_size = block_size
+        self._state_slot_capacity = state_slot_capacity
+        self._resident_generations: dict[int, int] = {}
+        self._generation_of: dict[int, int] = {}
+        self._seen_generations: dict[int, int] = {}
+        self._last_step_sequence = 0
+        self._retired_slots_total = 0
         self._needs_materialize = False
         # Compact indirection: scheduler block id → physical slab slot.  Only
         # ids that actually hold mamba state occupy rows; the pool never grows
@@ -84,14 +105,125 @@ class AlignStateManager:
         """Return the compact slot backing ``block_id`` (None if unmapped)."""
         return self._slot_of.get(block_id)
 
+    @property
+    def retired_slots(self) -> int:
+        """Physical slots retired by authoritative scheduler snapshots."""
+        return self._retired_slots_total
+
+    @property
+    def resident_blocks(self) -> int:
+        """Scheduler leases, including destinations not written yet."""
+        return len(self._resident_generations)
+
+    @property
+    def step_sequence(self) -> int:
+        return self._last_step_sequence
+
+    def requires_state_cache_barrier(self, step: StateCacheStep) -> bool:
+        """Whether applying this catalog can hand a physical slot to a new owner."""
+        resident = dict(step.resident_blocks)
+        return any(
+            resident.get(block_id) != self._generation_of[block_id]
+            for block_id in self._slot_of
+        )
+
+    def prepare_state_cache_step(self, step: StateCacheStep) -> None:
+        """Apply an ordered scheduler catalog before any state reads or writes.
+
+        A block's generation changes whenever its global id is reallocated.
+        Draining and fencing before removing an old mapping prevents a pending
+        compact update from writing into a slot after its next owner acquires it.
+        New catalog entries get slots only when zero-init or a copy writes them;
+        merely advertising a lease must never manufacture a restore source.
+        """
+        capacity = self._state_slot_capacity
+        if capacity is None:
+            raise RuntimeError("state catalogs require a bounded align state pool")
+        if (
+            type(step.sequence) is not int
+            or step.sequence != self._last_step_sequence + 1
+        ):
+            raise RuntimeError(
+                "out-of-order state cache catalog: "
+                f"expected {self._last_step_sequence + 1}, got {step.sequence}"
+            )
+        if self._state_cache.allocated_seqs != capacity:
+            raise RuntimeError("bounded state pool must be fully allocated before use")
+        resident: dict[int, int] = {}
+        for block_id, generation in step.resident_blocks:
+            if (
+                type(block_id) is not int
+                or block_id < 0
+                or type(generation) is not int
+                or generation < 0
+                or block_id in resident
+            ):
+                raise RuntimeError("invalid or duplicate block in state cache catalog")
+            previous = self._seen_generations.get(block_id)
+            if previous is not None and (
+                generation < previous
+                or (
+                    generation == previous
+                    and block_id not in self._resident_generations
+                )
+            ):
+                raise RuntimeError(f"stale state generation for block {block_id}")
+            resident[block_id] = generation
+        if len(resident) > capacity:
+            raise RuntimeError(
+                f"state cache catalog exceeds capacity ({len(resident)} > {capacity})"
+            )
+        retired = [
+            block_id
+            for block_id in self._slot_of
+            if resident.get(block_id) != self._generation_of[block_id]
+        ]
+        if retired:
+            self._state_cache.apply_pending_states()
+            mx.eval(*self._state_cache.updated_state_arrays())
+            mx.synchronize()
+            self._needs_materialize = False
+            for block_id in retired:
+                self._free_slots.append(self._slot_of.pop(block_id))
+                self._generation_of.pop(block_id)
+            self._retired_slots_total += len(retired)
+        self._resident_generations = resident
+        self._seen_generations.update(resident)
+        self._last_step_sequence = step.sequence
+
+    def _require_catalog_block(self, block_id: int) -> None:
+        if (
+            self._state_slot_capacity is not None
+            and block_id not in self._resident_generations
+        ):
+            raise RuntimeError(
+                f"state block {block_id} is absent from scheduler catalog"
+            )
+
+    def _require_state_source(self, block_id: int) -> None:
+        self._require_catalog_block(block_id)
+        if self._state_slot_capacity is not None and (
+            block_id not in self._slot_of
+            or self._generation_of.get(block_id) != self._resident_generations[block_id]
+        ):
+            raise RuntimeError(f"missing state source for block {block_id} generation")
+
     def _alloc_slot(self, block_id: int) -> int:
         """Bind ``block_id`` to a slot, preferring a reclaimed one."""
+        self._require_catalog_block(block_id)
         if self._free_slots:
             slot = self._free_slots.pop()
         else:
+            if (
+                self._state_slot_capacity is not None
+                and self._next_slot >= self._state_slot_capacity
+            ):
+                raise RuntimeError("bounded state slot capacity exhausted")
             slot = self._next_slot
             self._next_slot += 1
         self._slot_of[block_id] = slot
+        if self._state_slot_capacity is not None:
+            self._generation_of[block_id] = self._resident_generations[block_id]
         return slot
 
     def _ensure_slot_capacity(self) -> None:
@@ -100,6 +232,10 @@ class AlignStateManager:
         The cap stays the pool's block count: distinct mamba block ids can
         never exceed it, so the scheduler-visible worst case still fits.
         """
+        if self._state_slot_capacity is not None:
+            if self._state_cache.allocated_seqs != self._state_slot_capacity:
+                raise RuntimeError("bounded state pool capacity changed after startup")
+            return
         if self._next_slot > self._state_cache.allocated_seqs:
             target = min(
                 self._state_cache.max_seqs,
@@ -116,6 +252,12 @@ class AlignStateManager:
         for cached-but-idle mamba blocks are *not* touched: only a role
         change retires a slot, so prefix-cache restores stay intact.
         """
+        if self._state_slot_capacity is not None:
+            if kv_block_ids and set(kv_block_ids).intersection(
+                self._resident_generations
+            ):
+                raise RuntimeError("scheduler state catalog includes a KV-owned block")
+            return
         if not kv_block_ids or not self._slot_of:
             return
         for block_id in set(kv_block_ids).intersection(self._slot_of):
@@ -139,7 +281,18 @@ class AlignStateManager:
         first would grow the pool to cover dst slots that the about-to-be-
         freed ones could have served, stranding the difference.
         """
-        pairs = [(src, dst) for src, dst in block_copies if src in self._slot_of]
+        if self._state_slot_capacity is not None:
+            pairs = [
+                (src, dst)
+                for src, dst in block_copies
+                if src in self._resident_generations
+                or dst in self._resident_generations
+            ]
+            for src, dst in pairs:
+                self._require_state_source(src)
+                self._require_catalog_block(dst)
+        else:
+            pairs = [(src, dst) for src, dst in block_copies if src in self._slot_of]
         if not pairs and not kv_block_ids:
             return
         self._state_cache.apply_pending_states()
@@ -223,12 +376,14 @@ class AlignStateManager:
                         "entries"
                     )
                 dst = row[dst_idx]
+                self._require_catalog_block(dst)
                 dst_ids.append(dst)
                 if num_computed == 0:
                     zero_ids.append(dst)
                     continue
                 src_idx = (num_computed - 1) // self._block_size
                 src = row[src_idx]
+                self._require_state_source(src)
                 if src != dst:
                     copy_src.append(src)
                     copy_dst.append(dst)

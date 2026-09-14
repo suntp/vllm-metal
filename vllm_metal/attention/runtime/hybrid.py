@@ -26,6 +26,7 @@ from vllm_metal.attention.runtime.base import PagedAttentionRuntimeBase
 from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.state import AlignStateManager, RequestStateManager
 from vllm_metal.pytorch_backend.tensor_bridge import TORCH_TO_MLX_DTYPE
+from vllm_metal.state_budget import StateCacheStep
 
 logger = init_logger(__name__)
 
@@ -46,6 +47,8 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         dtype: mx.Dtype,
         # Scheduler-side mamba caching strategy.
         mamba_cache_mode: str = "none",
+        # Independent physical state limit; None preserves the legacy budget.
+        state_slot_capacity: int | None = None,
         # TurboQuant (SDPA layers only)
         turboquant: bool = False,
         k_quant: str | None = None,
@@ -63,6 +66,14 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
                 f"family (supported: {state_family.supported_cache_modes})"
             )
         self._mamba_cache_mode = mamba_cache_mode
+        if state_slot_capacity is not None and (
+            type(state_slot_capacity) is not int
+            or state_slot_capacity <= 0
+            or mamba_cache_mode != "align"
+            or state_family.label != "gdn"
+        ):
+            raise ValueError("a positive state slot capacity requires GDN align mode")
+        self._state_slot_capacity = state_slot_capacity
 
         # SDPA params
         self._num_kv_heads = num_kv_heads
@@ -95,13 +106,19 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         # Align-mode slabs sit behind the state manager's compact
         # block-id → slot indirection: a physical row exists per distinct
         # mamba block holding state (live or cached), never per block-id
-        # span of the pool.  The paged plan still charges every block for
-        # its state bytes (admission worst case — any block can become a
-        # mamba block), but the pool materializes lazily by slot count and
-        # reclaims slots when ids move back to full-attention groups.
+        # span of the pool. By default the paged plan charges every block
+        # for state bytes, and rows materialize on demand. A configured state
+        # budget instead fixes this pool's capacity independently of KV blocks;
+        # it is materialized once below, after shared layout adoption.
         # None mode keeps one slab per resident request and grows on demand.
         align = self._mamba_cache_mode == "align"
-        state_slots = num_blocks if align else self._max_num_seqs
+        state_slots = (
+            self._state_slot_capacity
+            if self._state_slot_capacity is not None
+            else num_blocks
+            if align
+            else self._max_num_seqs
+        )
         self._state_cache = self._hybrid_plan.family.create_state_cache(
             geometry=self._hybrid_plan.geometry,
             num_layers=self._hybrid_plan.layers.num_state,
@@ -112,7 +129,11 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
             ),
         )
         self._state_manager = (
-            AlignStateManager(self._state_cache, self._block_size)
+            AlignStateManager(
+                self._state_cache,
+                self._block_size,
+                state_slot_capacity=self._state_slot_capacity,
+            )
             if align
             else RequestStateManager(self._state_cache)
         )
@@ -158,6 +179,10 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         self._scheduler_group_indices = (group_index,)
         self._group_block_sizes = (block_size,)
         self._state_group_indices = tuple(state_group_indices)
+        if self._state_slot_capacity is not None and (
+            layer_group_ordinals is None or layer_pool_ordinals is None
+        ):
+            raise RuntimeError("bounded state pools require the scheduler pool layout")
         if layer_group_ordinals is not None:
             pool_ordinals = (
                 layer_pool_ordinals
@@ -165,6 +190,54 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
                 else list(range(len(layer_group_ordinals)))
             )
             self.state_cache.set_layer_layout(layer_group_ordinals, pool_ordinals)
+        if self._state_slot_capacity is not None:
+            # Adopt aliases first: otherwise this would allocate one pool per
+            # layer, exceeding the budget before unused siblings are released.
+            self.state_cache.ensure_capacity(self._state_slot_capacity)
+            logger.info("Bounded GDN state cache: %s", self.state_cache_telemetry())
+
+    @property
+    def state_slot_capacity(self) -> int | None:
+        return self._state_slot_capacity
+
+    def requires_state_cache_barrier(self, step: StateCacheStep) -> bool:
+        manager = self.state_manager
+        return isinstance(
+            manager, AlignStateManager
+        ) and manager.requires_state_cache_barrier(step)
+
+    def prepare_state_cache_step(self, step: StateCacheStep) -> None:
+        if self._state_slot_capacity is None:
+            raise RuntimeError("state catalogs require a bounded GDN runtime")
+        manager = self.state_manager
+        assert isinstance(manager, AlignStateManager)
+        manager.prepare_state_cache_step(step)
+
+    def state_cache_telemetry(self) -> dict[str, int]:
+        """Stable pool bytes exclude pending updates and forward temporaries."""
+        cache = self.state_cache
+        manager = self.state_manager
+        return {
+            "stable_bytes": (
+                cache.allocated_seqs
+                * cache.num_state_pools
+                * self._hybrid_plan.state_bytes_per_layer()
+            ),
+            "capacity_slots": cache.max_seqs,
+            "allocated_slots": cache.allocated_seqs,
+            "occupied_slots": manager.occupied_slots
+            if isinstance(manager, AlignStateManager)
+            else 0,
+            "resident_blocks": manager.resident_blocks
+            if isinstance(manager, AlignStateManager)
+            else 0,
+            "retired_slots": manager.retired_slots
+            if isinstance(manager, AlignStateManager)
+            else 0,
+            "sequence": manager.step_sequence
+            if isinstance(manager, AlignStateManager)
+            else 0,
+        }
 
     def kv_scheduler_group_indices(self) -> tuple[int, ...]:
         """Return scheduler KV groups consumed by SDPA layers."""

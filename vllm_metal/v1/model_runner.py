@@ -51,6 +51,7 @@ from vllm_metal.attention.context import (
     prepare_grouped,
 )
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
+from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
 from vllm_metal.config import get_config
@@ -63,6 +64,7 @@ from vllm_metal.distributed import (
 from vllm_metal.metal.constants import PA_WINDOW_MAX_HEAD_SIZE
 from vllm_metal.multimodal import merge_multimodal_embeddings
 from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
+from vllm_metal.state_budget import StateCacheStep
 from vllm_metal.v1.cache_policy import ModelCachePolicy
 from vllm_metal.v1.decode_pipeline import (
     PENDING_TOKEN_PLACEHOLDER,
@@ -2549,6 +2551,28 @@ class MetalModelRunner:
             if materialize_runtime_state:
                 runtime.materialize_pending_state()
 
+    def _prepare_state_cache_step(self, scheduler_output: SchedulerOutput) -> None:
+        runtime = self._paged_attention_runtime
+        if not (
+            isinstance(runtime, HybridPagedAttentionRuntime)
+            and runtime.state_slot_capacity is not None
+        ):
+            return
+        state_step = getattr(scheduler_output, "metal_state_cache", None)
+        if not isinstance(state_step, StateCacheStep):
+            raise RuntimeError(
+                "bounded GDN state pool requires scheduler state catalog"
+            )
+        if runtime.requires_state_cache_barrier(state_step):
+            # Resolving here fills the pipeline's single cached-output slot.
+            # The engine consumes that old output only after this step, so
+            # this step must sample synchronously instead of submitting a new
+            # deferred sample into the still-occupied slot.
+            self._decode_pipeline.begin_step(
+                PipelineGateDecision(eligible=False, reason="state cache retirement")
+            )
+        runtime.prepare_state_cache_step(state_step)
+
     def execute_model(
         self, scheduler_output: SchedulerOutput
     ) -> ModelRunnerOutput | None:
@@ -2567,6 +2591,10 @@ class MetalModelRunner:
         # an ineligible step must resolve the pending deferred sample first so
         # the synchronous path never observes a pending token placeholder.
         self._decode_pipeline.begin_step(self._evaluate_pipeline_gate(scheduler_output))
+
+        # Consume catalogs even when this output schedules no tokens. A
+        # cleanup-only step must release slots before the next admission.
+        self._prepare_state_cache_step(scheduler_output)
 
         self._free_encoder_outputs(scheduler_output.free_encoder_mm_hashes)
         evicted_req_ids = self._finished_req_ids(scheduler_output)
