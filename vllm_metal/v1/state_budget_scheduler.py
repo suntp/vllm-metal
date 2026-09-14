@@ -185,6 +185,39 @@ class StateQuotaKVCacheManager:
         self.evicted_checkpoints += len(victims)
         return True
 
+    def _remove_completed_state_rows(
+        self, request_id: str, processed_computed_tokens: int
+    ) -> None:
+        """Release expired align states even when null gaps separate them.
+
+        Upstream's shared range helper stops its reverse scan at the first
+        null block. Align prefill can skip several positions per step, so that
+        dense-table shortcut can miss an older state behind a gap. With async
+        batches, Mamba's last-state shortcut may already refer to a newer row.
+        Such missed rows remain referenced and can exhaust the state quota.
+
+        Only positions strictly before the completed source are eligible.
+        The completed source and every in-flight destination remain owned;
+        freeing a row also preserves any other request's reference/hash.
+        """
+        if processed_computed_tokens <= 0:
+            return
+        pool = self._delegate.block_pool
+        for manager in self._state_managers.values():
+            blocks = manager.req_to_blocks.get(request_id)
+            if not blocks:
+                continue
+            source_index = (processed_computed_tokens - 1) // manager.block_size
+            freed = []
+            for index in range(min(source_index, len(blocks)) - 1, -1, -1):
+                block = blocks[index]
+                if block.is_null:
+                    continue
+                freed.append(block)
+                blocks[index] = pool.null_block
+            if freed:
+                pool.free_blocks(freed)
+
     def allocate_slots(
         self,
         request: Request,
@@ -240,9 +273,11 @@ class StateQuotaKVCacheManager:
         # Upstream permits this release even when admission later fails.  It
         # is idempotent when the delegate repeats it, and protects in-flight
         # source states by using only completed tokens.
+        processed_computed = max(0, total_computed - request.num_in_flight_tokens)
+        self._remove_completed_state_rows(request.request_id, processed_computed)
         delegate.coordinator.remove_skipped_blocks(
             request.request_id,
-            max(0, total_computed - request.num_in_flight_tokens),
+            processed_computed,
             num_prompt_tokens=request.num_prompt_tokens,
         )
         needed = 0

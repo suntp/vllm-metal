@@ -47,9 +47,19 @@ def _initialize_hash():
     init_none_hash(_hash)
 
 
-def _config(groups=1, blocks=128, retention=None, *, partial=False, checkpoints=0):
+def _config(
+    groups=1,
+    blocks=128,
+    retention=None,
+    *,
+    partial=False,
+    checkpoints=0,
+    block_size=BLOCK,
+    max_model_len=1024,
+    max_in_flight_tokens=None,
+):
     state = MambaSpec(
-        block_size=BLOCK,
+        block_size=block_size,
         shapes=((4, 4),),
         dtypes=(torch.float32,),
         mamba_cache_mode="align",
@@ -62,7 +72,7 @@ def _config(groups=1, blocks=128, retention=None, *, partial=False, checkpoints=
             KVCacheGroupSpec(
                 ["attention"],
                 FullAttentionSpec(
-                    block_size=BLOCK,
+                    block_size=block_size,
                     num_kv_heads=1,
                     head_size=2,
                     dtype=torch.float32,
@@ -74,20 +84,22 @@ def _config(groups=1, blocks=128, retention=None, *, partial=False, checkpoints=
     )
     return KVCacheManager(
         config,
-        max_model_len=1024,
-        scheduler_block_size=BLOCK,
-        hash_block_size=BLOCK // 2 if partial else BLOCK,
-        max_in_flight_tokens=2 * BLOCK,
+        max_model_len=max_model_len,
+        scheduler_block_size=block_size,
+        hash_block_size=block_size // 2 if partial else block_size,
+        max_in_flight_tokens=2 * block_size
+        if max_in_flight_tokens is None
+        else max_in_flight_tokens,
     )
 
 
-def _request(name, tokens=128, *, offset=0):
+def _request(name, tokens=128, *, offset=0, block_size=BLOCK):
     return Request(
         request_id=name,
         prompt_token_ids=list(range(offset, offset + tokens)),
         sampling_params=SamplingParams(temperature=0, max_tokens=128),
         pooling_params=None,
-        block_hasher=get_request_block_hasher(BLOCK, _hash),
+        block_hasher=get_request_block_hasher(block_size, _hash),
     )
 
 
@@ -165,6 +177,102 @@ def test_working_bound_allows_every_admitted_request_to_advance(
         assert len(quota.resident_blocks) <= capacity
         assert quota.quota_stalls == 0
     assert all(request.num_computed_tokens == 10 * BLOCK for request in running)
+
+
+@pytest.mark.parametrize("capacity", [9, 10])
+def test_sparse_long_prefill_fits_working_reserve_with_two_inflight_batches(capacity):
+    block_size, chunk, prompt, decode = 784, 1568, 156801, 32
+    quota = StateQuotaKVCacheManager(
+        _config(
+            groups=3,
+            blocks=218,
+            retention=0,
+            block_size=block_size,
+            max_model_len=163840,
+            max_in_flight_tokens=2 * chunk,
+        ),
+        capacity=capacity,
+    )
+    quota.max_resident_requests = 1
+    request = _request("long-sparse", tokens=prompt, block_size=block_size)
+    pending = deque()
+    counts = [chunk] * 100 + [1] + [1] * (decode - 1)
+    max_owned = max_resident = 0
+
+    for count in counts:
+        if len(pending) == 2:
+            request.num_in_flight_tokens -= pending.popleft()
+        completed = request.num_computed_tokens - request.num_in_flight_tokens
+        completed_source = max(0, (completed - 1) // block_size)
+        protected = {
+            block.block_id
+            for manager in quota._state_managers.values()
+            for index, block in enumerate(manager.req_to_blocks[request.request_id])
+            if not block.is_null and index >= completed_source
+        }
+        quota.new_step_starts()
+        allocated = quota.allocate_slots(request, count)
+        assert allocated is not None
+        owned = _state_ids(quota, request)
+        assert protected <= owned  # Completed source and in-flight rows survive.
+        max_owned = max(max_owned, len(owned))
+        max_resident = max(max_resident, len(quota.resident_blocks))
+        assert len(quota.resident_blocks) <= 9
+        request.status = RequestStatus.RUNNING
+        request.num_computed_tokens += count
+        request.num_in_flight_tokens += count
+        pending.append(count)
+        if request.num_computed_tokens >= prompt:
+            request.append_output_token_ids(100)
+
+    while pending:
+        request.num_in_flight_tokens -= pending.popleft()
+    assert request.num_computed_tokens == prompt + decode - 1
+    assert request.num_preemptions == 0
+    assert quota.quota_stalls == quota.admission_stalls == 0
+    assert max_owned == max_resident == 9
+
+
+def test_sparse_completed_rows_release_before_a_failed_kv_allocation():
+    quota = StateQuotaKVCacheManager(
+        _config(groups=3, blocks=20, retention=0, max_in_flight_tokens=4 * BLOCK),
+        capacity=9,
+    )
+    request = _request("sparse", tokens=10 * BLOCK)
+    chunk = 2 * BLOCK
+    pending = deque()
+    for _ in range(3):
+        if len(pending) == 2:
+            request.num_in_flight_tokens -= pending.popleft()
+        _advance(quota, request, chunk)
+        request.num_in_flight_tokens += chunk
+        pending.append(chunk)
+    expired = {
+        manager.req_to_blocks[request.request_id][1].block_id
+        for manager in quota._state_managers.values()
+    }
+    protected = _state_ids(quota, request) - expired
+    held = quota.block_pool.get_new_blocks(quota.block_pool.get_num_free_blocks())
+    request.num_in_flight_tokens -= pending.popleft()
+    generations = quota._generation
+    quota.new_step_starts()
+
+    # No KV room even after safely retiring the first three state rows.
+    # Failed allocation must still release expired rows without touching the
+    # completed source at position 3 or in-flight destination at position 5.
+    assert quota.allocate_slots(request, chunk) is None
+    assert quota._generation == generations
+    assert _state_ids(quota, request) == protected
+    assert set(dict(quota.resident_blocks)) == protected
+    assert all(quota.block_pool.blocks[block].ref_cnt == 0 for block in expired)
+    assert all(quota.block_pool.blocks[block].ref_cnt == 1 for block in protected)
+    for manager in quota._state_managers.values():
+        assert manager.req_to_blocks[request.request_id][1].is_null
+
+    quota.block_pool.free_blocks(held)
+    assert quota.allocate_slots(request, chunk) is not None
+    assert protected <= _state_ids(quota, request)
+    assert len(quota.resident_blocks) == 9
 
 
 def test_writing_same_block_preserves_its_generation():
