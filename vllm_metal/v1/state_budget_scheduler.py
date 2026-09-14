@@ -23,7 +23,10 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+from vllm.v1.core.single_type_kv_cache_manager import (
+    FullAttentionManager,
+    MambaManager,
+)
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.request import Request, RequestStatus
 
@@ -56,6 +59,15 @@ class StateQuotaKVCacheManager:
     def __init__(self, delegate: KVCacheManager, capacity: int) -> None:
         if capacity <= 0:
             raise ValueError("state cache capacity must be positive")
+        managers = delegate.coordinator.single_type_managers
+        if any(
+            type(manager) not in (FullAttentionManager, MambaManager)
+            for manager in managers
+        ):
+            raise ValueError(
+                "state cache budget requires ordinary FullAttentionManager and "
+                "align MambaManager groups; other cache manager types are unsupported"
+            )
         self._delegate = delegate
         self.capacity = capacity
         self._resident: dict[int, int] = {}
@@ -68,10 +80,13 @@ class StateQuotaKVCacheManager:
         self.retired_uncached = 0
         self.quota_stalls = 0
         self.admission_stalls = 0
+        self.pressure_wait_steps = 0
+        self.pressure_wait_global_steps = 0
+        self.pressure_wait_state_steps = 0
         self._state_managers = {
             group: manager
-            for group, manager in enumerate(delegate.coordinator.single_type_managers)
-            if isinstance(manager, MambaManager)
+            for group, manager in enumerate(managers)
+            if type(manager) is MambaManager
         }
         if not self._state_managers:
             raise ValueError("state cache budget requires align state groups")
@@ -139,6 +154,9 @@ class StateQuotaKVCacheManager:
             "reused_block_ids": self.reused_block_ids,
             "quota_stalls": self.quota_stalls,
             "admission_stalls": self.admission_stalls,
+            "pressure_wait_steps": self.pressure_wait_steps,
+            "pressure_wait_global_steps": self.pressure_wait_global_steps,
+            "pressure_wait_state_steps": self.pressure_wait_state_steps,
             "resident_requests": len(self.resident_request_ids()),
         }
 
@@ -352,6 +370,7 @@ class StateBudgetScheduler(Scheduler):
 
     kv_cache_manager: KVCacheManager
     max_num_running_reqs: int
+    max_num_scheduled_tokens: int
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -400,6 +419,8 @@ class StateBudgetScheduler(Scheduler):
         # a state row that the new quota can actively evict.
         self.defer_block_free = True
         self.kv_cache_manager = cast(KVCacheManager, self._state_quota)
+        self._cache_fence_wait_global = False
+        self._cache_fence_wait_state = False
         logger.info(
             "Bounded state cache: %d rows, %d rows/request working reserve, "
             "at most %d running requests",
@@ -427,8 +448,126 @@ class StateBudgetScheduler(Scheduler):
                     return queue
         return super()._select_waiting_queue_for_scheduling()
 
+    def _running_cache_allocation_needs(self) -> tuple[int, int]:
+        """Upper-bound new global blocks and state rows for running requests.
+
+        Count the missing table suffix, rather than charging every decode for
+        a new page. Each request independently gets the full token/input limit:
+        omitting shared-budget subtraction stays conservative when core skips
+        earlier requests. Alignment and other core restrictions only reduce it.
+        Exact manager types and the no-CoW/spec/checkpoint guards are required
+        for these ordinary append and one-state-row allocation rules.
+        """
+        token_limit = min(
+            self.max_num_scheduled_tokens,
+            self.scheduler_config.max_num_batched_tokens,
+        )
+        if token_limit <= 0:
+            return 0, 0
+        managers = self._state_quota.coordinator.single_type_managers
+        global_needed = state_needed = 0
+        for request in self.running:
+            tokens = min(
+                request.num_tokens_with_spec
+                + request.num_output_placeholders
+                - request.num_computed_tokens,
+                token_limit,
+                self.max_model_len
+                - request.num_computed_tokens
+                - self.num_sampled_tokens_per_step,
+            )
+            threshold = self.scheduler_config.long_prefill_token_threshold
+            if threshold > 0:
+                tokens = min(tokens, threshold)
+            if tokens <= 0:
+                continue
+            if self.need_mamba_block_aligned_split:
+                tokens = self._mamba_block_aligned_split(request, tokens)
+            if tokens <= 0:
+                continue
+            total_tokens = request.num_computed_tokens + tokens
+            for manager in managers:
+                if request.request_id in manager._partial_hit_reqs:
+                    raise RuntimeError(
+                        "unexpected partial cache CoW under a state budget"
+                    )
+                required = (total_tokens + manager.block_size - 1) // manager.block_size
+                present = len(manager.req_to_blocks.get(request.request_id, ()))
+                missing = max(0, required - present)
+                if type(manager) is MambaManager:
+                    missing = int(missing > 0)
+                    state_needed += missing
+                global_needed += missing
+        return global_needed, state_needed
+
+    def _should_wait_for_cache_fence(self) -> bool:
+        """Drain in-flight work before a shortage causes cascading preemption.
+
+        Core retries allocation immediately after each preemption. Deferred
+        frees cannot supply blocks within that call, so retrying can evict all
+        running requests. Only wait while a positive-token step is outstanding;
+        after it drains, ordinary core preemption can release blocks immediately.
+        """
+        self._cache_fence_wait_global = False
+        self._cache_fence_wait_state = False
+        if self.processed_step_seq >= self.sched_step_seq:
+            return False
+        global_needed, state_needed = self._running_cache_allocation_needs()
+        if global_needed == 0 and state_needed == 0:
+            return False
+        quota = self._state_quota
+        pool = quota.block_pool
+
+        def shortages() -> tuple[bool, bool]:
+            # Idle resident checkpoints are evictable; only referenced rows
+            # reduce the physical quota available to this running batch.
+            pinned = sum(
+                pool.blocks[block_id].ref_cnt > 0 for block_id in quota._resident
+            )
+            return (
+                global_needed > pool.get_num_free_blocks(),
+                state_needed > quota.capacity - pinned,
+            )
+
+        global_short, state_short = shortages()
+        if not (global_short or state_short):
+            return False
+
+        # Allocation normally performs this idempotent release per request.
+        # Do it before deciding to wait so already-completed old states do not
+        # masquerade as GPU-pinned resources. The completed source and every
+        # in-flight destination remain referenced, including shared sources.
+        for request in self.running:
+            processed = max(
+                0,
+                min(request.num_computed_tokens, quota.max_model_len)
+                - request.num_in_flight_tokens,
+            )
+            quota._remove_completed_state_rows(request.request_id, processed)
+        quota.retire_uncached()
+        global_short, state_short = shortages()
+        self._cache_fence_wait_global = global_short
+        self._cache_fence_wait_state = state_short
+        return global_short or state_short
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
-        output = super().schedule(throttle_prefills)
+        maximum = self.max_num_scheduled_tokens
+        try:
+            if self._should_wait_for_cache_fence():
+                self.max_num_scheduled_tokens = 0
+                self._state_quota.pressure_wait_steps += 1
+                self._state_quota.pressure_wait_global_steps += int(
+                    self._cache_fence_wait_global
+                )
+                self._state_quota.pressure_wait_state_steps += int(
+                    self._cache_fence_wait_state
+                )
+            # Let core finalize the empty step normally: finished IDs, previous
+            # batch membership and the state catalog must reach the worker even
+            # while the engine's bounded FIFO drains earlier positive-token work.
+            output = super().schedule(throttle_prefills)
+        finally:
+            self.max_num_scheduled_tokens = maximum
         if output.kv_cache_block_copies:
             raise RuntimeError("unexpected CoW output under a state budget")
         self._state_quota.retire_uncached()

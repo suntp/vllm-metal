@@ -78,9 +78,39 @@ both arms to:
 
 Each pressure wave contains eight requests. The explicit override is a stress
 configuration, not evidence that the natural startup planner chooses 48 blocks.
+It limits the scheduler's logical shared BlockPool. The Metal backend may retain
+larger KV arrays allocated during startup profiling; report both
+`resolved.num_gpu_blocks` and `runtime_before.num_blocks`. This exercises real
+scheduler allocation failure and preemption, not operating-system memory
+exhaustion or a claim that physical KV storage shrank to 48 blocks.
 Do not reduce it below the model's startup capacity requirement. If the selected
 workload does not actually preempt and recover a request, the gate fails instead
 of silently marking that scenario covered.
+
+## State-budget behavior under pressure
+
+The opt-in budget preserves the existing deferred-free fence: blocks referenced
+by an unfinished GPU step stay owned until its result is consumed. Before core
+scheduling, the budget adapter bounds the new blocks needed by running requests
+from their existing tables. It first releases eligible states strictly before
+the completed source. If global blocks or unpinned state capacity are still
+insufficient, it dispatches a normal zero-token step so the existing FIFO can
+consume earlier work. Once no positive-token step is outstanding, ordinary
+preemption can free blocks immediately. Continuing within an existing decode
+block needs no new block and does not trigger this wait.
+
+`pressure_wait_steps`, `pressure_wait_global_steps` and
+`pressure_wait_state_steps` count these waits; the reason counts can overlap.
+They are separate from quota/admission allocation failures. The supported
+manager geometry is ordinary full attention plus aligned Mamba state, with
+existing exclusions for partial CoW, internal checkpoints, speculation and
+external transfers. Unknown manager implementations are rejected explicitly.
+
+Waiting changes batch composition and which computations finish before a
+preemption. Keep complete-output compatibility against the original production
+schedule separate from any same-schedule state/reference experiment. A reference
+match does not rewrite a failed original comparison as PASS. Preserve the old
+report and identify every deliberately changed scheduling policy in diagnostics.
 
 ## What is measured
 

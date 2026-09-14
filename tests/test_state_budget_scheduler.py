@@ -691,6 +691,9 @@ def _scheduler_init(
         )
         self.connector = self.ec_connector = None
         self.max_num_running_reqs = 100
+        self.max_num_scheduled_tokens = 128
+        self.sched_step_seq = 0
+        self.processed_step_seq = 0
         self.num_spec_tokens = 0
         self.policy = policy
 
