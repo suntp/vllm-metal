@@ -42,6 +42,36 @@ The environment used for the first measurements has lock SHA256
 The lock belongs with the raw reports when they are published; `reports/` is
 not automatically present after cloning this repository.
 
+### Model processor compatibility in the pinned environment
+
+The 27B reference at Hugging Face revision
+[`3e6447f082e89cc7f0bc6e5441afd38dfce760ff`](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit/tree/3e6447f082e89cc7f0bc6e5441afd38dfce760ff)
+has conflicting processor metadata: `preprocessor_config.json` selects
+`Qwen2VLImageProcessorFast`, while `processor_config.json` embeds the unregistered
+`Qwen3VLImageProcessor` name. A CPU-only `AutoProcessor.from_pretrained` check
+still fails with the pinned transformers **5.17.0**. Upgrading from the previous
+5.12 environment did not make that fresh metadata loadable.
+
+The 27B commands below therefore construct a dedicated model view inside the
+new report directory. They symlink weight shards, copy other files, and omit
+only the exact known incompatible `processor_config.json`, preserving its bytes
+and hash beside the view. The existing `Qwen2VLImageProcessorFast` preprocessor
+is kept unchanged. Both arms use that same view. No shared Hugging Face or
+ModelScope snapshot, global processor registry, or installed package is edited.
+An unexpected processor configuration fails for inspection instead of receiving
+an unverified replacement. The view is checked with `AutoProcessor` before
+inference; this check loads processor/tokenizer metadata, not model weights.
+
+This compatibility recipe is for the **text-token benchmark**. It is not a
+validation of image/video preprocessing equivalence. The measured local 27B
+snapshot already omitted the same processor file; the official preprocessor
+and that local preprocessor have equal JSON values but different whitespace,
+so their raw file hashes differ. Preserve the view's file hashes and download
+revision with the results rather than claiming byte-identical unmodified model
+metadata. The pinned 0.8B revision already has no `processor_config.json` and
+uses the recognized preprocessor name; it does not require this omission.
+
+
 The block below uses a dedicated `.venv-state-budget-repro`, installs exactly
 that dependency set, builds this checkout, and runs baseline/budget/compare
 sequentially for both automatic and explicitly synchronous scheduling. It does
@@ -76,6 +106,7 @@ xcodebuild -version > "$bench_dir/xcode.txt"
 xcrun --show-sdk-version > "$bench_dir/sdk.txt"
 rustc --version > "$bench_dir/rust.txt"
 uv --version > "$bench_dir/uv.txt"
+sysctl hw.memsize iogpu.wired_limit_mb > "$bench_dir/system-memory.txt"
 "$bench_python" -m vllm_metal.metal.build > "$bench_dir/native-build.log" 2>&1
 uv pip freeze --python "$bench_python" > "$bench_dir/environment-freeze.txt"
 git rev-parse HEAD > "$bench_dir/source-commit.txt"
@@ -94,7 +125,64 @@ case "${STATE_BENCH_CASESET:-08b}" in
     ;;
   *) printf 'STATE_BENCH_CASESET must be 08b or 27b\n' >&2; exit 2 ;;
 esac
-bench_common=(--model "$STATE_BENCH_MODEL" "${bench_workload[@]}"
+bench_model="$STATE_BENCH_MODEL"
+if test "${STATE_BENCH_CASESET:-08b}" = 27b; then
+  "$bench_python" - "$STATE_BENCH_MODEL" "$bench_dir" <<'PY'
+import hashlib
+import json
+import shutil
+import sys
+from pathlib import Path
+
+from transformers import AutoProcessor, __version__ as transformers_version
+
+source = Path(sys.argv[1]).resolve()
+output = Path(sys.argv[2]).resolve()
+view = output / "model-view"
+view.mkdir()
+known_processor_sha = "45fc17c8dd2474af6b493b52483c26c0584b0082d368c480f9fa611e73070040"
+processor_file = source / "processor_config.json"
+excluded = []
+if processor_file.exists():
+    raw = processor_file.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != known_processor_sha:
+        raise RuntimeError("Unexpected processor_config.json; inspect compatibility before applying this 27B recipe")
+    (output / "original-processor_config.json").write_bytes(raw)
+    excluded.append(processor_file.name)
+preprocessor = json.loads((source / "preprocessor_config.json").read_text())
+if preprocessor.get("image_processor_type") not in (
+    "Qwen2VLImageProcessorFast", "Qwen2VLImageProcessor"
+):
+    raise RuntimeError("Unexpected preprocessor; this recipe must not change its semantics")
+if not list(source.glob("*.safetensors")):
+    raise RuntimeError("Expected the reference snapshot's top-level safetensors shards")
+for item in source.iterdir():
+    if not item.is_file() or item.name in excluded:
+        continue
+    target = view / item.name
+    if item.suffix == ".safetensors":
+        target.symlink_to(item.resolve())
+    else:
+        shutil.copy2(item, target)
+manifest = {
+    "source_directory": str(source),
+    "view_directory": str(view),
+    "excluded_files": excluded,
+    "excluded_processor_sha256": known_processor_sha if excluded else None,
+    "transformers": transformers_version,
+    "non_weight_files": {
+        item.name: hashlib.sha256(item.read_bytes()).hexdigest()
+        for item in view.iterdir()
+        if item.is_file() and item.suffix != ".safetensors"
+    },
+}
+(output / "model-view-metadata.json").write_text(json.dumps(manifest, indent=2) + "\n")
+processor = AutoProcessor.from_pretrained(str(view), local_files_only=True)
+print("Processor CPU check:", type(processor).__name__, type(processor.image_processor).__name__)
+PY
+  bench_model="$bench_dir/model-view"
+fi
+bench_common=(--model "$bench_model" "${bench_workload[@]}"
   --max-num-seqs 4 --concurrency 1,4 --repeats 2 --max-new-tokens 32)
 for bench_async in auto off; do
   "$bench_python" tools/state_cache_budget_bench.py run "${bench_common[@]}" \
@@ -306,3 +394,15 @@ required Metal libraries including NAX, and deployment targets), and checks
 that platform discovery selects `MetalPlatform`. A passing pytest result alone
 does not cover those packaging checks. The scripts may resolve/install packages,
 so run those steps in a dedicated environment and retain its final freeze.
+
+## Revalidating saved reports after comparator hardening
+
+The comparison independently rebuilds the expected case matrix from the recorded
+configuration, checks its full order/metadata, validates every request's prompt
+and fixed-length output, and requires matching `length` finish reasons. Explicit
+`qualification_eligible=false` diagnostic metadata cannot qualify. The report
+records `comparator_sha256` separately from each input report's acquisition
+`tool_sha256`; both input acquisition hashes must still match. A comparison-only
+change can therefore revalidate unchanged raw reports without relabeling the
+code that collected them. Recompute comparisons and evidence tables after such
+a change; do not edit raw run reports to make them conform.

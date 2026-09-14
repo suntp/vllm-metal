@@ -645,8 +645,129 @@ def run_benchmark(args: argparse.Namespace) -> dict:
     return report
 
 
-def compare_reports(baseline: dict, budget: dict) -> dict:
+def _evidence_problems(report: dict, side: str) -> list[str]:
+    """Validate recorded evidence independently of its self-reported status.
+
+    This only runs during comparison. Keep acquisition unchanged so older raw
+    reports can be reassessed without changing their workload or tool identity.
+    """
     problems = []
+
+    def reject(reason: str) -> None:
+        problems.append(f"{side}: {reason}")
+
+    def contains_diagnostic(value: Any) -> bool:
+        if isinstance(value, dict):
+            return value.get("qualification_eligible") is False or any(
+                contains_diagnostic(item) for item in value.values()
+            )
+        if isinstance(value, list):
+            return any(contains_diagnostic(item) for item in value)
+        return False
+
+    if report.get("qualification_eligible") is False or contains_diagnostic(
+        report.get("metadata", {})
+    ):
+        reject("diagnostic evidence is not eligible for qualification")
+    if report.get("schema_version") != SCHEMA_VERSION or report.get("kind") != "run":
+        reject("expected a supported run report")
+    if report.get("failure"):
+        reject("run report contains a failure")
+    config = report.get("config", {})
+    if not isinstance(config, dict):
+        reject("workload configuration is missing or invalid")
+        return problems
+
+    def positive(value: Any) -> bool:
+        return type(value) is int and value > 0
+
+    valid_config = True
+    for name in ("prompt_lengths", "concurrency"):
+        values = config.get(name)
+        if (
+            not isinstance(values, list)
+            or not values
+            or not all(positive(value) for value in values)
+            or len(set(values)) != len(values)
+        ):
+            reject(f"invalid workload configuration: {name}")
+            valid_config = False
+    for name in (
+        "repeats",
+        "max_new_tokens",
+        "max_model_len",
+        "max_num_batched_tokens",
+        "max_num_seqs",
+    ):
+        if not positive(config.get(name)):
+            reject(f"invalid workload configuration: {name}")
+            valid_config = False
+    if config.get("async_scheduling") not in ("auto", "on", "off"):
+        reject("invalid workload configuration: async_scheduling")
+    utilization = config.get("gpu_memory_utilization")
+    if (
+        isinstance(utilization, bool)
+        or not isinstance(utilization, (int, float))
+        or not 0 < utilization <= 1
+    ):
+        reject("invalid workload configuration: gpu_memory_utilization")
+    if not valid_config:
+        return problems
+    if (
+        max(config["prompt_lengths"]) + config["max_new_tokens"]
+        > config["max_model_len"]
+    ):
+        reject("requested prompt and output exceed max_model_len")
+    plan = case_plan(argparse.Namespace(**config))
+    if type(report.get("expected_cases")) is not int or report["expected_cases"] != len(
+        plan
+    ):
+        reject("expected_cases differs from the matrix rebuilt from configuration")
+    records = report.get("records")
+    if not isinstance(records, list) or any(not isinstance(r, dict) for r in records):
+        reject("records must be a list of case objects")
+        return problems
+    if [r.get("key") for r in records] != [case["key"] for case in plan]:
+        reject("recorded case order/keys differ from the configured matrix")
+    expected = {case["key"]: case for case in plan}
+
+    def token_rows_valid(value: Any, rows: int, width: int) -> bool:
+        return (
+            isinstance(value, list)
+            and len(value) == rows
+            and all(
+                isinstance(tokens, list)
+                and len(tokens) == width
+                and all(type(token) is int and token >= 0 for token in tokens)
+                for tokens in value
+            )
+        )
+
+    for record in records:
+        key = record.get("key")
+        case = expected.get(key) if isinstance(key, str) else None
+        if case is None:
+            continue
+        if any(record.get(name) != value for name, value in case.items()):
+            reject(f"case metadata differs from configured matrix: {key}")
+        count = case["concurrency"]
+        if not token_rows_valid(
+            record.get("prompt_token_ids"), count, case["prompt_length"]
+        ):
+            reject(f"prompt rows/token counts are incomplete or invalid: {key}")
+        if not token_rows_valid(
+            record.get("output_token_ids"), count, config["max_new_tokens"]
+        ):
+            reject(f"output rows/token counts are incomplete or invalid: {key}")
+        if record.get("finish_reasons") != ["length"] * count:
+            reject(f"finish reasons must cover every fixed-length output: {key}")
+    return problems
+
+
+def compare_reports(baseline: dict, budget: dict) -> dict:
+    problems = _evidence_problems(baseline, "baseline") + _evidence_problems(
+        budget, "budget"
+    )
     baseline_config, budget_config = (
         baseline.get("config", {}),
         budget.get("config", {}),
@@ -793,6 +914,7 @@ def compare_reports(baseline: dict, budget: dict) -> dict:
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": "comparison",
+        "comparator_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "status": "pass" if not problems and comparisons else "fail",
         "problems": problems,
         "comparisons": comparisons,

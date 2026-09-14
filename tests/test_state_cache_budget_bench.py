@@ -29,12 +29,21 @@ def args(tmp_path, *extra):
 
 
 def report(budget=False):
-    return {
+    result = {
+        "schema_version": 2,
+        "kind": "run",
         "status": "completed",
-        "expected_cases": 1,
+        "expected_cases": 2,
         "config": {
             "async_scheduling": "auto",
             "max_new_tokens": 2,
+            "prompt_lengths": [2],
+            "concurrency": [1],
+            "repeats": 1,
+            "max_model_len": 8,
+            "max_num_batched_tokens": 4,
+            "max_num_seqs": 1,
+            "gpu_memory_utilization": 0.25,
             "state_budget_mib": 256 if budget else None,
         },
         "budget_applied": budget,
@@ -79,6 +88,20 @@ def report(budget=False):
             }
         ],
     }
+
+    template = result["records"][0]
+    result["records"] = [
+        {
+            **template,
+            **case,
+            "prompt_token_ids": [[1, 2]],
+            "output_token_ids": [[3, 4]],
+            "finish_reasons": ["length"],
+            "admitted_num_computed_tokens": [512 if case["phase"] == "hot" else 0],
+        }
+        for case in bench.case_plan(SimpleNamespace(**result["config"]))
+    ]
+    return result
 
 
 def test_cli_baseline_and_budget_are_explicit(tmp_path):
@@ -152,7 +175,7 @@ def test_incomplete_duplicate_and_empty_evidence_cannot_pass():
     budget = report(True)
     for invalid in (
         {**budget, "status": "failed"},
-        {**budget, "expected_cases": 2},
+        {**budget, "expected_cases": 3},
         {**budget, "records": []},
         {**budget, "expected_cases": 2, "records": budget["records"] * 2},
     ):
@@ -442,3 +465,77 @@ def test_weight_fingerprint_is_required_and_must_match(manifest):
     baseline, budget = report(), report(True)
     budget["metadata"]["weights_manifest"] = manifest
     assert bench.compare_reports(baseline, budget)["status"] == "fail"
+
+
+@pytest.mark.parametrize("field", ["observer_trace", "working_tensor_trace", "nested"])
+def test_diagnostic_reports_cannot_qualify_even_if_both_outputs_match(field):
+    baseline, budget = report(), report(True)
+    for observed in (baseline, budget):
+        observed["metadata"][field] = {
+            "variant": "diagnostic_fallback_sync",
+            "qualification_eligible": False,
+        }
+    compared = bench.compare_reports(baseline, budget)
+    assert compared["status"] == "fail"
+    assert any("diagnostic evidence" in p for p in compared["problems"])
+
+
+def test_self_declared_smaller_case_count_cannot_hide_missing_matrix():
+    baseline, budget = report(), report(True)
+    for observed in (baseline, budget):
+        observed["records"] = observed["records"][:1]
+        observed["expected_cases"] = 1
+    compared = bench.compare_reports(baseline, budget)
+    assert compared["status"] == "fail"
+    assert any("rebuilt from configuration" in p for p in compared["problems"])
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("output_token_ids", [[]]),
+        ("output_token_ids", []),
+        ("output_token_ids", [[3]]),
+        ("output_token_ids", [[3, 4], [3, 4]]),
+        ("output_token_ids", [[True, 4]]),
+        ("prompt_token_ids", [[1]]),
+        ("finish_reasons", []),
+        ("finish_reasons", [None]),
+        ("finish_reasons", ["abort"]),
+        ("finish_reasons", ["stop"]),
+    ],
+)
+def test_matching_incomplete_requests_or_finish_reasons_cannot_pass(field, value):
+    baseline, budget = report(), report(True)
+    for observed in (baseline, budget):
+        for record in observed["records"]:
+            record[field] = value
+    assert bench.compare_reports(baseline, budget)["status"] == "fail"
+
+
+@pytest.mark.parametrize(
+    "change", ["reorder", "missing_config", "wrong_phase", "wrong_schema"]
+)
+def test_matching_malformed_matrix_evidence_cannot_pass(change):
+    baseline, budget = report(), report(True)
+    for observed in (baseline, budget):
+        if change == "reorder":
+            observed["records"].reverse()
+        elif change == "missing_config":
+            del observed["config"]["prompt_lengths"]
+        elif change == "wrong_phase":
+            observed["records"][0]["phase"] = "hot"
+        else:
+            observed["schema_version"] = 1
+    assert bench.compare_reports(baseline, budget)["status"] == "fail"
+
+
+def test_comparison_identifies_its_own_code_separately_from_acquisition():
+    baseline, budget = report(), report(True)
+    compared = bench.compare_reports(baseline, budget)
+    assert compared["status"] == "pass"
+    assert (
+        compared["comparator_sha256"]
+        == bench.hashlib.sha256(TOOL.read_bytes()).hexdigest()
+    )
+    assert compared["baseline_metadata"]["tool_sha256"] == "tool"
