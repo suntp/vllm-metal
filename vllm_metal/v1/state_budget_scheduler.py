@@ -350,6 +350,9 @@ class StateQuotaKVCacheManager:
 class StateBudgetScheduler(Scheduler):
     """Mixin implementation also used ahead of AsyncScheduler in the MRO."""
 
+    kv_cache_manager: KVCacheManager
+    max_num_running_reqs: int
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         budget = state_cache_budget_from_kv_config(
