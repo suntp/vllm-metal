@@ -193,6 +193,77 @@ def test_three_mixed_waves_have_unique_requests_and_complete_shifted_plans():
             )
 
 
+def test_workload_can_allow_configured_eos():
+    plan = gate.workload(FakeTokenizer(), 544, "pressure", ignore_eos=False)
+    assert plan
+    assert all(request["ignore_eos"] is False for request in plan)
+    assert [len(r["prompt_token_ids"]) for r in plan] == [
+        len(r["prompt_token_ids"])
+        for r in gate.workload(FakeTokenizer(), 544, "pressure")
+    ]
+
+
+class _ChatTokenizer(FakeTokenizer):
+    chat_template = "{{ messages }}"
+
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, **kwargs):
+        assert tokenize is True
+        assert add_generation_prompt is True
+        assert messages[0]["role"] == "user"
+        return [11, 22, 33]
+
+
+def test_chat_template_coerces_numpy_int_tokens():
+    class Int64Tokenizer(_ChatTokenizer):
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, **kwargs):
+            del messages, tokenize, add_generation_prompt, kwargs
+            return [type("I64", (int,), {})(9), type("I64", (int,), {})(10)]
+
+    plan = gate.workload(FakeTokenizer(), 544, "pressure")
+    gate.apply_chat_template_to_plan(Int64Tokenizer(), plan)
+    assert all(item["prompt_token_ids"][:2] == [9, 10] for item in plan)
+    assert all(type(token) is int for item in plan for token in item["prompt_token_ids"][:2])
+
+
+def test_chat_template_accepts_numpy_token_ids():
+    class ArrayTokenizer(_ChatTokenizer):
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, **kwargs):
+            del messages, tokenize, add_generation_prompt, kwargs
+            return type("Arr", (), {"tolist": staticmethod(lambda: [7, 8])})()
+
+    plan = gate.workload(FakeTokenizer(), 544, "pressure")
+    gate.apply_chat_template_to_plan(ArrayTokenizer(), plan)
+    assert all(item["prompt_token_ids"][:2] == [7, 8] for item in plan)
+
+
+def test_chat_template_padding_is_stable_across_calls():
+    tokenizer = _ChatTokenizer()
+    first = gate.workload(tokenizer, 544, "pressure", ignore_eos=False)
+    second = gate.workload(tokenizer, 544, "pressure", ignore_eos=False)
+    gate.apply_chat_template_to_plan(tokenizer, first)
+    gate.apply_chat_template_to_plan(tokenizer, second)
+    assert [item["prompt_token_ids"] for item in first] == [
+        item["prompt_token_ids"] for item in second
+    ]
+
+
+def test_chat_template_rewrite_preserves_planned_lengths():
+    tokenizer = _ChatTokenizer()
+    plan = gate.workload(tokenizer, 544, "pressure", ignore_eos=False)
+    lengths = [len(item["prompt_token_ids"]) for item in plan]
+    gate.apply_chat_template_to_plan(tokenizer, plan)
+    assert [len(item["prompt_token_ids"]) for item in plan] == lengths
+    assert all(item["prompt_token_ids"][:3] == [11, 22, 33] for item in plan)
+
+
+def test_chat_template_rejects_prompts_shorter_than_the_template():
+    tokenizer = _ChatTokenizer()
+    tokenizer.apply_chat_template = lambda *a, **k: list(range(200))  # noqa: ARG005
+    plan = gate.workload(FakeTokenizer(), 544, "pressure")
+    with pytest.raises(ValueError, match="chat template has 200 tokens"):
+        gate.apply_chat_template_to_plan(tokenizer, plan)
+
+
 @pytest.mark.parametrize(
     ("args", "kwargs"),
     [

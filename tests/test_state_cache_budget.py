@@ -20,6 +20,7 @@ from vllm_metal.state_budget import (
     resolve_state_cache_budget,
     state_cache_budget_bytes,
     state_cache_budget_from_kv_config,
+    state_cache_rows_per_request,
     state_cache_scratch_allowance,
 )
 from vllm_metal.v1.cache_policy import WorkerCachePlanner, _state_budget_for_runner
@@ -254,6 +255,52 @@ def test_non_gdn_budget_fails_instead_of_reducing_kv_reserve(monkeypatch):
     worker.get_cache_block_size_bytes = Mock(return_value=KV_BLOCK_BYTES)
     with pytest.raises(NotImplementedError, match="GDN align"):
         planner._paged_attention_plan(overhead=2 * GIB)
+
+
+@pytest.mark.parametrize("batches,groups,expected", [(1, 3, 6), (2, 3, 9), (1, 1, 2)])
+def test_working_reserve_is_source_plus_one_row_per_in_flight_batch(
+    batches, groups, expected
+):
+    cfg = config(max_concurrent_batches=batches)
+    assert state_cache_rows_per_request(cfg, groups) == expected
+
+
+def test_one_request_synchronous_floor_is_six_rows_for_qwen38_geometry():
+    runner_kw = {
+        "is_hybrid": True,
+        "cache_config": config().cache_config,
+        "hybrid_runtime_plan": SimpleNamespace(
+            family=SimpleNamespace(label="gdn"),
+            layers=SimpleNamespace(num_state=48, num_attention=16),
+        ),
+        "hybrid_align_state_bytes_per_block": lambda: STATE_ROW_BYTES,
+    }
+    too_small = config(
+        additional_config={"state_cache_budget_mib": 293}, max_concurrent_batches=1
+    )
+    with pytest.raises(ValueError, match=r"at least 6 rows \(294 MiB\)"):
+        _state_budget_for_runner(SimpleNamespace(vllm_config=too_small, **runner_kw))
+    floor = config(
+        additional_config={"state_cache_budget_mib": 294}, max_concurrent_batches=1
+    )
+    budget = _state_budget_for_runner(SimpleNamespace(vllm_config=floor, **runner_kw))
+    assert budget is not None
+    assert budget.capacity == 6
+    assert budget.allocated_bytes == 6 * STATE_ROW_BYTES
+
+
+def test_four_synchronous_requests_need_twenty_four_rows():
+    cfg = config(max_concurrent_batches=1)
+    cfg.scheduler_config.max_num_seqs = 4
+    rows = state_cache_rows_per_request(cfg, 3)
+    assert rows == 6
+    needed = 4 * rows * STATE_ROW_BYTES
+    mib = (needed + MIB - 1) // MIB
+    assert mib == 1175
+    budget = StateCacheBudget.from_bytes(mib * MIB, STATE_ROW_BYTES)
+    assert budget.capacity == 24
+    assert budget.capacity // rows == 4
+    assert StateCacheBudget.from_bytes(1174 * MIB, STATE_ROW_BYTES).capacity == 23
 
 
 def test_budget_below_inflight_working_reserve_fails_before_pool_allocation():

@@ -138,4 +138,11 @@ These finite workloads establish their observed event coverage and output
 comparisons. They are not an HTTP/network test, a multiprocessing-shutdown test,
 or a long-duration service soak. All ordinary requests currently use fixed
 output limits with `ignore_eos=True`; varied limits and explicit cancellation
-exercise departures, but do not constitute natural-EOS coverage.
+exercise departures, but do not constitute natural-EOS coverage. For that
+missing check, run a **separate** pair with `--no-ignore-eos --apply-chat-template`
+so prompts go through the model's chat template and sequences may finish on
+configured EOS tokens. Keep the same non-budget arguments in both arms. Record
+finish reasons and complete outputs; do not relabel a fixed-length
+`ignore_eos=True` archive as natural-stop evidence. Matching-schedule
+no-quota/C83 diagnostic controls are host-specific: unless a host re-runs
+them, treat the published controls as belonging to the original 64 GB archive.

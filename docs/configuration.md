@@ -63,6 +63,12 @@ vllm serve /path/to/model \
   --additional-config '{"state_cache_budget_mib": 2048}'
 ```
 
+The `2048` value is an example. Size it from the row formula above, the target
+concurrency, whether asynchronous scheduling is enabled, how many idle
+checkpoints to keep, and the host's planned Metal budget. The published 27B
+pairs use 2048 MiB so that those archives stay comparable; they are not a
+recommendation to use 2048 MiB on every machine.
+
 `state_cache_budget_mib` is a positive integer measured in MiB (2^20 bytes).
 Omit the key to keep the existing compact, demand-grown state cache. This is
 an experimental, per-engine option; it does not change the model weights or
@@ -111,11 +117,26 @@ or completing the request releases ownership; in-flight physical rows still
 wait for their GPU fence. Ordinary streaming output uses the same request
 lifecycle as non-streaming output.
 
+Do not copy one MiB value across machines or serving shapes. Omitting
+`state_cache_budget_mib` keeps the compact, demand-grown state cache. When the
+option is set, the working reserve is `(B + 1) * G` physical rows per running
+request, where `B` is `max_concurrent_batches` (1 when asynchronous scheduling
+is off, otherwise the engine's in-flight batch depth) and `G` is the number of
+striped GDN groups. The scheduler admits at most `floor(capacity / ((B + 1) *
+G))` running requests. A budget smaller than one request's working rows is
+rejected at startup. Extra rows above that floor are available for idle
+prefix checkpoints; they are not required for a single in-flight request.
+
 For Qwen3.8-27B with the current BF16-conv/FP32-recurrent geometry, a physical
-row across 16 shared pools is 48.9375 MiB. Three GDN groups consume three rows
-for one complete model state. A 2048 MiB setting admits 41 physical rows, and
-under two in-flight batches supports at most four running requests. Other
-models and dtypes have different row sizes; use the reported resolved values.
+row across 16 shared pools is 48.9375 MiB and `G = 3`. One synchronous request
+therefore needs 6 rows (294 MiB). Four asynchronous requests at `B = 2` need 36
+working rows (1762 MiB) before any spare checkpoint capacity. The 2048 MiB
+serve example above admits 41 rows, which is a reproducible **benchmark** setting for
+that four-request asynchronous 27B matrix on 48 GB / 64 GB hosts, not a default
+for every RAM size. On a tighter host, a one-request 294 MiB budget can assign
+more memory to KV than 2048 MiB, because the stable pool is fully allocated at
+startup. Other models and dtypes have different row sizes; use the resolved
+slot size and running-request limit printed at startup.
 
 The additional state scratch allowance is `(3 * B + 1) * R * F`, where `B` is
 the maximum number of in-flight batches, `R` is the admitted request limit

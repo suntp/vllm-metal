@@ -2,8 +2,16 @@
 
 `tools/state_cache_budget_bench.py` compares the existing compact-slot behavior
 with the opt-in `state_cache_budget_mib` setting on the same source checkout.
-It supports a 48 GB M5 Max or a 64 GB M5 Pro; record the actual device and memory
-from each report instead of comparing machines as if their memory budgets match.
+It supports a 48 GB M5 Max, a 64 GB M5 Pro, or another Apple Silicon host;
+record the actual device and memory from each report instead of comparing
+machines as if their memory budgets match. The 0.8B `256` MiB and 27B `2048`
+MiB values in the paste-and-run blocks are **reproducible benchmark settings
+for those case sets**, not automatically selected optima for every RAM size.
+A one-request minimum or a concurrency-sized budget is a separate experiment:
+keep every non-budget argument identical inside that pair, and do not fold the
+results into the standard 08b/27b matrix. Hosts with less planned Metal memory
+may reject the published 27B `.70` / 2048 MiB / 8192 combination even though
+the 0.8B case set still fits.
 
 ## Prepare an isolated source environment
 
@@ -268,6 +276,17 @@ For longer prompts, increase both `--max-model-len` and `--prompt-lengths`, keep
 prompt length plus `--max-new-tokens` within the model limit. Increase `--repeats`
 for more churn and use a range of feasible budgets. A concurrency argument is
 the submitted batch size; the actual scheduler running limit can be smaller.
+
+A 32 GB-class host that cannot start the published 27B `.70` / 2048 MiB
+matrix should keep that rejection as a host-specific result and add **new**
+pairs instead of editing the 08b/27b case set. Two useful extra pairs, each
+with identical non-budget arguments on both arms:
+
+- one synchronous request at the 27B working-row floor (`state_cache_budget_mib=294`);
+- four synchronous requests at the concurrency floor (`1175` MiB for 24 rows).
+
+Publish those JSON/logs under a distinct directory. They do not replace the
+standard matrix or the 48 GB / 64 GB 2048 MiB archives.
 
 For cache-hit coverage, prefer `k * B + 1` tokens, where `B` is the actual
 resolved cache block size: `545,2177` for `B=544`, or `785,6273` for `B=784`.

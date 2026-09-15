@@ -34,7 +34,12 @@ def write_json(path: Path, value: dict) -> None:
 
 
 def workload(
-    tokenizer, block: int, scenario: str, waves: int = 1, wave_interval: float = 2.0
+    tokenizer,
+    block: int,
+    scenario: str,
+    waves: int = 1,
+    wave_interval: float = 2.0,
+    ignore_eos: bool = True,
 ) -> list[dict]:
     if scenario == "mixed":
         shapes = [
@@ -73,13 +78,64 @@ def workload(
                         tokenizer, length, index
                     ),
                     "max_tokens": output,
-                    "ignore_eos": True,
+                    "ignore_eos": ignore_eos,
                     "sampling": {"temperature": 0, "logprobs": None, "seed": 0},
                     "arrival_offset_s": wave * wave_interval + arrival,
                     "cancel_stage": cancel,
                 }
             )
     return result
+
+
+def apply_chat_template_to_plan(tokenizer, plan: list[dict]) -> None:
+    """Rebuild each planned prompt through the tokenizer chat template.
+
+    Planned token counts stay exact so block-size coverage does not change.
+    The template plus generation prompt must fit the shortest planned prompt.
+    """
+    template = getattr(tokenizer, "chat_template", None)
+    if not template:
+        raise ValueError("apply_chat_template requires a tokenizer chat_template")
+    for item in plan:
+        length = len(item["prompt_token_ids"])
+        wrapped = tokenizer.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": f"Library request {item['request_id']}. Continue.",
+                }
+            ],
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=False,
+        )
+        if hasattr(wrapped, "input_ids"):
+            wrapped = wrapped["input_ids"]
+        if hasattr(wrapped, "tolist"):
+            wrapped = wrapped.tolist()
+        if wrapped and isinstance(wrapped, list) and wrapped and isinstance(
+            wrapped[0], list
+        ):
+            wrapped = wrapped[0]
+        if isinstance(wrapped, str):
+            wrapped = tokenizer.encode(wrapped, add_special_tokens=False)
+        try:
+            wrapped = [int(token) for token in wrapped]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("chat template produced no prompt tokens") from exc
+        if not wrapped:
+            raise ValueError("chat template produced no prompt tokens")
+        if len(wrapped) > length:
+            raise ValueError(
+                f"{item['request_id']}: chat template has {len(wrapped)} tokens, "
+                f"planned prompt is {length}"
+            )
+        suffix = item["request_id"].rsplit("-", 1)[-1]
+        pad_index = int(suffix) if suffix.isdigit() else 0
+        pad = bench.build_prompt_tokens(
+            tokenizer, length - len(wrapped), pad_index
+        )
+        item["prompt_token_ids"] = wrapped + pad
 
 
 class Observer:
@@ -257,6 +313,8 @@ def run(args) -> dict:
             "async_scheduling",
             "waves",
             "wave_interval_seconds",
+            "ignore_eos",
+            "apply_chat_template",
         )
     }
     config.update(
@@ -361,14 +419,17 @@ def run(args) -> dict:
         report["metadata"]["chat_template_sha256"] = bench.digest(
             tokenizer.chat_template
         )
-        report["metadata"]["chat_template_applied"] = False
+        report["metadata"]["chat_template_applied"] = bool(args.apply_chat_template)
         plan = workload(
             tokenizer,
             args.block_size,
             args.scenario,
             args.waves,
             args.wave_interval_seconds,
+            ignore_eos=args.ignore_eos,
         )
+        if args.apply_chat_template:
+            apply_chat_template_to_plan(tokenizer, plan)
         records = {
             item["request_id"]: {
                 **item,
@@ -548,6 +609,17 @@ def main() -> int:
     p.add_argument("--max-steps", type=int, default=10000)
     p.add_argument("--waves", type=int, default=3)
     p.add_argument("--wave-interval-seconds", type=float, default=2.0)
+    p.add_argument(
+        "--ignore-eos",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="default True keeps the fixed-length gate; --no-ignore-eos allows configured EOS",
+    )
+    p.add_argument(
+        "--apply-chat-template",
+        action="store_true",
+        help="rebuild planned prompts through the tokenizer chat template",
+    )
     p = sub.add_parser("compare")
     p.add_argument("--baseline", type=Path, required=True)
     p.add_argument("--budget", type=Path, required=True)
