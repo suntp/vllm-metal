@@ -113,8 +113,11 @@ def apply_chat_template_to_plan(tokenizer, plan: list[dict]) -> None:
             wrapped = wrapped["input_ids"]
         if hasattr(wrapped, "tolist"):
             wrapped = wrapped.tolist()
-        if wrapped and isinstance(wrapped, list) and wrapped and isinstance(
-            wrapped[0], list
+        if (
+            wrapped
+            and isinstance(wrapped, list)
+            and wrapped
+            and isinstance(wrapped[0], list)
         ):
             wrapped = wrapped[0]
         if isinstance(wrapped, str):
@@ -132,9 +135,7 @@ def apply_chat_template_to_plan(tokenizer, plan: list[dict]) -> None:
             )
         suffix = item["request_id"].rsplit("-", 1)[-1]
         pad_index = int(suffix) if suffix.isdigit() else 0
-        pad = bench.build_prompt_tokens(
-            tokenizer, length - len(wrapped), pad_index
-        )
+        pad = bench.build_prompt_tokens(tokenizer, length - len(wrapped), pad_index)
         item["prompt_token_ids"] = wrapped + pad
 
 

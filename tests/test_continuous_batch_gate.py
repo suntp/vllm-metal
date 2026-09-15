@@ -206,7 +206,9 @@ def test_workload_can_allow_configured_eos():
 class _ChatTokenizer(FakeTokenizer):
     chat_template = "{{ messages }}"
 
-    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, **kwargs):
+    def apply_chat_template(
+        self, messages, *, tokenize, add_generation_prompt, **kwargs
+    ):
         assert tokenize is True
         assert add_generation_prompt is True
         assert messages[0]["role"] == "user"
@@ -215,19 +217,25 @@ class _ChatTokenizer(FakeTokenizer):
 
 def test_chat_template_coerces_numpy_int_tokens():
     class Int64Tokenizer(_ChatTokenizer):
-        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, **kwargs):
+        def apply_chat_template(
+            self, messages, *, tokenize, add_generation_prompt, **kwargs
+        ):
             del messages, tokenize, add_generation_prompt, kwargs
             return [type("I64", (int,), {})(9), type("I64", (int,), {})(10)]
 
     plan = gate.workload(FakeTokenizer(), 544, "pressure")
     gate.apply_chat_template_to_plan(Int64Tokenizer(), plan)
     assert all(item["prompt_token_ids"][:2] == [9, 10] for item in plan)
-    assert all(type(token) is int for item in plan for token in item["prompt_token_ids"][:2])
+    assert all(
+        type(token) is int for item in plan for token in item["prompt_token_ids"][:2]
+    )
 
 
 def test_chat_template_accepts_numpy_token_ids():
     class ArrayTokenizer(_ChatTokenizer):
-        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, **kwargs):
+        def apply_chat_template(
+            self, messages, *, tokenize, add_generation_prompt, **kwargs
+        ):
             del messages, tokenize, add_generation_prompt, kwargs
             return type("Arr", (), {"tolist": staticmethod(lambda: [7, 8])})()
 
