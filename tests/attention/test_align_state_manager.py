@@ -420,7 +420,6 @@ class TestHybridAlignRuntime:
         pipeline = DecodePipeline(build_output=lambda batch: batch, validate=Mock())
         runtime = Mock(spec=HybridPagedAttentionRuntime)
         runtime.state_slot_capacity = 2
-        runtime.requires_state_cache_barrier.return_value = True
         runner = SimpleNamespace(
             _paged_attention_runtime=runtime, _decode_pipeline=pipeline
         )

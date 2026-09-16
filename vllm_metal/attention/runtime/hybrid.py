@@ -200,12 +200,6 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
     def state_slot_capacity(self) -> int | None:
         return self._state_slot_capacity
 
-    def requires_state_cache_barrier(self, step: StateCacheStep) -> bool:
-        manager = self.state_manager
-        return isinstance(
-            manager, AlignStateManager
-        ) and manager.requires_state_cache_barrier(step)
-
     def prepare_state_cache_step(self, step: StateCacheStep) -> None:
         if self._state_slot_capacity is None:
             raise RuntimeError("state catalogs require a bounded GDN runtime")

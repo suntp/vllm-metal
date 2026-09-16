@@ -119,14 +119,6 @@ class AlignStateManager:
     def step_sequence(self) -> int:
         return self._last_step_sequence
 
-    def requires_state_cache_barrier(self, step: StateCacheStep) -> bool:
-        """Whether applying this catalog can hand a physical slot to a new owner."""
-        resident = dict(step.resident_blocks)
-        return any(
-            resident.get(block_id) != self._generation_of[block_id]
-            for block_id in self._slot_of
-        )
-
     def prepare_state_cache_step(self, step: StateCacheStep) -> None:
         """Apply an ordered scheduler catalog before any state reads or writes.
 
