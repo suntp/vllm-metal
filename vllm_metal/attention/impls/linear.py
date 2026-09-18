@@ -464,7 +464,11 @@ class GDNPagedAttentionWrapper(nn.Module):
             d_k,
             d_v,
         )
-        mx.eval(y_flat, recurrent_pool)
+        # The native call encodes writes outside MLX's lazy graph. Both arrays
+        # were already evaluated above, so evaluating them again cannot wait
+        # for those writes. Complete the producer stream before the output or
+        # an alias of the shared state is read on the CPU or another stream.
+        mx.synchronize(mx.default_stream(mx.gpu))
         return y_flat.astype(state.x.dtype)
 
     def _project_output(
