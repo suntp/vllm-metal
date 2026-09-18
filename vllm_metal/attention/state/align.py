@@ -42,9 +42,16 @@ if TYPE_CHECKING:
 class AlignStateManager:
     """Drive block-indexed state for align-mode prefix caching."""
 
-    def __init__(self, state_cache: PagedStateCache, block_size: int) -> None:
+    def __init__(
+        self,
+        state_cache: PagedStateCache,
+        block_size: int,
+        *,
+        mamba_cache_mode: str = "align",
+    ) -> None:
         self._state_cache = state_cache
         self._block_size = block_size
+        self._mamba_cache_mode = mamba_cache_mode
         self._needs_materialize = False
 
     @property
@@ -80,9 +87,10 @@ class AlignStateManager:
             )
         num_groups = len(state_block_ids[0]) if state_block_ids else 0
 
-        # The lazy kernels' deferred compact updates are keyed by slab id;
-        # slabs can move between steps here, so drain them before planning.
-        self._state_cache.apply_pending_states()
+        # Align mode materializes prefix checkpoints. None mode keeps compact
+        # decode updates until a slot is copied, reset, or the request is released.
+        if self._mamba_cache_mode == "align":
+            self._state_cache.apply_pending_states()
 
         group_mappings: list[list[int]] = []
         for group in range(num_groups):
@@ -122,20 +130,15 @@ class AlignStateManager:
             group_mappings.append(dst_ids)
 
         ctx.state_group_slot_mappings = tuple(group_mappings)
-        self._needs_materialize = True
+        self._needs_materialize |= self._mamba_cache_mode == "align"
 
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
         """Append authoritative state arrays that the forward mutates."""
         outputs.extend(self._state_cache.updated_state_arrays())
 
     def release_requests(self, req_ids: set[str]) -> None:
-        """Slabs belong to scheduler blocks, not requests — nothing to free.
-
-        Preempted/finished requests leave their last written slab in place;
-        the scheduler either caches that block (checkpoint) or frees and
-        reuses it, in which case the next owner zero-inits or copies over it.
-        """
-        del req_ids
+        """Materialize deferred updates at a request lifecycle boundary."""
+        self._needs_materialize |= bool(req_ids)
 
     def materialize_pending_state(self) -> None:
         """Force stable state arrays out of the lazy graph between steps."""

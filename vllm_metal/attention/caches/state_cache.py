@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -112,6 +112,7 @@ class PagedStateCache:
             return
         self.require_allocated_slots(src_ids)
         self.require_allocated_slots(dst_ids)
+        self.apply_pending_states([*src_ids, *dst_ids])
         src = mx.array(src_ids, dtype=mx.int32)
         dst = mx.array(dst_ids, dtype=mx.int32)
         for layer_idx in layer_indices:
@@ -134,6 +135,7 @@ class PagedStateCache:
         if not slot_ids or not layer_indices:
             return
         self.require_allocated_slots(slot_ids)
+        self.apply_pending_states(slot_ids)
         ids = mx.array(slot_ids, dtype=mx.int32)
         for layer_idx in layer_indices:
             for states in (self.conv_states, self.recurrent_states):
@@ -324,7 +326,15 @@ class PagedStateCache:
         for layer_idx in range(self.num_layers):
             self.apply_pending_recurrent_state(layer_idx)
 
-    def apply_pending_states(self) -> None:
-        """Scatter all deferred conv and recurrent updates into stable pools."""
-        self.apply_pending_conv_states()
-        self.apply_pending_recurrent_states()
+    def apply_pending_states(self, slot_ids: Sequence[int] | None = None) -> None:
+        """Flush pending components touching these slots, or all when omitted."""
+        slots = None if slot_ids is None else set(slot_ids)
+        for layer_idx in range(self.num_layers):
+            if slots is None or slots.intersection(
+                self.pending_conv_slot_ids[layer_idx] or ()
+            ):
+                self.apply_pending_conv_state(layer_idx)
+            if slots is None or slots.intersection(
+                self.pending_recurrent_slot_ids[layer_idx] or ()
+            ):
+                self.apply_pending_recurrent_state(layer_idx)

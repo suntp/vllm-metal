@@ -13,7 +13,7 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 from vllm.logger import init_logger
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.state_cache import PagedStateCache
@@ -96,10 +96,12 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         self._state_cache = PagedStateCache(
             self.storage.state_views(state_names), group_ordinals
         )
-        state_spec = config.kv_cache_groups[self._state_group_indices[0]].kv_cache_spec
+        state_spec = self.storage.specs[state_names[0]]
+        assert isinstance(state_spec, MambaSpec)
         self._state_manager = AlignStateManager(
             self._state_cache,
             state_spec.block_size,
+            mamba_cache_mode=state_spec.mamba_cache_mode,
         )
         logger.info(
             "Hybrid shared cache: %d blocks, %.2f GiB backing for KV and state",
@@ -179,12 +181,14 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         return True
 
     def zero_blocks(self, block_ids: Sequence[int]) -> None:
-        self.state_cache.apply_pending_states()
+        self.state_cache.apply_pending_states(block_ids)
         self.storage.zero_blocks(block_ids)
 
     def copy_blocks(self, block_copies: Sequence[tuple[int, int]]) -> None:
         """Apply scheduler CoW copies to SDPA KV and align-mode state."""
-        self.state_cache.apply_pending_states()
+        self.state_cache.apply_pending_states(
+            [slot for pair in block_copies for slot in pair]
+        )
         self.storage.copy_blocks(block_copies)
 
     def populate_step_context(
