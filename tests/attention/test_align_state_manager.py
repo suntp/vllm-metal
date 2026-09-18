@@ -77,6 +77,47 @@ class TestAlignStateManager:
         conv, rec = _slab(cache, 0, 3)
         assert np.all(conv == 0) and np.all(rec == 0)
 
+    def test_none_mode_keeps_compact_updates_between_decode_steps(self) -> None:
+        cache = _make_cache()
+        manager = AlignStateManager(cache, 4096, mamba_cache_mode="none")
+        self._populate(manager, ["a"], [[[3]]], [(0, 1)])
+        cache.set_pending_recurrent_state(
+            0, [3], mx.full((1, 1, 4, 32), 9, dtype=mx.float32)
+        )
+
+        manager.materialize_pending_state()
+        self._populate(manager, ["a"], [[[3]]], [(1, 1)])
+
+        view = cache.recurrent_state_for_decode(0, [3])
+        assert view.uses_compact_state
+        np.testing.assert_array_equal(np.array(view.state), 9)
+        np.testing.assert_array_equal(np.array(cache.recurrent_states[0][3]), 0)
+
+        manager.release_requests({"a"})
+        manager.materialize_pending_state()
+        assert not cache.has_pending_recurrent_state(0)
+        np.testing.assert_array_equal(np.array(cache.recurrent_states[0][3]), 9)
+
+    def test_state_motion_flushes_only_intersecting_pending_updates(self) -> None:
+        cache = _make_cache()
+        for layer, slot, value in [(0, 3, 7), (1, 6, 9)]:
+            cache.set_pending_conv_state(
+                layer, [slot], mx.full((1, 1, 4), value, dtype=mx.float32)
+            )
+        cache.copy_slots([3], [4], [0])
+        assert cache.has_pending_conv_state(1)
+        np.testing.assert_array_equal(np.array(cache.conv_states[0][4]), 7)
+
+        cache.set_pending_conv_state(0, [3], mx.full((1, 1, 4), 11, dtype=mx.float32))
+        cache.zero_slots([3], [0])
+        assert not cache.has_pending_conv_state(0)
+        assert cache.has_pending_conv_state(1)
+        cache.apply_pending_states()
+        mx.eval(*cache.updated_state_arrays())
+        np.testing.assert_array_equal(np.array(cache.conv_states[0][3]), 0)
+        np.testing.assert_array_equal(np.array(cache.conv_states[0][4]), 7)
+        np.testing.assert_array_equal(np.array(cache.conv_states[1][6]), 9)
+
     def test_boundary_crossing_copies_forward_and_keeps_checkpoint(self) -> None:
         cache = _make_cache()
         manager = AlignStateManager(cache, BLOCK)
@@ -166,3 +207,20 @@ class TestHybridAlignRuntime:
         assert not cache.has_pending_conv_state(0)
         assert not cache.has_pending_recurrent_state(0)
         assert runtime.state_manager.needs_materialize is False
+
+
+def test_scheduler_copy_and_zero_preserve_unrelated_compact_updates():
+    runtime = TestHybridAlignRuntime()._make_runtime()
+    initialize_hybrid_runtime(runtime, 8, mamba_cache_mode="align")
+    cache = runtime.state_cache
+    cache.set_pending_recurrent_state(
+        0, [3], mx.full((1, 1, 4, 32), 9, dtype=mx.float32)
+    )
+
+    runtime.zero_blocks([1])
+    runtime.copy_blocks([(1, 2)])
+    assert cache.has_pending_recurrent_state(0)
+    runtime.copy_blocks([(3, 4)])
+    assert not cache.has_pending_recurrent_state(0)
+    mx.eval(runtime.storage.buffer)
+    np.testing.assert_array_equal(np.array(cache.recurrent_states[0][4]), 9)
