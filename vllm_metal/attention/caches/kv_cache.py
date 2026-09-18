@@ -14,6 +14,7 @@ from collections.abc import Sequence
 import mlx.core as mx
 import torch
 from vllm.logger import init_logger
+from vllm.v1.kv_cache_interface import KVCacheLayout
 
 from vllm_metal.attention.caches.attention_layout import AttentionKVCacheLayout
 from vllm_metal.attention.caches.turboquant import (
@@ -40,6 +41,12 @@ class MetalPagedKVCache:
     @classmethod
     def from_upstream(cls, storage, names, *, dtype=mx.float16):
         """Bind attention views into vLLM's allocation."""
+        layout = KVCacheLayout[storage.config.kv_cache_layout or "LBNHC"]
+        if layout not in (KVCacheLayout.LBNHC, KVCacheLayout.BLNHC):
+            raise ValueError(
+                "Metal paged attention requires token-major KV layout "
+                f"LBNHC or BLNHC; received {layout.name}"
+            )
         specs = [storage.specs[name] for name in names]
         turboquant = hasattr(specs[0], "k_quant")
         cache = cls(
