@@ -75,6 +75,10 @@ class CacheViewPrimitive : public Primitive {
 void register_mlx_patch(nb::module_& m) {
   m.def("cache_view", [](nb::handle buffer_h, const std::vector<int>& shape,
                           const std::vector<size_t>& strides, size_t offset) {
+    nb::object array_cls = nb::module_::import_("mlx.core").attr("array");
+    if (!nb::isinstance(buffer_h, array_cls)) {
+      throw nb::type_error("cache_view: buffer must be mlx.core.array");
+    }
     const auto& buffer = *nb::inst_ptr<array>(buffer_h);
     if (shape.size() != strides.size()) {
       throw std::invalid_argument("cache_view: shape/stride rank mismatch");
@@ -115,7 +119,7 @@ void register_mlx_patch(nb::module_& m) {
             default_stream(Device::gpu), view_shape, view_strides,
             static_cast<int64_t>(offset), end - offset + 1),
         {buffer})[0];
-    nb::object out = nb::module_::import_("mlx.core").attr("array")(0);
+    nb::object out = array_cls(0);
     nb::inst_ptr<array>(out)->overwrite_descriptor(result);
     return out;
   });
