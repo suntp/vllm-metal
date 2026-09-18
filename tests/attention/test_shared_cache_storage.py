@@ -3,6 +3,7 @@
 
 import mlx.core as mx
 import numpy as np
+import pytest
 import torch
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -116,3 +117,15 @@ def test_packed_kv_store_preserves_strides_and_shared_backing():
     assert torch.all(key[2, 3] == 3)
     assert torch.all(value[2, 3] == 5)
     assert torch.all(key[2, 2] == 0)
+
+
+@pytest.mark.parametrize("layout", ["LBHNC", "BLHNC", "LHBNC", "BHLNC"])
+def test_attention_rejects_heads_outer_layouts(layout):
+    from dataclasses import replace
+
+    from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+
+    config = replace(make_storage().config, kv_cache_layout=layout)
+    storage = KVCacheStorage(config)
+    with pytest.raises(ValueError, match=f"token-major.*{layout}"):
+        MetalPagedKVCache.from_upstream(storage, ["a0", "a1"])
