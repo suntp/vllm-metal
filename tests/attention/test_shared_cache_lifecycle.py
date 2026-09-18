@@ -95,6 +95,7 @@ def _scheduler_and_runtime():
         speculative_config=None,
         num_speculative_tokens=0,
         num_lookahead_tokens=0,
+        num_prefill_lookahead_tokens=0,
         max_in_flight_tokens=64,
         max_concurrent_batches=1,
         use_v2_model_runner=False,
