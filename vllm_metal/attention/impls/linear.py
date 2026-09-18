@@ -434,22 +434,8 @@ class GDNPagedAttentionWrapper(nn.Module):
         # Stable request → slot mapping from model_runner's allocator.
         slot_mapping = mx.array(state.slot_ids, dtype=mx.int32)
 
-        y_flat = mx.zeros((total_tokens, n_hv, d_v), dtype=kernel_dtype)
-
-        mx.eval(
-            q_flat,
-            k_flat,
-            v_flat,
-            g_flat,
-            beta_flat,
-            recurrent_pool,
-            cu_seqlens_arr,
-            slot_mapping,
-            y_flat,
-        )
-
         ops = get_ops()
-        ops.gdn_linear_attention(
+        y_flat, recurrent_pool = ops.gdn_linear_attention(
             q_flat,
             k_flat,
             v_flat,
@@ -458,17 +444,14 @@ class GDNPagedAttentionWrapper(nn.Module):
             recurrent_pool,
             cu_seqlens_arr,
             slot_mapping,
-            y_flat,
             n_hk,
             n_hv,
             d_k,
             d_v,
         )
-        # The native call encodes writes outside MLX's lazy graph. Both arrays
-        # were already evaluated above, so evaluating them again cannot wait
-        # for those writes. Complete the producer stream before the output or
-        # an alias of the shared state is read on the CPU or another stream.
-        mx.synchronize(mx.default_stream(mx.gpu))
+        # Publish the primitive's state output to the shared storage owner;
+        # subsequent aliases and output consumers inherit its dependencies.
+        self._gdn_state_cache.store_recurrent_state(self._gdn_cache_idx, recurrent_pool)
         return y_flat.astype(state.x.dtype)
 
     def _project_output(

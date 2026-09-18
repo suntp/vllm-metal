@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Exercise graph-external GDN writes against real MLX/Metal consumers."""
+"""Exercise native GDN graph dependencies with real MLX/Metal consumers."""
 
 from __future__ import annotations
 
@@ -109,8 +109,8 @@ def _expected_pool(values):
 
 
 def _host_state(case):
-    # Read the original upstream-owned strided backing without enqueuing a
-    # fresh GPU operation that could accidentally flush the native writer.
+    # Called after explicit evaluation: read the original upstream-owned
+    # strided backing without adding a GPU consumer to mask a missing edge.
     pages = case.storage.tensors["s0"].squeeze(dim=(1, 2))
     nbytes = 128 * torch.empty((), dtype=case.torch_state).element_size()
     return (
@@ -135,6 +135,67 @@ def test_fallback_shared_buffer_eval_completes_native_state_write(fallback_case)
         _host_state(fallback_case), _expected_pool({2: 1, 0: 1})
     )
     assert not fallback_case.storage.tensors["s1"].any()
+
+
+def test_fallback_builds_graph_without_host_wait(fallback_case, monkeypatch):
+    with monkeypatch.context() as guard:
+
+        def no_host_wait(*args, **kwargs):
+            pytest.fail("fallback construction must not evaluate or synchronize")
+
+        guard.setattr(mx, "eval", no_host_wait)
+        guard.setattr(mx, "synchronize", no_host_wait)
+        output = _step(fallback_case)
+    mx.eval(output)
+    np.testing.assert_array_equal(np.array(output), 1)
+
+
+def test_fallback_custom_producer_feeds_other_stream(fallback_case):
+    producer = mx.new_stream(mx.gpu)
+    consumer = mx.new_stream(mx.gpu)
+    with mx.stream(producer):
+        output = _step(fallback_case)
+    with mx.stream(consumer):
+        observed = output + 0
+        state = fallback_case.cache.recurrent_states[0] + 0
+        mx.eval(observed, state)
+    np.testing.assert_array_equal(np.array(observed), 1)
+    np.testing.assert_array_equal(np.array(state), _expected_pool({2: 1, 0: 1}))
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_native_recurrences_retain_distinct_outputs(fallback_case, compiled):
+    ops = get_ops()
+
+    def two_steps(q, v, g, beta, state, cu_seqlens, slots):
+        first, state = ops.gdn_linear_attention(
+            q, q, v, g, beta, state, cu_seqlens, slots, 1, 1, 32, 4
+        )
+        second, state = ops.gdn_linear_attention(
+            q, q, v, g, beta, state, cu_seqlens, slots, 1, 1, 32, 4
+        )
+        return first, second, state
+
+    run = mx.compile(two_steps) if compiled else two_steps
+    state = fallback_case.cache.recurrent_states[0]
+    unit = np.zeros((2, 1, 32), dtype=np.float32)
+    unit[..., 0] = 1
+    first, second, state = run(
+        mx.array(unit, dtype=state.dtype),
+        mx.full((2, 1, 4), 2, dtype=state.dtype),
+        mx.ones((2, 1), dtype=state.dtype),
+        mx.full((2, 1), 0.5, dtype=state.dtype),
+        state,
+        mx.array([0, 1, 2], dtype=mx.int32),
+        mx.array([2, 0], dtype=mx.int32),
+    )
+    fallback_case.cache.store_recurrent_state(0, state)
+    mx.eval(first, second, fallback_case.storage.buffer)
+    np.testing.assert_array_equal(np.array(first), 1)
+    np.testing.assert_array_equal(np.array(second), 1.5)
+    np.testing.assert_array_equal(
+        _host_state(fallback_case), _expected_pool({2: 1.5, 0: 1.5})
+    )
 
 
 @pytest.mark.parametrize("different_stream", [False, True])
