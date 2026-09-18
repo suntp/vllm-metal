@@ -981,6 +981,17 @@ class WorkerCachePlanner:
                 overhead=overhead,
             )
             budget -= self._worker.model_runner.draft_scratch_reserve_bytes()
+            if self._worker.model_runner.is_hybrid:
+                # Hybrid KV and state share one Metal buffer.
+                buffer_limit = int(mx.device_info()["max_buffer_length"])
+                if budget > buffer_limit:
+                    logger.warning(
+                        "Reducing hybrid KV cache budget from %.2f GB to %.2f GB "
+                        "to fit Metal's single-buffer limit (max_buffer_length).",
+                        budget / 1e9,
+                        buffer_limit / 1e9,
+                    )
+                budget = min(budget, buffer_limit)
             logger.info(
                 "Mixed attention layout: reporting %.2f GB KV budget; "
                 "runtime allocation deferred until vLLM KVCacheConfig",
