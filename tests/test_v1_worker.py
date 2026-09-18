@@ -191,6 +191,30 @@ class TestWorkerRunnerBoundaryDelegation:
         setup_paged_attention.assert_called_once_with(overhead=measured_overhead)
         worker.get_cache_block_size_bytes.assert_called_once_with()
 
+    @pytest.mark.parametrize(
+        ("is_hybrid", "profiled_budget", "expected"),
+        [(True, 16_384, 8_192), (True, 4_096, 4_096), (False, 16_384, 16_384)],
+    )
+    def test_deferred_budget_caps_only_single_buffer_storage(
+        self, monkeypatch, is_hybrid, profiled_budget, expected
+    ) -> None:
+        runner = SimpleNamespace(
+            is_hybrid=is_hybrid,
+            scheduler_memory_reporting_mode=lambda: "paged_attention_layout_budget",
+            profile_run=lambda: 0,
+            draft_scratch_reserve_bytes=lambda: 0,
+        )
+        planner = WorkerCachePlanner(_make_worker(runner))
+        monkeypatch.setattr(planner, "_metal_limit_bytes", lambda: profiled_budget)
+        monkeypatch.setattr(planner, "_memory_fraction", lambda: 1.0)
+        monkeypatch.setattr(planner, "get_model_memory_usage", lambda: 0)
+        monkeypatch.setattr(
+            "vllm_metal.v1.cache_policy.mx.device_info",
+            lambda: {"max_buffer_length": 8_192},
+        )
+
+        assert planner.determine_available_memory() == expected
+
 
 class TestPagedAttentionPlanDiagnostics:
     def _make_planner(
