@@ -983,7 +983,7 @@ class WorkerCachePlanner:
                 overhead=overhead,
             )
             budget -= self._worker.model_runner.draft_scratch_reserve_bytes()
-            if self._worker.model_runner.is_hybrid:
+            if self._worker.model_runner.is_hybrid and not self._layer_compact_layout:
                 budget = self._cap_hybrid_budget_at_buffer_limit(budget)
             logger.info(
                 "Mixed attention layout: reporting %.2f GB KV budget; "
@@ -1009,14 +1009,20 @@ class WorkerCachePlanner:
         """Return cache bytes after model weights and execution overhead."""
         return int(metal_limit * fraction) - model_memory - overhead
 
+    @property
+    def _layer_compact_layout(self) -> bool:
+        """Whether the resolved layout lets the hybrid backing split per layer."""
+        layout = self._worker.vllm_config.cache_config.get_resolved_kv_cache_layout()
+        return layout.is_layer_compact
+
     def _cap_hybrid_budget_at_buffer_limit(self, budget: int) -> int:
         """Cap the hybrid cache budget at Metal's single-buffer limit.
 
-        The hybrid KV and state backing is one Metal allocation, so it must
-        fit ``max_buffer_length`` even when the requested
-        ``--gpu-memory-utilization`` would fund more. That cap silently
-        shrinks real capacity on hosts where the request exceeds the limit,
-        so the reduction is announced with both sizes in the capacity log;
+        Block-outermost layouts interleave every group inside one block, so
+        the hybrid KV and state backing must be one Metal allocation and fits
+        ``max_buffer_length`` only. Layer-compact layouts split the backing
+        per layer region instead (see ``KVCacheStorage``) and skip this cap.
+        The reduction is announced with both sizes in the capacity log;
         ``VLLM_METAL_HYBRID_BUFFER_CAP=error`` turns it into a startup
         failure for operators who need the full requested capacity.
         """
