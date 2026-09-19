@@ -129,6 +129,22 @@ def test_geometry_check_rejects_shape_drift() -> None:
         runtime._validate_declared_state_geometry(Model(drifted_args))
 
 
+def test_geometry_check_revalidates_after_a_failed_attempt() -> None:
+    args = _model_args()
+    plan = build_hybrid_runtime_plan(
+        asdict(args), args.num_hidden_layers, (torch.bfloat16, torch.float32)
+    )
+    runtime = HybridPagedAttentionRuntime(hybrid_plan=plan, dtype=mx.float32)
+    drifted_args = _model_args(mamba_d_state=args.mamba_d_state + 8)
+
+    with pytest.raises(ValueError, match="state geometry drift"):
+        runtime._validate_declared_state_geometry(Model(drifted_args))
+    assert not runtime._geometry_validated
+
+    runtime._validate_declared_state_geometry(Model(args))
+    assert runtime._geometry_validated
+
+
 def test_geometry_check_rejects_layer_count_drift() -> None:
     args = _model_args(
         num_hidden_layers=5,
