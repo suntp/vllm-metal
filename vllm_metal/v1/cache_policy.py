@@ -1032,8 +1032,9 @@ class WorkerCachePlanner:
         requested = budget
         budget = buffer_limit
         message = (
-            "Hybrid KV and state share one Metal allocation capped at "
-            f"max_buffer_length: requested {requested / 1e9:.2f} GB of cache, "
+            "Block-outermost layout backs hybrid KV and state with one Metal "
+            f"allocation capped at max_buffer_length: requested "
+            f"{requested / 1e9:.2f} GB of cache, "
             f"reporting {budget / 1e9:.2f} GB ({(requested - budget) / 1e9:.2f} GB "
             "short of the request; scheduler block counts are derived from the "
             "capped budget). Lower --gpu-memory-utilization to make the request "
