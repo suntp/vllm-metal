@@ -114,11 +114,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_METAL_BUILD_FROM_SOURCE", "0") == "1"
     ),
     # How the hybrid cache planner reacts when the requested KV+state budget
-    # exceeds Metal's single-buffer limit (max_buffer_length). The whole hybrid
-    # backing is one Metal allocation, so the budget is capped to fit it and
-    # the real capacity shrinks below the requested --gpu-memory-utilization.
-    # "warn" (default) logs the requested vs. capped sizes; "error" fails
-    # startup instead of silently reducing capacity.
+    # cannot be honored. Block-outermost (BLNHC) layouts back the whole hybrid
+    # cache with one Metal allocation, so the budget is capped at Metal's
+    # single-buffer limit (max_buffer_length) and the real capacity shrinks
+    # below the requested --gpu-memory-utilization. Layer-compact (LBNHC)
+    # layouts split the backing into per-region buffers below that limit and
+    # are never capped. "warn" (default) logs the requested vs. capped sizes;
+    # "error" fails startup instead of silently reducing capacity.
     "VLLM_METAL_HYBRID_BUFFER_CAP": lambda: os.getenv(
         "VLLM_METAL_HYBRID_BUFFER_CAP", "warn"
     ),
