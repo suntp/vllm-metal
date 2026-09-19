@@ -192,6 +192,15 @@ class TestWorkerRunnerBoundaryDelegation:
         setup_paged_attention.assert_called_once_with(overhead=measured_overhead)
         worker.get_cache_block_size_bytes.assert_called_once_with()
 
+    @staticmethod
+    def _force_block_outermost(planner: WorkerCachePlanner) -> None:
+        """Route the planner through the capped single-buffer storage mode."""
+        from vllm.v1.kv_cache_interface import KVCacheLayout
+
+        planner._worker.cache_config.get_resolved_kv_cache_layout = (
+            lambda: KVCacheLayout["BLNHC"]
+        )
+
     @pytest.mark.parametrize(
         ("is_hybrid", "profiled_budget", "expected"),
         [(True, 16_384, 8_192), (True, 4_096, 4_096), (False, 16_384, 16_384)],
@@ -206,6 +215,8 @@ class TestWorkerRunnerBoundaryDelegation:
             draft_scratch_reserve_bytes=lambda: 0,
         )
         planner = WorkerCachePlanner(_make_worker(runner))
+        if is_hybrid:
+            self._force_block_outermost(planner)
         monkeypatch.setattr(planner, "_metal_limit_bytes", lambda: profiled_budget)
         monkeypatch.setattr(planner, "_memory_fraction", lambda: 1.0)
         monkeypatch.setattr(planner, "get_model_memory_usage", lambda: 0)
@@ -216,6 +227,32 @@ class TestWorkerRunnerBoundaryDelegation:
 
         assert planner.determine_available_memory() == expected
 
+    def test_layer_compact_hybrid_budget_skips_the_buffer_cap(
+        self, monkeypatch
+    ) -> None:
+        from vllm.v1.kv_cache_interface import KVCacheLayout
+
+        runner = SimpleNamespace(
+            is_hybrid=True,
+            scheduler_memory_reporting_mode=lambda: "paged_attention_layout_budget",
+            profile_run=lambda: 0,
+            draft_scratch_reserve_bytes=lambda: 0,
+        )
+        planner = WorkerCachePlanner(_make_worker(runner))
+        planner._worker.cache_config.get_resolved_kv_cache_layout = (
+            lambda: KVCacheLayout["LBNHC"]
+        )
+        planner._metal_limit_bytes = lambda: 32_760_000_000
+        planner._memory_fraction = lambda: 1.0
+        planner.get_model_memory_usage = lambda: 0
+        monkeypatch.setattr(
+            "vllm_metal.v1.cache_policy.mx.device_info",
+            lambda: {"max_buffer_length": 16_380_000_000},
+        )
+
+        # Per-region storage needs no single-buffer cap, even at 2x the limit.
+        assert planner.determine_available_memory() == 32_760_000_000
+
     def _budget_capped_runner(self) -> WorkerCachePlanner:
         runner = SimpleNamespace(
             is_hybrid=True,
@@ -224,6 +261,7 @@ class TestWorkerRunnerBoundaryDelegation:
             draft_scratch_reserve_bytes=lambda: 0,
         )
         planner = WorkerCachePlanner(_make_worker(runner))
+        self._force_block_outermost(planner)
         planner._metal_limit_bytes = lambda: 16_380_000_000
         planner._memory_fraction = lambda: 1.0
         planner.get_model_memory_usage = lambda: 0

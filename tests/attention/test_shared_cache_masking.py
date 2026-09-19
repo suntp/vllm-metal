@@ -101,16 +101,17 @@ def _poisoned_shared_cache(block_size: int, dtype: mx.Dtype) -> MetalPagedKVCach
     storage = KVCacheStorage(_config(block_size, dtype))
     # Poison the actual upstream-owned bytes in place, retaining the shared
     # import. Replacing storage.buffer would test a different allocation.
-    backing = storage.tensors[_STATE_NAMES[0]].untyped_storage()
-    torch.empty(0, dtype=torch.uint8).set_(backing).fill_(0xFF)
+    for raw in storage._region_storages:
+        raw.fill_(0xFF)
     cache = MetalPagedKVCache.from_upstream(storage, _ATTENTION_NAMES, dtype=dtype)
     _, recurrent = storage.state_views(_STATE_NAMES)
     assert recurrent[1].dtype == mx.float32
     assert np.isnan(np.array(recurrent[1][3])).all()
-    assert storage.tensors[_ATTENTION_NAMES[1]].storage_offset() > 0
+    # Per-layer regions: every layer view bases its own buffer at offset 0.
+    assert storage.tensors[_ATTENTION_NAMES[1]].storage_offset() == 0
     assert (
-        storage.tensors[_ATTENTION_NAMES[1]].untyped_storage().data_ptr()
-        == backing.data_ptr()
+        storage.tensors[_ATTENTION_NAMES[0]].untyped_storage()._cdata
+        != storage.tensors[_ATTENTION_NAMES[1]].untyped_storage()._cdata
     )
     return cache
 
