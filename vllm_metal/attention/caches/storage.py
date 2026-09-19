@@ -205,16 +205,20 @@ class KVCacheStorage:
                 self._region_storages, self._page_strides, strict=True
             )
         ]
+        self._chain_version = 0
         if self._layout.is_layer_compact:
-            # The chain only orders writes; each region anchor wraps its own
-            # buffer plus the chain, so views pull their region's full write
-            # history without serializing against other regions' data.
+            # The chain only orders writes; each region's anchor re-wraps its
+            # own buffer plus the chain, rebuilt lazily in ``anchor()`` only
+            # when the region is read after new writes land (one node per
+            # stale region per read, not one per write per region).
             self._chain = mx.array([], mx.uint8)
             self._anchors = list(self._base_anchors)
+            self._anchor_built_at = [0] * len(self._base_anchors)
         else:
             # Single buffer: the chain itself is the arena-backed anchor.
             self._chain = self._base_anchors[0]
             self._anchors = list(self._base_anchors)
+            self._anchor_built_at = [0]
 
     @property
     def buffer(self) -> mx.array:
@@ -224,19 +228,28 @@ class KVCacheStorage:
         return self._chain
 
     def anchor(self, region: int) -> mx.array:
-        """Return the current depends-wrapped backing for one region."""
-        return self._anchors[region]
+        """Return the current depends-wrapped backing for one region.
+
+        Rebuilt only when writes landed since the last read of *this* region,
+        so steady-state decode adds one node per region read instead of one
+        per write per region.
+        """
+        if self._layout.is_layer_compact:
+            if self._anchor_built_at[region] != self._chain_version:
+                self._anchors[region] = mx.depends(
+                    self._base_anchors[region], [self._chain]
+                )
+                self._anchor_built_at[region] = self._chain_version
+            return self._anchors[region]
+        return self._chain
 
     def depend(self, arrays: Sequence[mx.array]) -> None:
         if not arrays:
             return
         self._chain = mx.depends(self._chain, list(arrays))
-        if self._layout.is_layer_compact:
-            self._anchors = [
-                mx.depends(base, [self._chain]) for base in self._base_anchors
-            ]
-        else:
-            self._anchors = [self._chain]
+        self._chain_version += 1
+        if not self._layout.is_layer_compact:
+            self._anchors[0] = self._chain
 
     def views(self, tensors: Sequence[torch.Tensor], names: Sequence[str]) -> CacheViews:
         return CacheViews(
