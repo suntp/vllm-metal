@@ -206,7 +206,6 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
                 self._hybrid_plan.family.label,
             )
             return
-        self._geometry_validated = True
         caches = make_cache()
         plan = self._hybrid_plan
         # mlx-lm models declare one cache per cache-bearing layer in layer
@@ -255,6 +254,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
                 "wrong offsets. Align the plan and the model config before "
                 "starting."
             )
+        self._geometry_validated = True
 
     @property
     def state_cache(self) -> PagedStateCache:
