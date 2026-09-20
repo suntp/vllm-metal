@@ -81,9 +81,9 @@ def test_copy_cycles_snapshot_sources_and_deduplicate_aliases(monkeypatch):
     def no_runtime_bridge(*args, **kwargs):
         raise AssertionError("cache runtime must not cross the Torch/MLX bridge")
 
-    monkeypatch.setattr(mx, "from_dlpack", no_runtime_bridge)
-    storage = make_storage()
     monkeypatch.setattr(torch.Tensor, "numpy", no_runtime_bridge)
+    storage = make_storage()
+    monkeypatch.setattr(mx, "from_dlpack", no_runtime_bridge)
     storage.tensors["a0"][1].fill_(1)
     storage.tensors["a0"][2].fill_(2)
     storage.tensors["a1"][1].fill_(3)

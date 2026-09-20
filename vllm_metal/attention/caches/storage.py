@@ -17,7 +17,10 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.utils import allocate_kv_cache
 
-from vllm_metal.pytorch_backend.tensor_bridge import TORCH_TO_MLX_DTYPE
+from vllm_metal.pytorch_backend.tensor_bridge import (
+    TORCH_TO_MLX_DTYPE,
+    torch_to_mlx,
+)
 
 
 class CacheViews(Sequence[mx.array]):
@@ -63,13 +66,13 @@ class KVCacheStorage:
         first = next(iter(self.tensors.values()))
         backing = first.untyped_storage()
         raw = torch.empty(0, dtype=torch.uint8).set_(backing)
-        # Import a CPU NumPy view once, requiring shared storage. Every MLX
+        # Import the CPU backing once through the zero-copy bridge. Every MLX
         # view shares this buffer, so Metal tracks the aliases as one allocation.
         # MLX dimensions are int32 even when the allocation exceeds 2 GiB.
         # The engine may lower num_blocks across workers after planning each
         # worker's tensor size. Shape the backing by its physical page stride.
         page_bytes = config.kv_cache_tensors[0].block_stride
-        self.buffer = mx.asarray(raw.view(-1, page_bytes).numpy(), copy=False)
+        self.buffer = torch_to_mlx(raw.view(-1, page_bytes))
         self.nbytes = backing.nbytes()
         self.specs = {
             name: (
