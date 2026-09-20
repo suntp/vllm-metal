@@ -197,8 +197,8 @@ class TestWorkerRunnerBoundaryDelegation:
         """Route the planner through the capped single-buffer storage mode."""
         from vllm.v1.kv_cache_interface import KVCacheLayout
 
-        planner._worker.cache_config.get_resolved_kv_cache_layout = (
-            lambda: KVCacheLayout["BLNHC"]
+        planner._worker.cache_config.get_resolved_kv_cache_layout = lambda: (
+            KVCacheLayout["BLNHC"]
         )
 
     @pytest.mark.parametrize(
@@ -239,8 +239,8 @@ class TestWorkerRunnerBoundaryDelegation:
             draft_scratch_reserve_bytes=lambda: 0,
         )
         planner = WorkerCachePlanner(_make_worker(runner))
-        planner._worker.cache_config.get_resolved_kv_cache_layout = (
-            lambda: KVCacheLayout["LBNHC"]
+        planner._worker.cache_config.get_resolved_kv_cache_layout = lambda: (
+            KVCacheLayout["LBNHC"]
         )
         planner._metal_limit_bytes = lambda: 32_760_000_000
         planner._memory_fraction = lambda: 1.0

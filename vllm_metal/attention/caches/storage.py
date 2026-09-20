@@ -123,7 +123,7 @@ class KVCacheStorage:
         within one tensor (``layer_stride`` aliasing) or across overlaid
         group tensors (shared state pools) — share one region.
         """
-        self._region_storages = []
+        self._region_storages: list[torch.Tensor] = []
         self._page_strides = []
         self._page_tensors = []
         self._region_by_name = {}
@@ -183,7 +183,7 @@ class KVCacheStorage:
         page_bytes = self.config.kv_cache_tensors[0].block_stride
         self._region_storages.append(raw)
         self._page_strides.append(page_bytes)
-        self._region_by_name = {name: 0 for name in allocated}
+        self._region_by_name = dict.fromkeys(allocated, 0)
         # CoW/zeroing cover physical bytes exactly once. Layer-outermost
         # layouts place a logical block in disjoint regions of the allocation.
         regions = {}
@@ -254,10 +254,10 @@ class KVCacheStorage:
         if not self._layout.is_layer_compact:
             self._anchors[0] = self._chain
 
-    def views(self, tensors: Sequence[torch.Tensor], names: Sequence[str]) -> CacheViews:
-        return CacheViews(
-            self, tensors, [self._region_by_name[name] for name in names]
-        )
+    def views(
+        self, tensors: Sequence[torch.Tensor], names: Sequence[str]
+    ) -> CacheViews:
+        return CacheViews(self, tensors, [self._region_by_name[name] for name in names])
 
     def state_views(self, names: Sequence[str]) -> list[CacheViews]:
         states = []
@@ -270,10 +270,7 @@ class KVCacheStorage:
             )
             MambaBase.bind_kv_cache(binding, self.tensors[name])
             states.append(binding.kv_cache)
-        return [
-            self.views(component, names)
-            for component in zip(*states, strict=True)
-        ]
+        return [self.views(component, names) for component in zip(*states, strict=True)]
 
     def copy_blocks(self, pairs: Sequence[tuple[int, int]]) -> None:
         if not pairs:

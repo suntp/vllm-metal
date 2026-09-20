@@ -105,7 +105,10 @@ def test_views_bind_to_their_own_region_anchor():
         storage._region_by_name["a1"],
     ]
     conv, recurrent = storage.state_views(["s0", "s1"])
-    assert conv.regions == [storage._region_by_name["s0"], storage._region_by_name["s1"]]
+    assert conv.regions == [
+        storage._region_by_name["s0"],
+        storage._region_by_name["s1"],
+    ]
     assert recurrent.regions == conv.regions
 
 
@@ -204,16 +207,16 @@ def test_budget_above_buffer_limit_splits_into_per_region_buffers(monkeypatch):
     planner = _budget_planner(monkeypatch, "LBNHC", buffer_limit)
 
     budget = planner.determine_available_memory()
-    planned = get_kv_cache_config_from_groups(planner._worker.vllm_config, groups, budget)
+    planned = get_kv_cache_config_from_groups(
+        planner._worker.vllm_config, groups, budget
+    )
     storage = KVCacheStorage(planned)
 
     # Layer-compact layouts split the backing per layer region, so the budget
     # is not capped at Metal's single-buffer limit.
     assert budget == 2 * buffer_limit
     assert 0 < storage.nbytes
-    assert all(
-        raw.numel() <= buffer_limit for raw in storage._region_storages
-    )
+    assert all(raw.numel() <= buffer_limit for raw in storage._region_storages)
     assert storage.state_views(["s0", "s1"])[0][0].shape[0] == planned.num_blocks
 
 
@@ -225,7 +228,9 @@ def test_budget_above_buffer_limit_still_caps_block_outermost_layouts(monkeypatc
     planner = _budget_planner(monkeypatch, "BLNHC", buffer_limit)
 
     budget = planner.determine_available_memory()
-    planned = get_kv_cache_config_from_groups(planner._worker.vllm_config, groups, budget)
+    planned = get_kv_cache_config_from_groups(
+        planner._worker.vllm_config, groups, budget
+    )
     from dataclasses import replace
 
     storage = KVCacheStorage(replace(planned, kv_cache_layout="BLNHC"))
