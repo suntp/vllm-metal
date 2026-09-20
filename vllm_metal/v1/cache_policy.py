@@ -11,8 +11,6 @@ import mlx.core as mx
 import torch
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
-
-import vllm_metal.envs as envs
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -22,6 +20,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 
+import vllm_metal.envs as envs
 from vllm_metal.attention.caches.attention_layout import AttentionKVCacheLayout
 from vllm_metal.attention.caches.turboquant import (
     BLOCK_SIZE as TQ_BLOCK_SIZE,
