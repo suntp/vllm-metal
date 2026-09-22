@@ -1671,9 +1671,9 @@ static std::vector<array> gdn_linear_attention_primitive_fn(
     const array& g, const array& beta, const array& state_pool,
     const array& cu_seqlens, const array& slot_mapping,
     int Hk, int Hv, int Dk, int Dv) {
-  if (Dk > 256) {
+  if (Dk <= 0 || Dk > 256 || Dk % 32 != 0) {
     throw std::runtime_error(
-        "GDN kernel supports Dk <= 256 (state[8] * 32 threads). "
+        "GDN kernel requires Dk to be a positive multiple of 32, at most 256. "
         "Got Dk=" + std::to_string(Dk));
   }
   auto prim = std::make_shared<GDNLinearAttentionPrimitive>(
