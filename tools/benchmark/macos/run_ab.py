@@ -272,7 +272,7 @@ def run(args: argparse.Namespace) -> dict:
     result["arm_orders"] = arm_orders
     for rep, order in enumerate(arm_orders):
         for arm in order:
-            gate_value = "0" if arm == "on" else "1"
+            gate_value = args.gate_on_value if arm == "on" else args.gate_off_value
             quiet = (
                 gpu_state.wait_quiet_window(args.quiet_threshold)
                 if not args.no_quiet_wait
@@ -354,7 +354,18 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--gate-env",
         default=DEFAULT_GATE_ENV,
-        help="A/B switch: 'on' arm sets it to 0, 'off' to 1",
+        help="A/B switch: 'on' arm sets it to --gate-on-value, 'off' to "
+        "--gate-off-value",
+    )
+    parser.add_argument(
+        "--gate-on-value",
+        default="0",
+        help="value for the 'on' arm (default 0: the gate is a disable flag)",
+    )
+    parser.add_argument(
+        "--gate-off-value",
+        default="1",
+        help="value for the 'off' arm (default 1: the disable flag set)",
     )
     parser.add_argument(
         "--reps",
