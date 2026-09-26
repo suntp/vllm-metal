@@ -324,7 +324,7 @@ def run(args: argparse.Namespace) -> dict:
             }
             evidence.write_json(output / "results.json", result)
 
-    result["comparison"] = evidence.summarize(arms, ["on", "off"])
+    result["comparison"] = evidence.summarize(arms, ["off", "on"])
     result["finished_utc"] = datetime.now(UTC).isoformat()
     evidence.write_json(output / "results.json", result)
     return result

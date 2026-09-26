@@ -24,13 +24,20 @@ ooo AGXAccelerator <class AGXAccelerator> 1000
   | "Device Utilization %"=57
   | "Performance Statistics"=()
 ooo AGXAccelerator <class AGXAccelerator> 1001
-  | "Device Utilization %"=3
-  | "Accelerator linked"=Yes
+  | "PerformanceStatistics" = {"In use system memory (driver)"=0,"Tiler Utilization %"=1,"Renderer Utilization %"=3,"Device Utilization %"=4,"Allocated PB Size"=109576192}
 """
 
 
 def test_parse_utilization_takes_peak_entry() -> None:
     assert gpu_state.parse_utilization_text(_IOREG_SAMPLE) == 57
+
+
+def test_parse_utilization_handles_inline_statistics() -> None:
+    text = (
+        '  | "PerformanceStatistics" = {"Renderer Utilization %"=3,'
+        '"Device Utilization %"=11,"Allocated PB Size"=1}'
+    )
+    assert gpu_state.parse_utilization_text(text) == 11
 
 
 def test_parse_utilization_missing_entry_is_none() -> None:

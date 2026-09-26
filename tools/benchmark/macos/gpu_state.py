@@ -11,30 +11,27 @@ state; the observed utilization is recorded alongside every result.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import time
 from dataclasses import dataclass, field
 
 _IOREG_ARGS = ["ioreg", "-r", "-c", "AGXAccelerator", "-d", "1"]
-_UTILIZATION_PREFIX = '"Device Utilization %"='
+# Matches both ioreg layouts: a dedicated tree line and the value nested
+# inside the one-line "PerformanceStatistics" = {...} dictionary.
+_UTILIZATION_RE = re.compile(r'"Device Utilization %"\s*=\s*(\d+)')
 
 
 def parse_utilization_text(text: str) -> int | None:
     """Peak ``Device Utilization %`` across GPU entries in *ioreg* output.
 
     The marker may appear anywhere in a line (ioreg prefixes tree lines
-    with ``| ``), so the search is positional like ``grep -oE``.
-    Returns ``None`` when no utilization entry is found: callers must
-    treat the co-tenancy state as unknown, never as quiet.
+    with ``| `` and newer builds inline the statistics dictionary), so
+    the search is positional like ``grep -oE``.  Returns ``None`` when no
+    utilization entry is found: callers must treat the co-tenancy state
+    as unknown, never as quiet.
     """
-    values: list[int] = []
-    for line in text.splitlines():
-        position = line.find(_UTILIZATION_PREFIX)
-        if position < 0:
-            continue
-        digits = line[position + len(_UTILIZATION_PREFIX) :].strip()
-        if digits.isdigit():
-            values.append(int(digits))
+    values = [int(match) for match in _UTILIZATION_RE.findall(text)]
     return max(values) if values else None
 
 
