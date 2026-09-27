@@ -113,12 +113,14 @@ main() {
   sed -i '' -E "s/^version = .*/version = \"${version}\"/" pyproject.toml
 
   section "Building wheel"
-  uv build
+  wheel_build_dir=$(mktemp -d)
+  trap 'rm -rf -- "$wheel_build_dir"' EXIT
+  uv build --out-dir "$wheel_build_dir"
 
   # Abort before publishing if the wheel omitted a native artifact.
-  local wheels=(dist/*.whl)
-  if [ ! -f "${wheels[0]}" ]; then
-    error "No wheel found in dist/ after uv build."
+  local wheels=("$wheel_build_dir"/*.whl)
+  if [ "${#wheels[@]}" -ne 1 ] || [ ! -f "${wheels[0]}" ]; then
+    error "Expected exactly one wheel in ${wheel_build_dir} after uv build."
     exit 1
   fi
   verify_wheel_artifacts "${wheels[0]}"
@@ -152,7 +154,7 @@ main() {
       --jq '[.[] | select(.tagName | contains(".dev"))][0].tagName // ""')
   fi
 
-  gh release create "$tag" "${release_args[@]}" dist/*.whl
+  gh release create "$tag" "${release_args[@]}" "${wheels[0]}"
 
   if [ -n "$previous_dev_tag" ]; then
     gh release delete "$previous_dev_tag" --yes

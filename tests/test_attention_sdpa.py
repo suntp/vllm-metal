@@ -12,6 +12,8 @@ Metal kernel dispatch itself is covered by the end-to-end smoke tests,
 not here.
 """
 
+import logging
+import os
 from collections.abc import Iterator
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -638,8 +640,12 @@ class TestPrepareSDPAQKV:
 
 
 class _PagedRoutingOpsSpy:
-    def __init__(self) -> None:
+    def __init__(self, *, supports_mm_prefix: bool = True) -> None:
         self.calls: list[SimpleNamespace] = []
+        self._supports_mm_prefix = supports_mm_prefix
+
+    def supports_mm_prefix(self) -> bool:
+        return self._supports_mm_prefix
 
     def reshape_and_cache(
         self,
@@ -649,7 +655,12 @@ class _PagedRoutingOpsSpy:
         value_cache,
         slot_mapping,
     ) -> tuple[mx.array, mx.array]:
-        self.calls.append(SimpleNamespace(slot_mapping=slot_mapping.tolist()))
+        self.calls.append(
+            SimpleNamespace(
+                slot_mapping=slot_mapping.tolist(),
+                cache_block_size=key_cache.shape[1],
+            )
+        )
         return key_cache, value_cache
 
     def paged_attention_primitive(
@@ -669,6 +680,7 @@ class _PagedRoutingOpsSpy:
         _out: mx.array,
         window_seqlen_q: int = 1,
         sinks: mx.array | None = None,
+        mm_prefix_ranges: mx.array | None = None,
         num_decode_requests: int = -1,
         gqa_disabled: bool = False,
     ) -> None:
@@ -677,6 +689,34 @@ class _PagedRoutingOpsSpy:
         self.calls[-1].block_size = block_size
         self.calls[-1].num_decode_requests = num_decode_requests
         self.calls[-1].gqa_disabled = gqa_disabled
+        self.calls[-1].mm_prefix_ranges = mm_prefix_ranges
+
+
+class _PreMmPrefixOps:
+    """Ops of a native build that predates mm_prefix: no probe, no keyword."""
+
+    def __init__(self) -> None:
+        self._spy = _PagedRoutingOpsSpy()
+        self.calls = self._spy.calls
+
+    def reshape_and_cache(self, *args):
+        return self._spy.reshape_and_cache(*args)
+
+    def paged_attention_primitive(
+        self,
+        *args,
+        window_seqlen_q=1,
+        sinks=None,
+        num_decode_requests=-1,
+        gqa_disabled=False,
+    ):
+        self._spy.paged_attention_primitive(
+            *args,
+            window_seqlen_q=window_seqlen_q,
+            sinks=sinks,
+            num_decode_requests=num_decode_requests,
+            gqa_disabled=gqa_disabled,
+        )
 
 
 class TestSDPAForward:
@@ -786,7 +826,7 @@ class TestSDPAForward:
     def test_mixed_batch_routes_slots_and_page_tables_by_layer_group(self) -> None:
         """Full and sliding layers consume their scheduler-group metadata."""
         full = FullAttentionSpec(
-            block_size=32,
+            block_size=64,
             num_kv_heads=_N_KV_HEADS,
             head_size=_HEAD_DIM,
             dtype=torch.float16,
@@ -815,7 +855,7 @@ class TestSDPAForward:
         prepare_grouped(
             [([[3], [8, 9]], 17, 1)],
             [([[4], [10]], 2, 0)],
-            (32, 16),
+            (64, 16),
         )
         ctx = get_context()
         assert ctx is not None
@@ -849,11 +889,13 @@ class TestSDPAForward:
             sdpa_forward(inner, x, ctx, cache, layer_idx=1)
 
         full_call, sliding_call = ops.calls
-        assert full_call.slot_mapping == [3 * 32 + 17, 4 * 32, 4 * 32 + 1]
-        assert full_call.block_tables == [[3], [4]]
+        assert full_call.slot_mapping == [3 * 64 + 17, 4 * 64, 4 * 64 + 1]
+        assert full_call.block_tables == [[6, 7], [8, 9]]
+        assert full_call.cache_block_size == 64
         assert full_call.block_size == 32
         assert sliding_call.slot_mapping == [9 * 16 + 1, 10 * 16, 10 * 16 + 1]
         assert sliding_call.block_tables == [[8, 9], [10, 0]]
+        assert sliding_call.cache_block_size == 16
         assert sliding_call.block_size == 16
 
     def test_kernel_uses_layer_heads_and_registered_default_scale(self) -> None:
@@ -1235,23 +1277,24 @@ class TestSDPAForward:
 
 
 class TestBidirectionalDispatch:
-    """The bidirectional path is entered only for the configured layer kinds."""
+    """Image-block rows take the kernel path or the recompute per env."""
 
     @staticmethod
-    def _cache() -> MetalPagedKVCache:
+    def _cache(dtype: mx.Dtype = mx.float16) -> MetalPagedKVCache:
         """Gemma 4's layer mix over upstream storage: one full-attention layer
         at block 32 beside one sliding layer (window 1024) at block 16."""
+        torch_dtype = torch.float32 if dtype == mx.float32 else torch.float16
         full = FullAttentionSpec(
             block_size=32,
             num_kv_heads=_N_KV_HEADS,
             head_size=_HEAD_DIM,
-            dtype=torch.float16,
+            dtype=torch_dtype,
         )
         sliding = SlidingWindowSpec(
             block_size=16,
             num_kv_heads=_N_KV_HEADS,
             head_size=_HEAD_DIM,
-            dtype=torch.float16,
+            dtype=torch_dtype,
             sliding_window=1024,
             page_size_padded=full.page_size_bytes,
         )
@@ -1270,8 +1313,20 @@ class TestBidirectionalDispatch:
             KVCacheStorage(config), ["full", "sliding"]
         )
 
-    def _run(self, kinds: frozenset[str], ranges, layer_idx: int):
-        cache = self._cache()
+    def _run(
+        self,
+        kinds: frozenset[str],
+        ranges,
+        layer_idx: int,
+        *,
+        path: str | None = None,
+        supports: bool = True,
+        repeat: int = 1,
+        dtype: mx.Dtype = mx.float16,
+        ops: object | None = None,
+    ):
+        cache = self._cache(dtype)
+        # One decode row (17 cached tokens) and a 2-row prefill at positions 0..1.
         prepare_grouped([([[3], [8, 9]], 17, 1)], [([[4], [10]], 2, 0)], (32, 16))
         ctx = get_context()
         assert ctx is not None
@@ -1288,13 +1343,18 @@ class TestBidirectionalDispatch:
         keys = mx.ones((_BATCH, _N_KV_HEADS, 3, _HEAD_DIM))
         values = mx.ones((_BATCH, _N_KV_HEADS, 3, _HEAD_DIM))
         bidi = MagicMock(side_effect=lambda out, *a, **k: out)
+        spy = ops or _PagedRoutingOpsSpy(supports_mm_prefix=supports)
+        env = {k: v for k, v in os.environ.items() if k != "VLLM_METAL_MM_PREFIX_PATH"}
+        if path is not None:
+            env["VLLM_METAL_MM_PREFIX_PATH"] = path
         with (
+            patch.dict(os.environ, env, clear=True),
             patch.object(
                 sdpa_mod,
                 "prepare_sdpa_qkv",
                 return_value=(queries, keys, values, None, (keys, values)),
             ),
-            patch.object(sdpa_mod, "get_ops", return_value=_PagedRoutingOpsSpy()),
+            patch.object(sdpa_mod, "get_ops", return_value=spy),
             patch.object(
                 sdpa_mod,
                 "truncate_padded_output",
@@ -1302,13 +1362,15 @@ class TestBidirectionalDispatch:
             ),
             patch.object(sdpa_mod, "apply_bidirectional_segments", bidi),
         ):
-            sdpa_forward(inner, x, ctx, cache, layer_idx=layer_idx)
-        return bidi
+            for _ in range(repeat):
+                sdpa_forward(inner, x, ctx, cache, layer_idx=layer_idx)
+        return bidi, spy, ctx
 
-    def test_sliding_kind_enters_only_on_sliding_layers(self) -> None:
+    def test_recompute_path_keeps_the_splice(self) -> None:
         ranges = [None, [(0, 2)]]
-        assert self._run(frozenset({"sliding"}), ranges, 0).call_count == 0
-        bidi = self._run(frozenset({"sliding"}), ranges, 1)
+        bidi, spy, _ = self._run(frozenset({"sliding"}), ranges, 0, path="recompute")
+        assert bidi.call_count == 0
+        bidi, spy, ctx = self._run(frozenset({"sliding"}), ranges, 1, path="recompute")
         assert bidi.call_count == 1
         kwargs = bidi.call_args.kwargs
         assert kwargs["window"] == 1024
@@ -1316,16 +1378,101 @@ class TestBidirectionalDispatch:
         assert kwargs["block_size"] == 16
         assert kwargs["cu_seqlens"] == [0, 1, 3]
         assert kwargs["turboquant"] is False
+        assert spy.calls[-1].mm_prefix_ranges is None
+        assert ctx.mm_prefix_rows_built is False
 
-    def test_full_kind_enters_only_on_full_layers(self) -> None:
+    def test_kernel_path_passes_rows_only_on_configured_layers(self) -> None:
         ranges = [None, [(0, 2)]]
-        bidi = self._run(frozenset({"full"}), ranges, 0)
+        bidi, spy, ctx = self._run(frozenset({"sliding"}), ranges, 0)
+        assert bidi.call_count == 0
+        assert spy.calls[-1].mm_prefix_ranges is None
+        assert ctx.mm_prefix_rows_built is False
+        bidi, spy, ctx = self._run(frozenset({"sliding"}), ranges, 1)
+        assert bidi.call_count == 0
+        rows = spy.calls[-1].mm_prefix_ranges
+        assert rows is not None and rows.dtype == mx.int32
+        assert rows.tolist() == [[-1, -1], [0, 1], [0, 1]]
+        assert ctx.mm_prefix_row_count == 2
+        assert ctx.bidi_logged is True
+
+    def test_full_kind_takes_the_kernel_path_on_full_layers(self) -> None:
+        ranges = [None, [(0, 2)]]
+        _, spy, _ = self._run(frozenset({"full"}), ranges, 0)
+        assert spy.calls[-1].mm_prefix_ranges.tolist() == [[-1, -1], [0, 1], [0, 1]]
+        _, spy, _ = self._run(frozenset({"full"}), ranges, 1)
+        assert spy.calls[-1].mm_prefix_ranges is None
+
+    def test_float32_cache_falls_back_to_recompute(self) -> None:
+        """The tiled kernel has no float32 instantiation (the recompute path)."""
+        bidi, spy, ctx = self._run(
+            frozenset({"sliding"}), [None, [(0, 2)]], 1, dtype=mx.float32
+        )
         assert bidi.call_count == 1
-        assert bidi.call_args.kwargs["window"] is None
-        assert self._run(frozenset({"full"}), ranges, 1).call_count == 0
+        assert spy.calls[-1].mm_prefix_ranges is None
+        assert ctx.mm_prefix_rows_built is False
+
+    def test_unsupported_ops_fall_back_to_recompute(self) -> None:
+        bidi, spy, _ = self._run(
+            frozenset({"sliding"}), [None, [(0, 2)]], 1, supports=False
+        )
+        assert bidi.call_count == 1
+        assert spy.calls[-1].mm_prefix_ranges is None
+
+    def test_ops_predating_mm_prefix_serve_the_recompute(self) -> None:
+        # No probe and no keyword: the image rows still reach the recompute.
+        bidi, _, _ = self._run(
+            frozenset({"sliding"}), [None, [(0, 2)]], 1, ops=_PreMmPrefixOps()
+        )
+        assert bidi.call_count == 1
+
+    def test_unknown_path_value_raises(self) -> None:
+        with pytest.raises(ValueError, match="VLLM_METAL_MM_PREFIX_PATH"):
+            self._run(frozenset({"sliding"}), [None, [(0, 2)]], 1, path="kernle")
+
+    def test_rows_are_built_once_per_forward(self) -> None:
+        with patch.object(
+            sdpa_mod, "build_mm_prefix_rows", wraps=sdpa_mod.build_mm_prefix_rows
+        ) as build:
+            _, spy, ctx = self._run(
+                frozenset({"sliding"}), [None, [(0, 2)]], 1, repeat=3
+            )
+        assert build.call_count == 1
+        first = spy.calls[0].mm_prefix_ranges
+        assert all(c.mm_prefix_ranges is first for c in spy.calls)
+        assert ctx.mm_prefix_rows is first
+
+    def test_no_rows_inside_a_block_passes_none(self) -> None:
+        _, spy, ctx = self._run(frozenset({"sliding"}), [None, [(10, 12)]], 1)
+        assert spy.calls[-1].mm_prefix_ranges is None
+        assert ctx.mm_prefix_rows_built is True
+        assert ctx.bidi_logged is False
 
     def test_no_ranges_never_enters(self) -> None:
-        assert self._run(frozenset({"sliding"}), None, 1).call_count == 0
+        bidi, spy, _ = self._run(frozenset({"sliding"}), None, 1)
+        assert bidi.call_count == 0
+        assert spy.calls[-1].mm_prefix_ranges is None
+
+    def test_kernel_path_logs_the_row_count_once(self) -> None:
+        records: list[logging.LogRecord] = []
+
+        class _Sink(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        logger = logging.getLogger("vllm_metal.attention.impls.sdpa")
+        sink = _Sink(level=logging.INFO)
+        logger.addHandler(sink)
+        previous = logger.level
+        logger.setLevel(logging.INFO)
+        try:
+            self._run(frozenset({"sliding"}), [None, [(0, 2)]], 1, repeat=2)
+        finally:
+            logger.setLevel(previous)
+            logger.removeHandler(sink)
+        lines = [
+            r.getMessage() for r in records if "mm_prefix ranges" in r.getMessage()
+        ]
+        assert lines == ["Metal: mm_prefix ranges on 2 row(s)"]
 
 
 # === Laguna g_proj per-head gating ===

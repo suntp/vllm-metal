@@ -25,10 +25,12 @@ main() {
     # surface when release.sh runs on main. Build the wheel and assert it bundles
     # the prebuilt artifacts now — the same check release.sh runs before publish.
     section "Building wheel"
-    uv build
-    local wheels=(dist/*.whl)
-    if [ ! -f "${wheels[0]}" ]; then
-      error "No wheel found in dist/ after uv build."
+    wheel_build_dir=$(mktemp -d)
+    trap 'rm -rf -- "$wheel_build_dir"' EXIT
+    uv build --out-dir "$wheel_build_dir"
+    local wheels=("$wheel_build_dir"/*.whl)
+    if [ "${#wheels[@]}" -ne 1 ] || [ ! -f "${wheels[0]}" ]; then
+      error "Expected exactly one wheel in ${wheel_build_dir} after uv build."
       exit 1
     fi
     verify_wheel_artifacts "${wheels[0]}"

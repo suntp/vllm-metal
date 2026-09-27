@@ -82,7 +82,8 @@ K/V views, non-contiguous page tables, native writes, prefix-page copying,
 source-page clearing and a subsequent decode write. Dominant attention rows
 make missing writes observable even in a long context.
 The 1056-token upstream-page case also exercises the real block-table
-translation and reshaped K/V views before dispatching the block32 kernel.
+translation and unreshaped K/V storage: the block32 kernel addresses each
+translated page with its 32-token stride.
 `tests/test_attention_sdpa.py` checks that the environment switch and scheduler
 decode count reach the primitive.
 

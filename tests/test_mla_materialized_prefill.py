@@ -107,7 +107,7 @@ def test_materialized_prefill_matches_absorbed_loop(
 
     # Reference: force the gate off → absorbed kv_lora-space (512-wide MQA) loop.
     monkeypatch.setattr(
-        MLAPagedAttentionWrapper, "_materialized_prefill_ok", lambda *a, **k: False
+        MLAPagedAttentionWrapper, "_materialized_segments", lambda *a, **k: None
     )
     ref = run()
     monkeypatch.undo()  # restore the real gate → materialized path (on by default)
@@ -117,68 +117,52 @@ def test_materialized_prefill_matches_absorbed_loop(
     np.testing.assert_allclose(np.array(mat), np.array(ref), atol=atol, rtol=1e-2)
 
 
-def test_materialized_prefill_gate() -> None:
-    """The gate engages for an absorbed model on pure prefill and on
-    continuation chunks with >= ``_MATERIALIZED_MIN_NEW_TOKENS_WITH_PAST``
-    new tokens; small chunks with cached context, decode-shaped rows, and
-    pure decode batches fall back to the absorbed loop."""
+def _ctx(context_lens: list[int], cu_seqlens: list[int]) -> pac.PagedAttentionContext:
+    return pac.PagedAttentionContext(
+        slot_mapping=list(range(cu_seqlens[-1])),
+        block_tables=[[i] for i in range(len(context_lens))],
+        context_lens=context_lens,
+        cu_seqlens=cu_seqlens,
+        offsets=[
+            c - (e - s)
+            for c, s, e in zip(
+                context_lens, cu_seqlens[:-1], cu_seqlens[1:], strict=True
+            )
+        ],
+    )
+
+
+def test_materialized_segments_routing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Segments route independently: pure prefill and continuation chunks with
+    >= ``_MATERIALIZED_MIN_NEW_TOKENS_WITH_PAST`` new tokens materialize; small
+    chunks with cached context and decode-shaped rows stay absorbed. With no
+    routed multi-token segment the batch keeps the absorbed/kernel paths."""
     inner, _, wrapper = _make()
-    # pure prefill (past=0): ctx_len == num_new → engage even when small
-    assert wrapper._materialized_prefill_ok(
-        inner,
-        pac.PagedAttentionContext(
-            slot_mapping=[0, 1],
-            block_tables=[[0]],
-            context_lens=[2],
-            cu_seqlens=[0, 2],
-            offsets=[0],
-        ),
-    )
-    # chunked prefill below the new-token threshold → fall back
+    route = wrapper._materialized_segments
+    # pure prefill (past=0): ctx_len == num_new → routed even when small
+    assert route(inner, _ctx([2], [0, 2])) == [True]
+    # chunked prefill below the new-token threshold → nothing routed
     for num_new in (2, 511):
-        assert not wrapper._materialized_prefill_ok(
-            inner,
-            pac.PagedAttentionContext(
-                slot_mapping=list(range(num_new)),
-                block_tables=[[0]],
-                context_lens=[4 + num_new],
-                cu_seqlens=[0, num_new],
-                offsets=[4],
-            ),
-        )
-    # chunked prefill at the threshold: past>0, num_new==512 → engage
-    assert wrapper._materialized_prefill_ok(
-        inner,
-        pac.PagedAttentionContext(
-            slot_mapping=list(range(512)),
-            block_tables=[[0]],
-            context_lens=[4 + 512],
-            cu_seqlens=[0, 512],
-            offsets=[4],
-        ),
+        assert route(inner, _ctx([4 + num_new], [0, num_new])) is None
+    # chunked prefill at the threshold: past>0, num_new==512 → routed
+    assert route(inner, _ctx([4 + 512], [0, 512])) == [True]
+    # decode row packed ahead of a prefill: only the prefill is routed
+    assert route(inner, _ctx([4, 2], [0, 1, 3])) == [False, True]
+    # decode rows + small continuation + large continuation + fresh prefill
+    assert route(inner, _ctx([9, 7, 4 + 8, 4 + 512, 16], [0, 1, 2, 10, 522, 538])) == [
+        False,
+        False,
+        False,
+        True,
+        True,
+    ]
+    # pure decode → nothing routed
+    assert route(inner, _ctx([4, 5], [0, 1, 2])) is None
+    # decode rows never route, even with the threshold at 1
+    monkeypatch.setattr(
+        MLAPagedAttentionWrapper, "_MATERIALIZED_MIN_NEW_TOKENS_WITH_PAST", 1
     )
-    # decode-shaped row (num_new=1, ctx_len>1) mixed with prefill → fall back
-    assert not wrapper._materialized_prefill_ok(
-        inner,
-        pac.PagedAttentionContext(
-            slot_mapping=[0, 1, 2],
-            block_tables=[[0], [1]],
-            context_lens=[4, 2],
-            cu_seqlens=[0, 1, 3],
-            offsets=[3, 0],
-        ),
-    )
-    # pure decode → fall back
-    assert not wrapper._materialized_prefill_ok(
-        inner,
-        pac.PagedAttentionContext(
-            slot_mapping=[0],
-            block_tables=[[0]],
-            context_lens=[4],
-            cu_seqlens=[0, 1],
-            offsets=[3],
-        ),
-    )
+    assert route(inner, _ctx([4, 3], [0, 1, 3])) == [False, True]
 
 
 @pytest.mark.parametrize(
@@ -230,9 +214,9 @@ def test_chunked_prefill_matches_absorbed_loop(
     )
     x2 = mx.random.normal((1, 48, _HID)).astype(mx.float16)
 
-    # Under the patched threshold the phase-2 batch engages the materialized
-    # path, so the `mat` arm below really exercises it.
-    assert wrapper._materialized_prefill_ok(inner, ctx2)
+    # Under the patched threshold every phase-2 segment is routed to the
+    # materialized path, so the `mat` arm below really exercises it.
+    assert wrapper._materialized_segments(inner, ctx2) == [True, True, True]
 
     def run() -> mx.array:
         # Identical cache for both arms: reset, then re-run phase 1.
@@ -248,7 +232,7 @@ def test_chunked_prefill_matches_absorbed_loop(
 
     # Reference: force the gate off → absorbed kv_lora-space (512-wide MQA) loop.
     monkeypatch.setattr(
-        MLAPagedAttentionWrapper, "_materialized_prefill_ok", lambda *a, **k: False
+        MLAPagedAttentionWrapper, "_materialized_segments", lambda *a, **k: None
     )
     ref = run()
     monkeypatch.undo()  # restores gate AND threshold — re-patch the threshold
@@ -258,4 +242,106 @@ def test_chunked_prefill_matches_absorbed_loop(
     mat = run()
 
     assert mat.shape == (1, 48, _HID)
+    np.testing.assert_allclose(np.array(mat), np.array(ref), atol=atol, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    ("quantize", "atol"),
+    [(False, 2e-2), (True, 6e-2)],
+    ids=["dense", "quantized-4bit"],
+)
+def test_mixed_decode_prefill_batch_routes_per_segment(
+    quantize: bool, atol: float, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Continuous-batching shape: decode rows packed ahead of a fresh prefill,
+    a large continuation and a small continuation. Only the prefill-shaped
+    segments above the threshold materialize; decode rows and the small chunk
+    take the absorbed attention, and the combined output matches the
+    all-absorbed loop."""
+    # Scaled-down threshold: the 24-token continuation clears it, the
+    # 8-token one does not.
+    monkeypatch.setattr(
+        MLAPagedAttentionWrapper, "_MATERIALIZED_MIN_NEW_TOKENS_WITH_PAST", 16
+    )
+    inner, cache, wrapper = _make(quantize=quantize, num_blocks=16)
+
+    def slots(block_ids: list[int], start: int, num: int) -> list[int]:
+        return [
+            block_ids[pos // _BLK] * _BLK + pos % _BLK
+            for pos in range(start, start + num)
+        ]
+
+    # Phase 1 seeds past context: D1 (5 tokens, block 10), D2 (17, blocks
+    # 11,12), B (20, blocks 4,5), C (32, blocks 6,7).
+    ctx1 = pac.PagedAttentionContext(
+        slot_mapping=(
+            slots([10], 0, 5)
+            + slots([11, 12], 0, 17)
+            + slots([4, 5], 0, 20)
+            + slots([6, 7], 0, 32)
+        ),
+        block_tables=[[10], [11, 12], [4, 5], [6, 7]],
+        context_lens=[5, 17, 20, 32],
+        cu_seqlens=[0, 5, 22, 42, 74],
+        offsets=[0, 0, 0, 0],
+    )
+    x1 = mx.random.normal((1, 74, _HID)).astype(mx.float16)
+
+    # Phase 2 (decode first, then prefill — the runner's packed order):
+    # D1, D2 decode one token each; A fresh 16-token prefill; B continues
+    # past=20 with 24 new (routed); C continues past=32 with 8 new (absorbed).
+    ctx2 = pac.PagedAttentionContext(
+        slot_mapping=(
+            slots([10], 5, 1)
+            + slots([11, 12], 17, 1)
+            + slots([0], 0, 16)
+            + slots([4, 5, 8], 20, 24)
+            + slots([6, 7, 9], 32, 8)
+        ),
+        block_tables=[[10], [11, 12], [0], [4, 5, 8], [6, 7, 9]],
+        context_lens=[6, 18, 16, 44, 40],
+        cu_seqlens=[0, 1, 2, 18, 42, 50],
+        offsets=[5, 17, 0, 20, 32],
+        num_decode_requests=2,
+    )
+    x2 = mx.random.normal((1, 50, _HID)).astype(mx.float16)
+    assert wrapper._materialized_segments(inner, ctx2) == [
+        False,
+        False,
+        True,
+        True,
+        False,
+    ]
+
+    absorbed_calls: list[int] = []
+    real_absorbed = MLAPagedAttentionWrapper._absorbed_segment
+
+    def spy(self, *args, **kwargs):
+        absorbed_calls.append(args[-1])
+        return real_absorbed(self, *args, **kwargs)
+
+    def run() -> mx.array:
+        cache.latent_caches[0] = mx.zeros_like(cache.latent_caches[0])
+        pac.set_context(ctx1)
+        mx.eval(wrapper(x1, mask=None, cache=None))
+        pac.clear_context()
+        absorbed_calls.clear()
+        pac.set_context(ctx2)
+        out = wrapper(x2, mask=None, cache=None)
+        mx.eval(out)
+        pac.clear_context()
+        return out
+
+    monkeypatch.setattr(MLAPagedAttentionWrapper, "_absorbed_segment", spy)
+    mat = run()
+    assert absorbed_calls == [0, 1, 4]  # decode rows + the small continuation
+
+    # Reference: routing off → every segment on the absorbed loop.
+    monkeypatch.setattr(
+        MLAPagedAttentionWrapper, "_materialized_segments", lambda *a, **k: None
+    )
+    ref = run()
+    assert absorbed_calls == [0, 1, 2, 3, 4]
+
+    assert mat.shape == (1, 50, _HID)
     np.testing.assert_allclose(np.array(mat), np.array(ref), atol=atol, rtol=1e-2)

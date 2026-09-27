@@ -259,36 +259,86 @@ class MLAPagedAttentionWrapper(nn.Module):
         out_unembedded = inner.unembed_out(out_for_unembed)
         return out_unembedded.transpose(0, 2, 1, 3).reshape(1, seq_len, -1)
 
-    def _materialized_prefill_ok(self, inner: nn.Module, ctx: Any) -> bool:
-        """Gate for the materialized-prefill fast path (RFC #360 Phase 2): an
-        absorbed model with MultiLinear ``embed_q``/``unembed_out`` and at
-        least one multi-token segment. On by default — bitwise-equal to the
-        absorbed kv_lora-space loop (absorption identity), just at a cheaper
-        attention dim. Segments with past context (chunked-prefill
-        continuations, prefix-cache hits) materialize their cached K/V too,
-        but only once the chunk has >= ``_MATERIALIZED_MIN_NEW_TOKENS_WITH_PAST``
-        new tokens; decode-shaped rows and small continuation chunks fall
-        through to the absorbed loop."""
+    def _materialized_segments(self, inner: nn.Module, ctx: Any) -> list[bool] | None:
+        """Per-segment routing for the materialized-prefill fast path (RFC #360
+        Phase 2): an absorbed model with MultiLinear ``embed_q``/``unembed_out``.
+        On by default — bitwise-equal to the absorbed kv_lora-space loop
+        (absorption identity), just at a cheaper attention dim.
+
+        Returns one flag per segment (True = materialize), or ``None`` when no
+        multi-token segment qualifies and the whole batch stays on the absorbed
+        loop / kernel paths. Segments are routed independently, so a prefill
+        segment packed next to decode rows (the common continuous-batching
+        shape) still materializes. Segments with past context (chunked-prefill
+        continuations, prefix-cache hits) materialize their cached K/V too, but
+        only once the chunk has >= ``_MATERIALIZED_MIN_NEW_TOKENS_WITH_PAST``
+        new tokens; decode-shaped rows and small continuation chunks take the
+        absorbed path."""
         if not self._is_absorbed:
-            return False
+            return None
         # Materialization reverses embed_q/unembed_out via MultiLinear's transpose
         # flag (per-head + quantization-aware).
         if type(inner.embed_q).__name__ not in ("MultiLinear", "QuantizedMultiLinear"):
-            return False
+            return None
         cu = ctx.cu_seqlens
+        routed: list[bool] = []
         has_prefill = False
         for i, ctx_len in enumerate(ctx.context_lens):
             num_new = cu[i + 1] - cu[i]
-            has_prefill = has_prefill or num_new > 1
-            if (
-                ctx_len > num_new
-                and num_new < self._MATERIALIZED_MIN_NEW_TOKENS_WITH_PAST
-            ):
-                # Decode-shaped rows and small continuation chunks:
-                # materializing a whole context for a few queries loses to
-                # the absorbed path.
-                return False
-        return has_prefill
+            # Decode-shaped rows and small continuation chunks: materializing a
+            # whole context for a few queries loses to the absorbed path.
+            ok = ctx_len == num_new or (
+                num_new > 1 and num_new >= self._MATERIALIZED_MIN_NEW_TOKENS_WITH_PAST
+            )
+            routed.append(ok)
+            has_prefill = has_prefill or (ok and num_new > 1)
+        return routed if has_prefill else None
+
+    def _absorbed_segment(
+        self,
+        inner: nn.Module,
+        latent_cache: MLAPagedLatentCache,
+        layer_idx: int,
+        q_nope: mx.array,  # [1, nheads, seq, qk_nope_head_dim]
+        q_pe: mx.array,  # [1, nheads, seq, qk_rope_head_dim] (post-RoPE)
+        ctx: Any,
+        req_idx: int,
+    ) -> mx.array:
+        """Absorbed / kv_b_proj attention for one segment, reading its whole
+        context from the paged cache. Returns [1, num_new, num_heads * v_head_dim]."""
+        ctx_len = ctx.context_lens[req_idx]
+        req_start = ctx.cu_seqlens[req_idx]
+        req_end = ctx.cu_seqlens[req_idx + 1]
+        num_new = req_end - req_start
+        past_len = ctx_len - num_new  # tokens cached before this step
+
+        # Gather this request's full context from the paged cache.
+        # Block indexing: each block holds block_size contiguous token slots.
+        n_blocks = math.ceil(ctx_len / latent_cache.block_size)
+        blocks = _block_table_rows(ctx)[req_idx][:n_blocks]
+        all_latent = latent_cache.latent_caches[layer_idx][blocks].reshape(
+            -1, latent_cache.latent_dim
+        )[:ctx_len]
+
+        all_kv_norm = all_latent[:, : inner.kv_lora_rank]
+        all_k_pe = all_latent[:, inner.kv_lora_rank :]
+
+        rq_nope = q_nope[:, :, req_start:req_end, :]
+        rq_pe = q_pe[:, :, req_start:req_end, :]
+
+        k_pe_r = all_k_pe.reshape(1, 1, ctx_len, inner.qk_rope_head_dim)
+        causal_mask = self._causal_valid_mask(
+            num_new=num_new, ctx_len=ctx_len, past_len=past_len
+        )
+
+        out = self._apply_mla_attention(
+            rq_nope=rq_nope,
+            rq_pe=rq_pe,
+            all_kv_norm=all_kv_norm,
+            k_pe=k_pe_r,
+            causal_mask=causal_mask,
+        )
+        return out.transpose(0, 2, 1, 3).reshape(1, num_new, -1)
 
     def _materialized_prefill(
         self,
@@ -301,6 +351,7 @@ class MLAPagedAttentionWrapper(nn.Module):
         k_pe: mx.array,  # [1, 1, seq, qk_rope_head_dim] (post-RoPE)
         ctx: Any,
         seq_len: int,
+        routed: list[bool],
     ) -> mx.array:
         """Materialize full per-head K/V from the absorbed embed_q/unembed_out
         weights (mirroring upstream ``forward_mha``) and run prefill as standard
@@ -315,7 +366,9 @@ class MLAPagedAttentionWrapper(nn.Module):
         Segments with past context (chunked prefill, prefix-cache hits)
         gather their past latents from the paged cache — the scatter in
         ``__call__`` already ran — and materialize their K/V with the same
-        recipe; new tokens keep using the in-graph kv_norm/k_pe."""
+        recipe; new tokens keep using the in-graph kv_norm/k_pe. Segments not
+        flagged in ``routed`` (decode rows, small continuation chunks) run the
+        absorbed per-segment attention instead, in packed order."""
         nheads = inner.num_heads
         scale = self._attention_scale()
         # Leading [1, ...] axis so the per-head weights broadcast across heads.
@@ -340,6 +393,12 @@ class MLAPagedAttentionWrapper(nn.Module):
         for i, ctx_len in enumerate(ctx.context_lens):  # per-request causal MHA
             s, e = cu[i], cu[i + 1]
             num_new = e - s
+            if not routed[i]:
+                out = self._absorbed_segment(
+                    inner, latent_cache, layer_idx, q_nope, q_pe, ctx, i
+                )  # [1, num_new, nheads * v_head_dim]
+                outs.append(out[0].reshape(num_new, nheads, inner.v_head_dim))
+                continue
             past = ctx_len - num_new
             k_i = keys[:, s:e]
             v_i = values[:, s:e]
@@ -511,11 +570,13 @@ class MLAPagedAttentionWrapper(nn.Module):
             latent_cache.num_blocks, latent_cache.block_size, latent_cache.latent_dim
         )
 
-        # Materialized-prefill fast path (opt-in; absorbed model; segments with
-        # cached context only when the chunk has >= 512 new tokens, else they
-        # fall through). Materializes full K/V and runs standard MHA via
-        # MLX SDPA instead of the absorbed 512-wide MQA loop (RFC #360 Phase 2).
-        if self._materialized_prefill_ok(inner, ctx):
+        # Materialized-prefill fast path (opt-in; absorbed model; routed per
+        # segment — segments with cached context only when the chunk has >= 512
+        # new tokens, decode rows never). Materializes full K/V and runs
+        # standard MHA via MLX SDPA instead of the absorbed 512-wide MQA loop
+        # (RFC #360 Phase 2); unrouted segments take the absorbed attention.
+        routed = self._materialized_segments(inner, ctx)
+        if routed is not None:
             final = self._materialized_prefill(
                 inner,
                 latent_cache,
@@ -526,6 +587,7 @@ class MLAPagedAttentionWrapper(nn.Module):
                 k_pe,
                 ctx,
                 seq_len,
+                routed,
             )
             # For all-fresh batches `final` is computed from kv_norm/k_pe
             # directly and does not gather
@@ -548,46 +610,14 @@ class MLAPagedAttentionWrapper(nn.Module):
             )
             return inner.o_proj(final)
 
-        # Pre-convert block tables once per forward — reused across layers —
-        # to avoid a new mx.array allocation per request per layer
-        block_tables_mx = _block_table_rows(ctx)
-
-        outputs = []
-        for req_idx, ctx_len in enumerate(ctx.context_lens):
-            req_start = ctx.cu_seqlens[req_idx]
-            req_end = ctx.cu_seqlens[req_idx + 1]
-            num_new = req_end - req_start
-            past_len = ctx_len - num_new  # tokens cached before this step
-
-            # Gather this request's full context from the paged cache.
-            # Block indexing: each block holds block_size contiguous token slots.
-            n_blocks = math.ceil(ctx_len / latent_cache.block_size)
-            blocks = block_tables_mx[req_idx][:n_blocks]
-            all_latent = latent_cache.latent_caches[layer_idx][blocks].reshape(
-                -1, latent_cache.latent_dim
-            )[:ctx_len]
-
-            all_kv_norm = all_latent[:, : inner.kv_lora_rank]
-            all_k_pe = all_latent[:, inner.kv_lora_rank :]
-
-            rq_nope = q_nope[:, :, req_start:req_end, :]
-            rq_pe = q_pe[:, :, req_start:req_end, :]
-
-            k_pe_r = all_k_pe.reshape(1, 1, ctx_len, inner.qk_rope_head_dim)
-            causal_mask = self._causal_valid_mask(
-                num_new=num_new, ctx_len=ctx_len, past_len=past_len
+        # Per-request absorbed attention; block tables are converted once per
+        # forward and reused across layers (``_block_table_rows``).
+        outputs = [
+            self._absorbed_segment(
+                inner, latent_cache, layer_idx, q_nope, q_pe, ctx, req_idx
             )
-
-            out = self._apply_mla_attention(
-                rq_nope=rq_nope,
-                rq_pe=rq_pe,
-                all_kv_norm=all_kv_norm,
-                k_pe=k_pe_r,
-                causal_mask=causal_mask,
-            )
-
-            out = out.transpose(0, 2, 1, 3).reshape(1, num_new, -1)
-            outputs.append(out)
+            for req_idx in range(len(ctx.context_lens))
+        ]
 
         final = mx.concatenate(outputs, axis=1) if len(outputs) > 1 else outputs[0]
         return inner.o_proj(final)

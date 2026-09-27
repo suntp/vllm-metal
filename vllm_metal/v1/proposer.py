@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 import mlx.core as mx
+from vllm.utils.math_utils import cdiv
 from vllm.v1.outputs import DraftTokenIds
 
 if TYPE_CHECKING:
@@ -29,6 +30,29 @@ if TYPE_CHECKING:
         RequestState,
     )
     from vllm_metal.v1.spec_decode import PagedDecodeSegment
+
+
+# Ingests at or below this size are submitted as expanded decode rows instead
+# of a prefill segment (see _ingest_and_draft_first). Keeps small steady-state
+# ingests on decode and full-prompt catch-up on the tiled prefill kernel.
+_DECODE_INGEST_MAX_TOKENS = 16
+
+
+def validate_scheduler_blocks(
+    req_id: str,
+    block_ids: Sequence[int],
+    block_size: int,
+    *,
+    total_positions: int,
+) -> None:
+    """Check capacity without allocating or changing the scheduler's block table."""
+    needed = cdiv(total_positions, block_size)
+    if needed > len(block_ids):
+        raise RuntimeError(
+            f"Draft KV allocation for request {req_id!r} needs "
+            f"{needed} blocks for {total_positions} positions, but the "
+            f"scheduler supplied {len(block_ids)}."
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,12 +100,11 @@ class MetalProposer(Protocol):
         ...
 
     def release_requests(self, req_ids: set[str]) -> None:
-        """Release any per-request drafter state for these evicted/preempted ids.
+        """Clear per-request drafter state on eviction, preemption, or resume.
 
-        Called from the runner's lifecycle reconcile on eviction, preemption, and
-        resume. A proposer that pins a bounded per-request resource (draft cache
-        blocks) must release it here rather than hold it while the request waits;
-        a stateless proposer is a no-op.
+        The runner calls this before a request can reuse an ID or recompute
+        its prefix. Physical KV blocks remain scheduler-owned; a stateless
+        proposer is a no-op.
         """
         ...
 

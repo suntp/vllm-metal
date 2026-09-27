@@ -375,6 +375,7 @@ def test_gqa_decode_matches_reference(dtype, offset, interleaved) -> None:
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("disabled", [False, True])
 @pytest.mark.parametrize(
     "q_heads,kv_heads,head,block_size",
     [
@@ -386,7 +387,7 @@ def test_gqa_decode_matches_reference(dtype, offset, interleaved) -> None:
     ],
 )
 def test_gqa_reads_upstream_views_after_writes_and_block_copy(
-    dtype, q_heads, kv_heads, head, block_size
+    dtype, disabled, q_heads, kv_heads, head, block_size
 ):
     """Exercise every shipped GQA specialization on shared K/V storage.
 
@@ -480,10 +481,10 @@ def test_gqa_reads_upstream_views_after_writes_and_block_copy(
         kernel_tables, kernel_block_size = _build_block_tables([pages], block_size)
         if block_size == 1056:
             assert kernel_block_size == 32
-        kernel_keys = cache.key_caches[0].reshape(-1, kernel_block_size, kv_heads, head)
-        kernel_values = cache.value_caches[0].reshape(
-            -1, kernel_block_size, kv_heads, head
-        )
+        # Production keeps dense K/V in scheduler-page views. Translated
+        # block IDs must use the kernel-token stride without reshaping them.
+        kernel_keys = cache.key_caches[0]
+        kernel_values = cache.value_caches[0]
         out = mx.array(0)
         ops.paged_attention_primitive(
             query,
@@ -500,9 +501,13 @@ def test_gqa_reads_upstream_views_after_writes_and_block_copy(
             -1,
             out,
             num_decode_requests=1,
+            gqa_disabled=disabled,
         )
         mx.eval(out)
-        assert _dispatch_family() == "gqa_decode"
+        if disabled:
+            _assert_fallback()
+        else:
+            assert _dispatch_family() == "gqa_decode"
         # Independent logical history; never gather the cache under test.
         ref = _grouped_paged_reference(
             query=query,

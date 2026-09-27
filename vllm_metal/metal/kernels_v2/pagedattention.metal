@@ -641,6 +641,12 @@ constant bool use_sinks [[function_constant(40)]];
 constant bool use_turboquant [[function_constant(50)]];
 constant int k_bits [[function_constant(60)]];
 constant int v_bits [[function_constant(70)]];  // V quantization bit width (default 3)
+// Gemma 4 vision (mm_prefix): the tiled prefill kernel receives, per query
+// row, the inclusive absolute [start, end] of the image block the row lies in
+// ((-1, -1) elsewhere) and unmasks that block on top of the causal rule.
+// 120 is the first index free in this translation unit (10..70 above,
+// 80/81/90 in turboquant.metal, 100 in reshape_and_cache.metal, 110 below).
+constant bool use_mm_prefix [[function_constant(120)]];
 // Window mode: 0 = per-token (grid.y is a query token; today's decode path).
 // > 0 = the number of PA_WINDOW_ROWS-row sub-windows per segment: grid.y is
 // a (segment, sub-window) pair and the threadgroup owns up to
@@ -805,15 +811,17 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
   if (num_blocks <= 0) {
     // Every key in range lies left of the window: this partition's, or the
     // whole context's when sliding_window == 0 and the context is
-    // block-aligned.  Write what the masked loop produces for such a range
-    // and leave: a zero output, plus max 0 and sum 0 when partitioned (the
-    // reduce gives such a partial zero merge weight).
+    // block-aligned.  Write a zero output and leave.  When partitioned the
+    // partial must be neutral in the reduce: max -FLT_MAX and sum 0, so
+    // exp2(max - global_max) is 0 and the partial neither carries weight
+    // nor pins the global max (a max of 0 did, attenuating heads whose
+    // in-window scores are all far below 0).
     const int rows = WINDOW_MODE ? num_rows : 1;
     for (int r = 0; r < rows; r++) {
       const int out_row = q_token_idx + r;
       if (USE_PARTITIONING && thread_idx == 0 && use_partitioning) {
         max_logits[out_row * num_heads * max_num_partitions +
-                   head_idx * max_num_partitions + partition_idx] = 0.f;
+                   head_idx * max_num_partitions + partition_idx] = -FLT_MAX;
         exp_sums[out_row * num_heads * max_num_partitions +
                  head_idx * max_num_partitions + partition_idx] = 0.f;
       }
