@@ -832,7 +832,95 @@ def sdpa_forward(
         {} if mm_prefix_ranges is None else {"mm_prefix_ranges": mm_prefix_ranges}
     )
     out = mx.array(0)
-    if kv_cache.turboquant:
+    tq_prefill_lane = (
+        kv_cache.turboquant
+        # Plain prefill only: multi-token chunks. Spec-verify window rows
+        # (verify_window_q > 1) keep their bitwise window contract, and
+        # Gemma4 bidi rows keep the mm_prefix kernel path.
+        and q_3d.shape[0] > len(ctx.context_lens)
+        and (ctx.verify_window_q or 1) <= 1
+        and not mm_kwargs
+        # Shapes the unquantized dispatch can route to NAX/tiled; anything
+        # else would gain only the dequant overhead on the per-token path.
+        and q_3d.dtype in (mx.bfloat16, mx.float16)
+        and q_3d.shape[2] in (64, 96, 128, 256, 512)
+        and kernel_block_size in (8, 16, 32)
+        # Token-slice gather below assumes kernel blocks tile pool blocks
+        # exactly (the pool block size is a multiple of the kernel's).
+        and new_k_cache.shape[1] % kernel_block_size == 0
+    )
+    if tq_prefill_lane:
+        # Quantized caches cannot feed the NAX/tiled prefill kernels (they
+        # read bf16 fragments directly; the only quantized-capable kernel is
+        # the per-token v2 path, which serialises prefill batches). Gather
+        # just the kernel-block token slices the block table references and
+        # batch-dequantize those into a transient bf16 buffer (per layer,
+        # freed after the call), then route through the standard unquantized
+        # dispatch, which reaches NAX on M5. Dequantizing the pool whole is
+        # ~1000x the useful work: the pool is sized by gpu_memory_utilization
+        # (806k tokens here), not by the sequence (~1k). turbo_quant_decode
+        # mirrors the Metal kernels' hardcoded sign tables and Lloyd-Max
+        # centroids, so the values the prefill kernels consume match what
+        # the per-token kernel would have dequantized.
+        from vllm_metal.attention.caches.turboquant import turbo_quant_decode
+
+        if not globals().get("_TQ_LANE_ENGAGED_LOGGED"):
+            globals()["_TQ_LANE_ENGAGED_LOGGED"] = True
+            logger.info(
+                "Metal: TurboQuant prefill lane engaged (%d q tokens, hs=%d)",
+                q_3d.shape[0],
+                q_3d.shape[2],
+            )
+
+        # The pool is (pool_blocks, pool_block, kvh, dim); kernel blocks are
+        # aligned slices of the token stream (pool_block % kb == 0 above), so
+        # block-table entry e starts at flat token e*kb.
+        pool_tokens = new_key_scale_cache.shape[0] * new_key_scale_cache.shape[1]
+        k_flat = new_k_cache.reshape(pool_tokens, cache_kv_heads, new_k_cache.shape[-1])
+        v_flat = new_v_cache.reshape(pool_tokens, cache_kv_heads, new_v_cache.shape[-1])
+        ks_flat = new_key_scale_cache.reshape(pool_tokens, cache_kv_heads, -1)
+        kz_flat = new_key_zero_cache.reshape(pool_tokens, cache_kv_heads, -1)
+        vs_flat = new_value_scale_cache.reshape(pool_tokens, cache_kv_heads, -1)
+        table_flat = mx.reshape(block_tables, (-1,))
+        tok_idx = (
+            table_flat[:, None] * kernel_block_size + mx.arange(kernel_block_size)
+        ).reshape(-1)
+        k16, v16 = turbo_quant_decode(
+            (
+                mx.take(k_flat, tok_idx, axis=0),
+                mx.take(ks_flat, tok_idx, axis=0),
+                mx.take(kz_flat, tok_idx, axis=0),
+            ),
+            (
+                mx.take(v_flat, tok_idx, axis=0),
+                mx.take(vs_flat, tok_idx, axis=0),
+            ),
+            output_dtype=q_3d.dtype,
+        )
+        # The gathered copy lists kernel blocks in block-table order, so the
+        # kernel sees an identity block table.
+        gathered_table = mx.arange(
+            table_flat.shape[0], dtype=block_tables.dtype
+        ).reshape(block_tables.shape)
+        ops.paged_attention_primitive(
+            q_3d,
+            k16.reshape(-1, kernel_block_size, cache_kv_heads, q_3d.shape[2]),
+            v16.reshape(-1, kernel_block_size, cache_kv_heads, q_3d.shape[2]),
+            cache_kv_heads,
+            attn_scale,
+            attn_softcap,
+            gathered_table,
+            seq_lens,
+            cu_seqlens_q,
+            kernel_block_size,
+            max_seq_len,
+            layer_sliding_window,
+            out,
+            window_seqlen_q=ctx.verify_window_q,
+            sinks=sinks,
+            **mm_kwargs,
+        )
+    elif kv_cache.turboquant:
         # Reshape scale/zero caches for kernel block size
         kernel_key_scale = new_key_scale_cache
         kernel_value_scale = new_value_scale_cache

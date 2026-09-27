@@ -1,0 +1,26 @@
+perf: route TurboQuant prefill through block-gather dequant + NAX
+
+TurboQuant prefill fell through to the per-token v2 kernel (the
+pathology PR #367 fixed for bf16): a 1153-token prefill serialized
+~16.5s end-to-end on M5 Pro. The v2 kernel is the only quantized-
+capable Metal attention kernel, but the unquantized dispatch reaches
+the M5 NAX kernel, so batch-dequantize the referenced blocks and route
+through it:
+
+- gather just the kernel-block token slices the block table references
+  (dequantizing the whole pool is ~400x the useful work: the pool is
+  sized by gpu_memory_utilization -- 806k tokens -- not by the sequence)
+- turbo_quant_decode mirrors the Metal kernels' hardcoded sign tables
+  and Lloyd-Max centroids, so the dequantized values match the per-token
+  path exactly; e2e greedy output is identical to the per-token path
+- the gathered copy lists kernel blocks in block-table order, so the
+  primitive consumes an identity block table
+- gated to shapes the NAX/tiled dispatch accepts; spec-verify window,
+  mm-prefix, and non-aligned pool layouts keep the per-token path
+
+Primitive-level: 9.2-11.8x vs per-token at (1568,31360)/(2048,100352).
+E2E (Qwen3.8-27B-4bit hybrid, 1153-token prefill, M5 Pro):
+prefill 2.57s vs 16.5s per-token (6.4x), full 32-token gen 4.53s vs
+18.27s (4.0x), at parity with the unquantized bf16 baseline (4.58s).
+
+Signed-off-by: suntp <20786998+suntp@users.noreply.github.com>
