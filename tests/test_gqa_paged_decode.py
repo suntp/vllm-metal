@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Scoped GQA decode routing, verified after the native primitive executes.
 
-The default optimization covers three measured attention geometries, one
-request, ordinary FP16/BF16 caches, 16-token kernel pages, and long contexts.
+The default optimization covers four measured attention geometries, one
+request, ordinary FP16/BF16 caches, scoped kernel pages, and long contexts.
 Numerical support for another shape does not authorize its default
 use. These tests inspect the actual dispatcher and compare both selected and
 fallback paths against attention references; timing is deliberately excluded.
@@ -375,9 +375,18 @@ def test_gqa_decode_matches_reference(dtype, offset, interleaved) -> None:
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("q_heads,kv_heads,head", [(32, 8, 128), (24, 4, 256)])
+@pytest.mark.parametrize(
+    "q_heads,kv_heads,head,block_size",
+    [
+        (32, 8, 128, 16),
+        (24, 4, 256, 16),
+        (16, 2, 256, 16),
+        (16, 2, 256, 32),
+        (16, 2, 256, 1056),  # Actual hybrid scheduler-page translation.
+    ],
+)
 def test_gqa_reads_upstream_views_after_writes_and_block_copy(
-    dtype, q_heads, kv_heads, head
+    dtype, q_heads, kv_heads, head, block_size
 ):
     """Exercise every shipped GQA specialization on shared K/V storage.
 
@@ -395,12 +404,13 @@ def test_gqa_reads_upstream_views_after_writes_and_block_copy(
 
     from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
     from vllm_metal.attention.caches.storage import KVCacheStorage
+    from vllm_metal.attention.impls.sdpa import _build_block_tables
 
     n = _eligible_context(kv_heads) + 1
-    pages = _interleaved_table((n + 1 + BLOCK_SIZE - 1) // BLOCK_SIZE)
+    pages = _interleaved_table((n + 1 + block_size - 1) // block_size)
     num_blocks = max(pages) + 2
     spec = FullAttentionSpec(
-        block_size=BLOCK_SIZE,
+        block_size=block_size,
         num_kv_heads=kv_heads,
         head_size=head,
         dtype=torch.float16 if dtype == mx.float16 else torch.bfloat16,
@@ -441,7 +451,7 @@ def test_gqa_reads_upstream_views_after_writes_and_block_copy(
     # appended write cannot hide inside long-context numerical tolerances.
     keys[0], keys[n] = 4, 4
     values[0], values[n] = 1, 3
-    slots = [pages[i // BLOCK_SIZE] * BLOCK_SIZE + i % BLOCK_SIZE for i in range(n)]
+    slots = [pages[i // block_size] * block_size + i % block_size for i in range(n)]
     ops = get_ops()
     written = ops.reshape_and_cache(
         keys[:n],
@@ -457,7 +467,7 @@ def test_gqa_reads_upstream_views_after_writes_and_block_copy(
             storage.copy_blocks([(pages[0], num_blocks - 1)])
             storage.zero_blocks([pages[0]])
             pages[0] = num_blocks - 1
-            slot = pages[n // BLOCK_SIZE] * BLOCK_SIZE + n % BLOCK_SIZE
+            slot = pages[n // block_size] * block_size + n % block_size
             written = ops.reshape_and_cache(
                 keys[n:],
                 values[n:],
@@ -467,18 +477,25 @@ def test_gqa_reads_upstream_views_after_writes_and_block_copy(
             )
             cache.replace_layer_cache(0, *written)
         query = mx.ones((1, q_heads, head), dtype=dtype)
+        kernel_tables, kernel_block_size = _build_block_tables([pages], block_size)
+        if block_size == 1056:
+            assert kernel_block_size == 32
+        kernel_keys = cache.key_caches[0].reshape(-1, kernel_block_size, kv_heads, head)
+        kernel_values = cache.value_caches[0].reshape(
+            -1, kernel_block_size, kv_heads, head
+        )
         out = mx.array(0)
         ops.paged_attention_primitive(
             query,
-            cache.key_caches[0],
-            cache.value_caches[0],
+            kernel_keys,
+            kernel_values,
             kv_heads,
             head**-0.5,
             0.0,
-            mx.array([pages], dtype=mx.int32),
+            kernel_tables,
             mx.array([length], dtype=mx.int32),
             mx.array([0, 1], dtype=mx.int32),
-            BLOCK_SIZE,
+            kernel_block_size,
             length,
             -1,
             out,
@@ -513,10 +530,19 @@ def test_one_decode_request_takes_gqa(num_decode_requests) -> None:
 
 
 @pytest.mark.parametrize(
-    "q,kv,head,minimum", [(32, 8, 128, 32768), (24, 4, 256, 32768), (16, 2, 128, 65536)]
+    "q,kv,head,minimum,block_size",
+    [
+        (32, 8, 128, 32768, 16),
+        (24, 4, 256, 32768, 16),
+        (16, 2, 128, 65536, 16),
+        (16, 2, 256, 32768, 16),
+        (16, 2, 256, 32768, 32),
+    ],
 )
 @pytest.mark.parametrize("offset", [-1, 0, 1])
-def test_each_geometry_lower_boundary_dispatch(q, kv, head, minimum, offset):
+def test_each_geometry_lower_boundary_dispatch(
+    q, kv, head, minimum, block_size, offset
+):
     n = minimum + offset
     if offset >= 0:
         _require_grid(n, kv)
@@ -528,6 +554,7 @@ def test_each_geometry_lower_boundary_dispatch(q, kv, head, minimum, offset):
         num_query_heads=q,
         num_kv_heads=kv,
         head_size=head,
+        block_size=block_size,
     )
     if offset >= 0:
         assert _dispatch_family() == "gqa_decode"
@@ -536,10 +563,19 @@ def test_each_geometry_lower_boundary_dispatch(q, kv, head, minimum, offset):
     _assert_close(out, ref, mx.bfloat16)
 
 
-@pytest.mark.parametrize("q,kv,head", [(32, 8, 128), (24, 4, 256), (16, 2, 128)])
+@pytest.mark.parametrize(
+    "q,kv,head,block_size",
+    [
+        (32, 8, 128, 16),
+        (24, 4, 256, 16),
+        (16, 2, 128, 16),
+        (16, 2, 256, 16),
+        (16, 2, 256, 32),
+    ],
+)
 @pytest.mark.parametrize("n", [131071, 131072, 131073, 196608, 262144, 262145])
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-def test_each_geometry_continues_gqa_beyond_128k(q, kv, head, n, dtype):
+def test_each_geometry_continues_gqa_beyond_128k(q, kv, head, block_size, n, dtype):
     _require_grid(n, kv)
     out, ref = _run_primitive(
         [n],
@@ -549,6 +585,7 @@ def test_each_geometry_continues_gqa_beyond_128k(q, kv, head, n, dtype):
         num_query_heads=q,
         num_kv_heads=kv,
         head_size=head,
+        block_size=block_size,
     )
     assert _dispatch_family() == "gqa_decode"
     _assert_close(out, ref, dtype)
@@ -561,11 +598,16 @@ def test_each_geometry_continues_gqa_beyond_128k(q, kv, head, n, dtype):
         (16, 2, 128, 32768),  # Small measured gain deliberately omitted.
         (32, 8, 128, 16384),
         (24, 4, 256, 16384),
+        (16, 2, 256, 16384),
+        (16, 4, 256, 16384),
+        (16, 4, 256, 32768),  # Paired model-generation validation is unresolved.
+        (16, 4, 256, 65536),
+        (16, 4, 256, 131073),
         (32, 4, 64, 32768),  # Both narrow-head regressions stay excluded.
         (64, 8, 64, 32768),
         (32, 4, 64, 65536),  # Same old byte proxy/grid as the preceding row.
         (16, 2, 96, 65536),
-        (16, 4, 256, 65536),  # Unmeasured default geometry.
+        (32, 4, 256, 65536),  # Unmeasured default geometry.
         (16, 8, 128, 65536),
         (16, 16, 128, 65536),  # MHA.
     ],
@@ -584,14 +626,26 @@ def test_unselected_shapes_really_use_fallback(q, kv, head, n):
     _assert_close(out, ref, mx.bfloat16)
 
 
-@pytest.mark.parametrize("block_size", [8, 32])
-def test_unmeasured_kernel_page_sizes_use_fallback(block_size):
+@pytest.mark.parametrize(
+    "q,kv,head,block_size",
+    [
+        (32, 8, 128, 8),
+        (32, 8, 128, 32),
+        (16, 2, 256, 8),
+        (16, 4, 256, 32),
+        (24, 4, 256, 32),
+    ],
+)
+def test_unmeasured_kernel_page_sizes_use_fallback(q, kv, head, block_size):
     out, ref = _run_primitive(
         [32768],
         mx.float16,
         interleaved=True,
         seed=718,
         block_size=block_size,
+        num_query_heads=q,
+        num_kv_heads=kv,
+        head_size=head,
     )
     _assert_fallback()
     _assert_close(out, ref, mx.float16)
@@ -688,16 +742,28 @@ def test_matching_float32_uses_fallback() -> None:
 
 
 @pytest.mark.parametrize("minimum", [32768, 196609])
-def test_gqa_disable_flag_forces_established_kernels(monkeypatch, minimum) -> None:
+@pytest.mark.parametrize(
+    "q,kv,head,block_size",
+    [(32, 8, 128, 16), (16, 2, 256, 16), (16, 2, 256, 32)],
+)
+def test_gqa_disable_flag_forces_established_kernels(
+    monkeypatch, minimum, q, kv, head, block_size
+) -> None:
     from vllm_metal import envs
 
     monkeypatch.delenv("VLLM_METAL_DISABLE_GQA_DECODE", raising=False)
     assert envs.VLLM_METAL_DISABLE_GQA_DECODE is False
-    n = _eligible_context(minimum=minimum)
-    out_on, ref = _run_primitive([n], mx.bfloat16, interleaved=True, seed=7)
+    n = _eligible_context(kv, minimum=minimum)
+    shape = {
+        "num_query_heads": q,
+        "num_kv_heads": kv,
+        "head_size": head,
+        "block_size": block_size,
+    }
+    out_on, ref = _run_primitive([n], mx.bfloat16, interleaved=True, seed=7, **shape)
     assert _dispatch_family() == "gqa_decode"
     out_off, _ = _run_primitive(
-        [n], mx.bfloat16, interleaved=True, seed=7, gqa_disabled=True
+        [n], mx.bfloat16, interleaved=True, seed=7, gqa_disabled=True, **shape
     )
     _assert_fallback()
     _assert_close(out_on, ref, mx.bfloat16)
@@ -711,6 +777,7 @@ def test_gqa_disable_flag_forces_established_kernels(monkeypatch, minimum) -> No
         interleaved=True,
         seed=7,
         gqa_disabled=envs.VLLM_METAL_DISABLE_GQA_DECODE,
+        **shape,
     )
     _assert_fallback()
     _assert_close(out_env, ref, mx.bfloat16)
@@ -723,6 +790,12 @@ def test_gqa_disable_flag_forces_established_kernels(monkeypatch, minimum) -> No
         (32, 8, 128, 32768, 40, True),
         (24, 4, 256, 32767, 40, False),
         (24, 4, 256, 32768, 40, True),
+        (16, 2, 256, 32767, 40, False),
+        (16, 2, 256, 32768, 40, True),
+        (16, 4, 256, 32767, 40, False),
+        (16, 4, 256, 32768, 40, False),
+        (16, 2, 256, 32768, 43, False),
+        (16, 2, 256, 32769, 43, True),
         (16, 2, 128, 16384, 20, False),
         (16, 2, 128, 32768, 40, False),
         (16, 2, 128, 65535, 40, False),
@@ -742,13 +815,16 @@ def test_gqa_disable_flag_forces_established_kernels(monkeypatch, minimum) -> No
         (24, 4, 256, 524289, 40, True),
         (16, 2, 128, 1048576, 40, True),
         (32, 8, 128, 262145, 0, False),
+        (16, 2, 256, 262145, 40, True),
         (16, 4, 256, 262145, 40, False),
+        (16, 2, 256, 262145, 0, False),
+        (16, 4, 256, 262145, 0, False),
         (32, 8, 128, 65536, 0, False),
         (32, 8, 128, 65536, -1, False),
         (32, 4, 64, 65536, 40, False),
         (64, 8, 64, 32768, 40, False),
         (16, 2, 96, 65536, 40, False),
-        (16, 4, 256, 65536, 40, False),
+        (32, 4, 256, 65536, 40, False),
         (16, 8, 128, 65536, 40, False),
         (16, 16, 128, 65536, 40, False),
         (8, 1, 128, 65536, 40, False),

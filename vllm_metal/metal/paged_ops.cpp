@@ -135,7 +135,8 @@ static bool gqa_decode_shape_eligible(int num_heads, int num_kv_heads,
     return false;
   const bool measured_32k =
       (num_heads == 32 && num_kv_heads == 8 && head_size == 128) ||
-      (num_heads == 24 && num_kv_heads == 4 && head_size == 256);
+      (num_heads == 24 && num_kv_heads == 4 && head_size == 256) ||
+      (num_heads == 16 && num_kv_heads == 2 && head_size == 256);
   const bool measured_64k =
       num_heads == 16 && num_kv_heads == 2 && head_size == 128 &&
       max_seq_len >= 65536;
@@ -670,13 +671,19 @@ static void dispatch_paged_attention_v2_online(
   // the Python boundary so direct primitive callers obey the same scope.
   const bool gqa_single_request =
       num_seqs == 1 && (num_decode_requests == -1 || num_decode_requests == 1);
+  // Hybrid scheduler pages of 1056 tokens translate to a 32-token kernel
+  // view. Keep this additional page size limited to its measured geometry.
+  const bool gqa_page_size =
+      block_size == 16 ||
+      (block_size == 32 && num_heads == 16 && num_kv_heads == 2 &&
+       head_size == 256);
   const bool gqa_decode =
       !gqa_disabled
       && pure_decode && window_seqlen_q <= 1 && gqa_single_request
       && (query.dtype() == float16 || query.dtype() == bfloat16)
       && dtype_ok && query.dtype() == value_cache.dtype()
       && !use_turboquant && softcap <= 0.f && sinks == nullptr
-      && sliding_window < 0 && block_size == 16
+      && sliding_window < 0 && gqa_page_size
       && gqa_decode_shape_eligible(num_heads, num_kv_heads, head_size,
                                   max_seq_len, detected_gpu_core_count());
   if (gqa_decode) {
@@ -1862,16 +1869,28 @@ NB_MODULE(_paged_ops, m) {
         try {
           auto& d = metal::device(Device::gpu);
           auto* lib = d.get_library("paged_attention_v2_kern");
-          auto* k = d.get_kernel(
-              "paged_attention_gqa_decode_half_hs128_bs16_ps512", lib,
-              "paged_attention_gqa_decode_half_hs128_bs16_ps512", {});
-          return k != nullptr;
+          // Check every shipped specialization even on hosts whose missing
+          // core count keeps the positive dispatch tests on the fallback.
+          for (const char* dtype : {"half", "bfloat16_t"}) {
+            for (int head : {128, 256}) {
+              for (int block : {16, 32}) {
+                if (head == 128 && block == 32) continue;
+                std::string name =
+                    "paged_attention_gqa_decode_" + std::string(dtype) +
+                    "_hs" + std::to_string(head) + "_bs" +
+                    std::to_string(block) + "_ps" +
+                    std::to_string(kPartitionSize);
+                if (d.get_kernel(name, lib, name, {}) == nullptr) return false;
+              }
+            }
+          }
+          return true;
         } catch (const std::exception&) {
           return false;
         }
       },
-      "True when the loaded v2 shader library contains the GQA-shared "
-      "flash-decode pass (the default prebuilt metallib on this branch).");
+      "True when all shipped GQA decode specializations load from the "
+      "active v2 shader library.");
 
   m.def("init_v2_library", &init_v2_library,
         nb::arg("v2_src"),

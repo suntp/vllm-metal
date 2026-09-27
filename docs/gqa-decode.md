@@ -1,19 +1,28 @@
 # GQA decode routing
 
 The paged attention primitive can use `paged_attention_gqa_decode` for a
-limited set of single-request, long-context decode calls. Four shader
-specializations cover head dimensions 128/256, kernel block size 16 and
-FP16/BF16. The geometry and performance checks below further restrict routing.
+limited set of single-request, long-context decode calls. Six shader
+specializations cover head dimensions 128/256 with kernel block size 16,
+plus head dimension 256 with block size 32, in FP16/BF16. The geometry and
+performance checks below further restrict routing.
 
 ## Automatic eligibility
 
 The following geometries and inclusive minimum KV lengths are eligible:
 
-| Query heads | KV heads | Head dimension | Minimum KV tokens |
-|---:|---:|---:|---:|
-| 32 | 8 | 128 | 32,768 |
-| 24 | 4 | 256 | 32,768 |
-| 16 | 2 | 128 | 65,536 |
+| Query heads | KV heads | Head dimension | Kernel block size | Minimum KV tokens |
+|---:|---:|---:|---:|---:|
+| 32 | 8 | 128 | 16 | 32,768 |
+| 24 | 4 | 256 | 16 | 32,768 |
+| 16 | 2 | 128 | 16 | 65,536 |
+| 16 | 2 | 256 | 16 or 32 | 32,768 |
+
+Kernel block size is the view passed to the primitive after hybrid-cache
+translation. For example, a 1056-token scheduler block selects the largest
+supported divisor, 32, whereas a 528-token block selects 16. Merely adding a
+head geometry would not enable GQA for the former view without its block32
+specializations. Other geometries with block32 continue to use the
+established path.
 
 There is no additional GQA-specific maximum context length. The model's
 context limit, cache capacity and the primitive's resource limits still apply.
@@ -25,8 +34,7 @@ Every row additionally requires:
 - One pure-decode request, with `num_decode_requests` equal to 1 or omitted.
 - A verification window of at most 1.
 - Matching FP16 or BF16 query, key-cache, and value-cache types.
-- Kernel block size 16. This is the block size passed to the primitive after
-  any hybrid-cache view conversion.
+- A kernel block size allowed by the geometry table.
 - No TurboQuant, attention sinks, logit soft-capping, or sliding-window
   attention.
 - Enough partition threadgroups for the conservative occupancy guard:
@@ -37,6 +45,14 @@ Calls outside these conditions use the established attention family. That
 includes multi-request batches, even if each request individually matches a
 row, and lengths below the corresponding minimum. The 16/2/128 geometry starts
 at 64K; small measured gains at 32K were not used to widen automatic routing.
+
+The 16/4/256 geometry remains excluded. A MiMo-V2.6-Distill-Qwen-9B-OptiQ
+trial showed operator and serving gains, but a repeatable enabled/disabled
+32K generation comparison failed the strict top-5 rule. Continuous decode
+logits confirmed the divergence on the same token history. Both paths also
+differed from a native MLX continuation on that history, so this does not
+establish a GQA kernel correctness defect. Further full-model numerical
+validation is needed before widening this default scope.
 
 The gate checks geometry rather than model names and does not contain a
 device-name allowlist. Its bounds and occupancy guard are empirical choices,
@@ -59,12 +75,14 @@ APIs are no longer used.
 must actually report `gqa_decode`; boundary, multi-request, verification,
 feature, and disabled cases must report the appropriate established family.
 References include independent grouped CPU FP32 attention and native MLX SDPA.
-All three geometries and both cache dtypes are checked across the former
+All four geometries and both cache dtypes are checked across the former
 128K boundary, at 192K, and at 256K including a partial final partition.
-Shared-storage tests cover all four specializations using upstream-allocated
+Shared-storage tests cover all six specializations using upstream-allocated
 K/V views, non-contiguous page tables, native writes, prefix-page copying,
 source-page clearing and a subsequent decode write. Dominant attention rows
 make missing writes observable even in a long context.
+The 1056-token upstream-page case also exercises the real block-table
+translation and reshaped K/V views before dispatching the block32 kernel.
 `tests/test_attention_sdpa.py` checks that the environment switch and scheduler
 decode count reach the primitive.
 
@@ -72,6 +90,8 @@ Positive route tests need a reported GPU core count and sufficient partition
 grid. They skip on hosts that cannot enable GQA, including some virtual CI
 GPUs; the unknown-core fallback test runs there instead. Unconditional
 feature/dtype/page-size fallback tests do not require core-count detection.
+The library-availability check loads all six specializations even when the
+reported core count is unavailable.
 Validate the positive path on a capable GPU before reporting GQA coverage.
 
 `last_paged_dispatch()` records the last family selected in the process. It

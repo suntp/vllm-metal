@@ -2347,7 +2347,8 @@ instantiate_paged_attention_v2(float, char, uchar, 32);
 instantiate_paged_attention_v2(bfloat16_t, char, uchar, 32);
 instantiate_paged_attention_v2(half, char, uchar, 32);
 
-// Compile only the default dispatch domain: head128/256, block16, FP16/BF16.
+// Compile only the dispatch domain: head128/256 with block16, plus the
+// head256 block32 view used by the 16q/2kv hybrid geometry, in FP16/BF16.
 #define instantiate_gqa_decode_inner(type, head_size, block_size,            \
                                      partition_size)                         \
   template [[host_name("paged_attention_gqa_decode_" #type "_hs" #head_size  \
@@ -2376,7 +2377,8 @@ instantiate_paged_attention_v2(half, char, uchar, 32);
 
 #define instantiate_gqa_decode(type, partition_size)                         \
   instantiate_gqa_decode_inner(type, 128, 16, partition_size);               \
-  instantiate_gqa_decode_inner(type, 256, 16, partition_size);
+  instantiate_gqa_decode_inner(type, 256, 16, partition_size);               \
+  instantiate_gqa_decode_inner(type, 256, 32, partition_size);
 
 instantiate_gqa_decode(bfloat16_t, VLLM_METAL_PARTITION_SIZE);
 instantiate_gqa_decode(half, VLLM_METAL_PARTITION_SIZE);
