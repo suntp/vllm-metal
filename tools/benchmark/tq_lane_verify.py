@@ -1,213 +1,206 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TurboQuant prefill lane: correctness + interleaved A/B (old vs new).
+"""Production TurboQuant prefill correctness, interleaved timing and memory.
 
-Replicates the sdpa.py lane at the primitive level with production cache
-layouts ((blocks, bs, kvh, packed) + per-32-head-dim scale/zero), then:
+Both arms execute sdpa_forward, including projections, fused cache writes,
+block translation and dispatch. The reference disables only the new planner.
+The fixture binds upstream storage and uses nonidentity tables, optional page
+padding, shared prefixes and extra unused pool capacity. Reported error is
+against the compressed native attention path on the same quantized cache.
 
-  correctness — new lane (batch dequant -> unquantized dispatch) vs old
-  lane (per-token quantized kernel) and vs an fp32 reference computed on
-  the dequantized caches;
-  performance — interleaved arms, medians; the new arm's time INCLUDES
-  the batch dequant (the honest lane cost).
-
-    PYTHONPATH=. python tools/benchmark/tq_lane_verify.py
+    PYTHONPATH=. python tools/benchmark/tq_lane_verify.py --suite crossover
+    PYTHONPATH=. python tools/benchmark/tq_lane_verify.py --suite memory
+    PYTHONPATH=. python tools/benchmark/tq_lane_verify.py --suite geometry --tiled
 """
 
+import argparse
+import gc
+import importlib.metadata
+import json
 import statistics
-import sys
 import time
+from contextlib import nullcontext
+from unittest.mock import patch
 
 import mlx.core as mx
 import numpy as np
 
-from vllm_metal.attention.caches.turboquant import (
-    turbo_quant_decode,
-    turbo_quant_encode,
-)
+from tools.benchmark.tq_prefill_case import build_case
+from vllm_metal.attention.impls import sdpa
 from vllm_metal.metal import get_ops
 
-NQ, NKV, HS, BS = 24, 4, 256, 16
-SCALE = HS**-0.5
 
-
-def build_pool(seq, seed=715):
-    """Encode a dense (tokens, kvh, dim) KV into production pool layouts."""
-    mx.random.seed(seed)
-    blocks = (seq + BS - 1) // BS
-    tokens = blocks * BS
-    k = mx.random.normal((tokens, NKV, HS)).astype(mx.bfloat16)
-    v = mx.random.normal((tokens, NKV, HS)).astype(mx.bfloat16)
-    (ki, ks, kz), (vi, vs) = turbo_quant_encode(k, v, "q8_0", 3)
-
-    def pool(x):
-        return x.reshape(blocks, BS, NKV, -1)
-
-    return {
-        "blocks": blocks,
-        "kq": pool(ki),
-        "vq": pool(vi),
-        "ks": pool(ks),
-        "vs": pool(vs),
-        "kz": pool(kz),
-        "k_ref": k,
-        "v_ref": v,
-    }
-
-
-def reference(q, k, v, seq, qlen):
-    qf = q.astype(mx.float32).transpose(1, 0, 2).reshape(NKV, -1, qlen, HS)
-    kf = k[:seq].astype(mx.float32).transpose(1, 0, 2)
-    vf = v[:seq].astype(mx.float32).transpose(1, 0, 2)
-    s = qf @ kf[:, None].transpose(0, 1, 3, 2) * SCALE
-    qpos = mx.arange(qlen) + (seq - qlen)
-    kvpos = mx.arange(seq)
-    s = mx.where(kvpos[None, None, None, :] <= qpos[None, None, :, None], s, -1e30)
-    p = mx.softmax(s, axis=-1)
-    o = (p @ vf[:, None]).reshape(NKV * (NQ // NKV), qlen, HS).transpose(1, 0, 2)
-    return o.astype(q.dtype)
-
-
-def run_old(ops, q, pool, cu, table, lens, seq, out):
-    from vllm_metal.attention.caches.turboquant import get_v_centroids
-
-    ops.paged_attention_primitive(
-        q,
-        pool["kq"],
-        pool["vq"],
-        NKV,
-        SCALE,
-        0.0,
-        table,
-        lens,
-        cu,
-        BS,
-        seq,
-        -1,
-        out,
-        window_seqlen_q=1,
-        sinks=None,
-        key_scale_cache=pool["ks"],
-        value_scale_cache=pool["vs"],
-        key_zero_cache=pool["kz"],
-        v_centroids=get_v_centroids(3),
-        use_turboquant=True,
-        quant_type="q8_0",
-        v_bits=3,
+def run(case, reference):
+    # A fresh forward's metadata; normal multi-layer serving reuses it after
+    # the first layer. Both arms pay the same projection and cache-write work.
+    case.ctx.kernel_metadata_cache.clear()
+    context = (
+        patch.object(sdpa, "_turboquant_prefill_plan", return_value=None)
+        if reference
+        else nullcontext()
     )
+    with context:
+        output = case.forward()
+        mx.eval(output)
+    return output
 
 
-def run_new(ops, q, pool, cu, table, lens, seq, out, dtype=mx.bfloat16):
-    tokens = pool["kq"].shape[0] * pool["kq"].shape[1]
-    k16, v16 = turbo_quant_decode(
-        (
-            pool["kq"].reshape(tokens, NKV, -1),
-            pool["ks"].reshape(tokens, NKV, -1),
-            pool["kz"].reshape(tokens, NKV, -1),
+def measure(label, kwargs, reps, warmup):
+    case = build_case(**kwargs)
+    reference = run(case, True)
+    lane = run(case, False)
+    delta = mx.abs(lane.astype(mx.float32) - reference.astype(mx.float32)).max().item()
+    np.testing.assert_allclose(
+        np.array(lane.astype(mx.float32)),
+        np.array(reference.astype(mx.float32)),
+        atol=0.02,
+        rtol=0.03,
+    )
+    del lane, reference
+    samples = {"compressed": [], "prefill": []}
+    for rep in range(warmup + reps):
+        arms = [True, False] if rep % 2 == 0 else [False, True]
+        for reference in arms:
+            start = time.perf_counter()
+            output = run(case, reference)
+            elapsed = (time.perf_counter() - start) * 1000
+            if rep >= warmup:
+                samples["compressed" if reference else "prefill"].append(elapsed)
+            del output
+    memory = {}
+    for reference in (True, False):
+        gc.collect()
+        mx.synchronize()
+        mx.clear_cache()
+        mx.reset_peak_memory()
+        before = mx.get_active_memory()
+        output = run(case, reference)
+        mx.synchronize()
+        memory["compressed" if reference else "prefill"] = (
+            mx.get_peak_memory() - before
+        ) / 2**20
+        del output
+    median = {k: statistics.median(v) for k, v in samples.items()}
+    print(
+        json.dumps(
+            {
+                "case": label,
+                "config": kwargs,
+                "max_abs_error": delta,
+                "median_ms": median,
+                "speedup": median["compressed"] / median["prefill"],
+                "peak_extra_mib": memory,
+                "samples_ms": samples,
+            },
+            default=str,
         ),
-        (pool["vq"].reshape(tokens, NKV, -1), pool["vs"].reshape(tokens, NKV, -1)),
-        output_dtype=dtype,
-    )
-    blocks = pool["blocks"]
-    ops.paged_attention_primitive(
-        q,
-        k16.reshape(blocks, BS, NKV, HS),
-        v16.reshape(blocks, BS, NKV, HS),
-        NKV,
-        SCALE,
-        0.0,
-        table,
-        lens,
-        cu,
-        BS,
-        seq,
-        -1,
-        out,
-        window_seqlen_q=1,
-        sinks=None,
-    )
-
-
-def correctness(ops, qlen, seq):
-    pool = build_pool(seq)
-    table = mx.arange(pool["blocks"], dtype=mx.int32)[None]
-    lens = mx.array([seq], mx.int32)
-    cu = mx.array([0, qlen], mx.int32)
-    q = mx.random.normal((qlen, NQ, HS)).astype(mx.bfloat16)
-    mx.eval(
-        q, table, lens, cu, pool["kq"], pool["vq"], pool["ks"], pool["vs"], pool["kz"]
-    )
-
-    out_old = mx.array(0)
-    run_old(ops, q, pool, cu, table, lens, seq, out_old)
-    mx.eval(out_old)
-    out_new = mx.array(0)
-    run_new(ops, q, pool, cu, table, lens, seq, out_new)
-    mx.eval(out_new)
-
-    ref = reference(q, pool["k_ref"], pool["v_ref"], seq, qlen)
-    d_new_ref = float(
-        np.abs(
-            np.array(out_new.astype(mx.float32)) - np.array(ref.astype(mx.float32))
-        ).max()
-    )
-    d_old_ref = float(
-        np.abs(
-            np.array(out_old.astype(mx.float32)) - np.array(ref.astype(mx.float32))
-        ).max()
-    )
-    d_new_old = float(
-        np.abs(
-            np.array(out_new.astype(mx.float32)) - np.array(out_old.astype(mx.float32))
-        ).max()
-    )
-    scale_o = float(np.abs(np.array(ref.astype(mx.float32))).max())
-    print(
-        f"correctness qlen={qlen} seq={seq}: new-vs-ref {d_new_ref:.2e} "
-        f"old-vs-ref {d_old_ref:.2e} new-vs-old {d_new_old:.2e} "
-        f"(out scale {scale_o:.2f})",
         flush=True,
     )
-    return d_new_old
+    del case
+    gc.collect()
+    mx.synchronize()
+    mx.clear_cache()
 
 
-def bench(ops, qlen, seq, reps=7):
-    pool = build_pool(seq)
-    table = mx.arange(pool["blocks"], dtype=mx.int32)[None]
-    lens = mx.array([seq], mx.int32)
-    cu = mx.array([0, qlen], mx.int32)
-    q = mx.random.normal((qlen, NQ, HS)).astype(mx.bfloat16)
-    mx.eval(
-        q, table, lens, cu, pool["kq"], pool["vq"], pool["ks"], pool["vs"], pool["kz"]
-    )
-    out = mx.array(0)
-    samples = {"old": [], "new": []}
-    for rep in range(reps):
-        for arm in ("old", "new") if rep % 2 == 0 else ("new", "old"):
-            t0 = time.perf_counter()
-            if arm == "old":
-                run_old(ops, q, pool, cu, table, lens, seq, out)
-            else:
-                run_new(ops, q, pool, cu, table, lens, seq, out)
-            mx.eval(out)
-            samples[arm].append((time.perf_counter() - t0) * 1e3)
-    m_old = statistics.median(samples["old"])
-    m_new = statistics.median(samples["new"])
-    print(
-        f"bench qlen={qlen} seq={seq}: old {m_old:8.1f}ms  "
-        f"new {m_new:8.1f}ms  speedup {m_old / m_new:5.2f}x",
-        flush=True,
-    )
-    return m_old / m_new
+def cases(suite):
+    common = {"head_dim": 256, "n_heads": 24, "n_kv_heads": 4}
+    if suite == "crossover":
+        for qlen, context in [
+            (2, 4096),
+            (2, 32768),
+            (8, 32768),
+            (32, 32768),
+            (128, 32768),
+            (512, 32768),
+            (1153, 1153),
+        ]:
+            yield (
+                f"q{qlen}-kv{context}",
+                dict(common, qlens=(qlen,), context_lens=(context,)),
+            )
+    elif suite == "geometry":
+        for hd, nq, nkv in [(64, 8, 8), (128, 8, 2), (256, 24, 4), (512, 8, 1)]:
+            for dtype in [mx.float16, mx.bfloat16]:
+                for qlen in [128, 256, 512]:
+                    yield (
+                        f"d{hd}-q{nq}-kv{nkv}-{dtype}-{qlen}",
+                        {
+                            "head_dim": hd,
+                            "n_heads": nq,
+                            "n_kv_heads": nkv,
+                            "dtype": dtype,
+                            "qlens": (qlen,),
+                            "context_lens": (8192,),
+                        },
+                    )
+    else:
+        for padding in [0, 512]:
+            for pool in [1024, 16384]:
+                yield (
+                    f"padding{padding}-pool{pool}",
+                    dict(
+                        common,
+                        page_padding=padding,
+                        pool_blocks=pool,
+                        qlens=(128,),
+                        context_lens=(513,),
+                    ),
+                )
+        for batch in [1, 4, 8]:
+            yield (
+                f"mixed{batch}",
+                dict(
+                    common,
+                    qlens=(128,) + (1,) * (batch - 1),
+                    context_lens=(8192,) + (16,) * (batch - 1),
+                ),
+            )
+        yield (
+            "shared-prefix",
+            dict(
+                common,
+                qlens=(128,) * 8,
+                context_lens=(8192,) * 8,
+                shared_prefix=True,
+            ),
+        )
+
+        yield (
+            "independent-histories",
+            dict(common, qlens=(128,) * 8, context_lens=(8192,) * 8),
+        )
 
 
 def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(
+        "--suite", choices=["crossover", "geometry", "memory"], default="crossover"
+    )
+    ap.add_argument("--reps", type=int, default=7)
+    ap.add_argument("--warmup", type=int, default=2)
+    ap.add_argument("--tiled", action="store_true")
+    args = ap.parse_args()
+    if args.reps < 1 or args.warmup < 0:
+        ap.error("reps must be positive and warmup must be nonnegative")
     ops = get_ops()
-    check = correctness(ops, 130, 640)
-    assert check < 5e-2, check
-    sp1 = bench(ops, 1568, 31360)
-    sp2 = bench(ops, 2048, 100352)
-    print(f"SUMMARY speedups: {sp1:.2f}x / {sp2:.2f}x", flush=True)
+    ops.set_nax_enabled(not args.tiled)
+    print(
+        json.dumps(
+            {
+                "device": mx.device_info()["device_name"],
+                "nax_ready": ops.nax_ready(),
+                "versions": {
+                    n: importlib.metadata.version(n) for n in ["vllm", "mlx", "mlx-lm"]
+                },
+            }
+        ),
+        flush=True,
+    )
+    try:
+        for label, kwargs in cases(args.suite):
+            measure(label, kwargs, args.reps, args.warmup)
+    finally:
+        ops.set_nax_enabled(True)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

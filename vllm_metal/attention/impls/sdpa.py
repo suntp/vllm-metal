@@ -31,7 +31,7 @@ All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import mlx.core as mx
@@ -63,6 +63,13 @@ logger = init_logger(__name__)
 # sizes only.  Sorted descending so _pick_kernel_block_size selects the
 # largest valid divisor first, minimising the block-table expansion ratio.
 _KERNEL_BLOCK_SIZES = (32, 16, 8)
+
+# Dequantizing cached context must be amortized by enough query rows. Keep
+# short suffixes (including prefix hits) on the compressed kernel. MHA needs
+# more rows because it cannot amortize dequant across grouped query heads.
+# See tools/benchmark/tq_lane_verify.py's production-path crossover sweep.
+_TQ_MIN_PREFILL_TOKENS = 128
+_TQ_MIN_QUERIES_PER_KV_HEAD = 256
 
 
 def _has_packed_qkv_sdpa_contract(module: nn.Module) -> bool:
@@ -181,6 +188,24 @@ def _build_block_tables(
 
 
 @dataclass(frozen=True, eq=False)
+class _AttentionBatch:
+    query_indices: mx.array | None
+    block_tables: mx.array
+    seq_lens: mx.array
+    cu_seqlens_q: mx.array
+    max_seq_len: int
+
+
+@dataclass(frozen=True, eq=False)
+class _TurboQuantPrefillPlan:
+    prefill: _AttentionBatch
+    fallback: _AttentionBatch | None
+    restore_indices: mx.array | None
+    pool_pages: mx.array
+    pool_offsets: mx.array
+
+
+@dataclass(frozen=True, eq=False)
 class _KernelMetadata:
     """Kernel-format copies of the per-forward paged metadata.
 
@@ -194,6 +219,11 @@ class _KernelMetadata:
     block_tables: mx.array
     block_size: int
     max_seq_len: int
+    # Same forward/group lifetime as the existing kernel metadata. Only CPU
+    # routing and gather indices are cached, never materialized K/V buffers.
+    tq_prefill_plans: dict[tuple[int, int], _TurboQuantPrefillPlan | None] = field(
+        default_factory=dict
+    )
 
 
 def _kernel_metadata(
@@ -228,6 +258,113 @@ def _kernel_metadata(
         )
         ctx.kernel_metadata_cache[key] = meta
     return meta
+
+
+def _turboquant_prefill_plan(
+    ctx: PagedAttentionContext,
+    meta: _KernelMetadata,
+    raw_block_tables: list[list[int]],
+    cache_block_size: int,
+    num_query_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> _TurboQuantPrefillPlan | None:
+    """Plan bounded materialization using the existing CPU scheduler metadata.
+
+    Only referenced kernel blocks are gathered; shared prefixes are deduplicated.
+    Limit the gather to the longest cached prefix plus this step's new tokens.
+    Cold prefills stay batched, while unrelated long histories exceeding that
+    bound keep the compressed path. No GPU reads, new allocator or cache IDs.
+    """
+    min_tokens = max(
+        _TQ_MIN_PREFILL_TOKENS,
+        # Wide-head tiled prefill needs more rows to amortize materialization.
+        head_dim // 2,
+        (_TQ_MIN_QUERIES_PER_KV_HEAD * num_kv_heads + num_query_heads - 1)
+        // num_query_heads,
+    )
+    key = (cache_block_size, min_tokens)
+    if key in meta.tq_prefill_plans:
+        return meta.tq_prefill_plans[key]
+    assert ctx.cu_seqlens is not None
+    cu_seqlens = ctx.cu_seqlens
+    lengths = [b - a for a, b in zip(cu_seqlens[:-1], cu_seqlens[1:], strict=True)]
+    candidates = [i for i, length in enumerate(lengths) if length >= min_tokens]
+    if not candidates:
+        meta.tq_prefill_plans[key] = None
+        return None
+
+    kernel_bs = meta.block_size
+    ratio = cache_block_size // kernel_bs
+    block_limit = max(
+        (ctx.context_lens[i] - lengths[i] + kernel_bs - 1) // kernel_bs
+        for i in candidates
+    ) + sum((lengths[i] + kernel_bs - 1) // kernel_bs for i in candidates)
+    source_blocks: dict[int, int] = {}
+    prefill_ids: list[int] = []
+    rows: list[list[int]] = []
+    for i in candidates:
+        sources = [
+            raw_block_tables[i][j // ratio] * ratio + j % ratio
+            for j in range((ctx.context_lens[i] + kernel_bs - 1) // kernel_bs)
+        ]
+        if len(source_blocks.keys() | set(sources)) > block_limit:
+            continue
+        row = []
+        for source in sources:
+            if source not in source_blocks:
+                source_blocks[source] = len(source_blocks)
+            row.append(source_blocks[source])
+        prefill_ids.append(i)
+        rows.append(row)
+    selected = set(prefill_ids)
+    fallback_ids = [i for i in range(len(lengths)) if i not in selected]
+    query_order: list[int] = []
+
+    def batch(ids: list[int], tables: mx.array) -> _AttentionBatch:
+        indices = [q for i in ids for q in range(cu_seqlens[i], cu_seqlens[i + 1])]
+        query_order.extend(indices)
+        cu = [0]
+        for i in ids:
+            cu.append(cu[-1] + lengths[i])
+        return _AttentionBatch(
+            None if not fallback_ids else mx.array(indices, dtype=mx.int32),
+            tables,
+            mx.array([ctx.context_lens[i] for i in ids], dtype=mx.int32),
+            mx.array(cu, dtype=mx.int32),
+            max(ctx.context_lens[i] for i in ids),
+        )
+
+    width = max(map(len, rows))
+    tables = mx.array([row + [0] * (width - len(row)) for row in rows], mx.int32)
+    prefill = batch(prefill_ids, tables)
+    fallback = (
+        batch(fallback_ids, meta.block_tables[mx.array(fallback_ids, mx.int32)])
+        if fallback_ids
+        else None
+    )
+    restore = None
+    if fallback_ids:
+        inverse = [0] * len(query_order)
+        for packed, original in enumerate(query_order):
+            inverse[original] = packed
+        restore = mx.array(inverse, dtype=mx.int32)
+    blocks = mx.array(list(source_blocks), dtype=mx.int32)
+    # Keep addressing in page/token coordinates: a valid int32 page ID can
+    # still overflow if multiplied into an absolute int32 token offset.
+    pages = mx.repeat(blocks // ratio, kernel_bs)
+    offsets = (
+        (blocks % ratio)[:, None] * kernel_bs + mx.arange(kernel_bs, dtype=mx.int32)
+    ).reshape(-1)
+    plan = _TurboQuantPrefillPlan(
+        prefill,
+        fallback,
+        restore,
+        pages,
+        offsets,
+    )
+    meta.tq_prefill_plans[key] = plan
+    return plan
 
 
 def _mm_prefix_path(ops: Any) -> str:
@@ -832,96 +969,9 @@ def sdpa_forward(
         {} if mm_prefix_ranges is None else {"mm_prefix_ranges": mm_prefix_ranges}
     )
     out = mx.array(0)
-    tq_prefill_lane = (
-        kv_cache.turboquant
-        # Plain prefill only: multi-token chunks. Spec-verify window rows
-        # (verify_window_q > 1) keep their bitwise window contract, and
-        # Gemma4 bidi rows keep the mm_prefix kernel path.
-        and q_3d.shape[0] > len(ctx.context_lens)
-        and (ctx.verify_window_q or 1) <= 1
-        and not mm_kwargs
-        # Shapes the unquantized dispatch can route to NAX/tiled; anything
-        # else would gain only the dequant overhead on the per-token path.
-        and q_3d.dtype in (mx.bfloat16, mx.float16)
-        and q_3d.shape[2] in (64, 96, 128, 256, 512)
-        and kernel_block_size in (8, 16, 32)
-        # Token-slice gather below assumes kernel blocks tile pool blocks
-        # exactly (the pool block size is a multiple of the kernel's).
-        and new_k_cache.shape[1] % kernel_block_size == 0
-    )
-    if tq_prefill_lane:
-        # Quantized caches cannot feed the NAX/tiled prefill kernels (they
-        # read bf16 fragments directly; the only quantized-capable kernel is
-        # the per-token v2 path, which serialises prefill batches). Gather
-        # just the kernel-block token slices the block table references and
-        # batch-dequantize those into a transient bf16 buffer (per layer,
-        # freed after the call), then route through the standard unquantized
-        # dispatch, which reaches NAX on M5. Dequantizing the pool whole is
-        # ~1000x the useful work: the pool is sized by gpu_memory_utilization
-        # (806k tokens here), not by the sequence (~1k). turbo_quant_decode
-        # mirrors the Metal kernels' hardcoded sign tables and Lloyd-Max
-        # centroids, so the values the prefill kernels consume match what
-        # the per-token kernel would have dequantized.
-        from vllm_metal.attention.caches.turboquant import turbo_quant_decode
-
-        if not globals().get("_TQ_LANE_ENGAGED_LOGGED"):
-            globals()["_TQ_LANE_ENGAGED_LOGGED"] = True
-            logger.info(
-                "Metal: TurboQuant prefill lane engaged (%d q tokens, hs=%d)",
-                q_3d.shape[0],
-                q_3d.shape[2],
-            )
-
-        # The pool is (pool_blocks, pool_block, kvh, dim); kernel blocks are
-        # aligned slices of the token stream (pool_block % kb == 0 above), so
-        # block-table entry e starts at flat token e*kb.
-        pool_tokens = new_key_scale_cache.shape[0] * new_key_scale_cache.shape[1]
-        k_flat = new_k_cache.reshape(pool_tokens, cache_kv_heads, new_k_cache.shape[-1])
-        v_flat = new_v_cache.reshape(pool_tokens, cache_kv_heads, new_v_cache.shape[-1])
-        ks_flat = new_key_scale_cache.reshape(pool_tokens, cache_kv_heads, -1)
-        kz_flat = new_key_zero_cache.reshape(pool_tokens, cache_kv_heads, -1)
-        vs_flat = new_value_scale_cache.reshape(pool_tokens, cache_kv_heads, -1)
-        table_flat = mx.reshape(block_tables, (-1,))
-        tok_idx = (
-            table_flat[:, None] * kernel_block_size + mx.arange(kernel_block_size)
-        ).reshape(-1)
-        k16, v16 = turbo_quant_decode(
-            (
-                mx.take(k_flat, tok_idx, axis=0),
-                mx.take(ks_flat, tok_idx, axis=0),
-                mx.take(kz_flat, tok_idx, axis=0),
-            ),
-            (
-                mx.take(v_flat, tok_idx, axis=0),
-                mx.take(vs_flat, tok_idx, axis=0),
-            ),
-            output_dtype=q_3d.dtype,
-        )
-        # The gathered copy lists kernel blocks in block-table order, so the
-        # kernel sees an identity block table.
-        gathered_table = mx.arange(
-            table_flat.shape[0], dtype=block_tables.dtype
-        ).reshape(block_tables.shape)
-        ops.paged_attention_primitive(
-            q_3d,
-            k16.reshape(-1, kernel_block_size, cache_kv_heads, q_3d.shape[2]),
-            v16.reshape(-1, kernel_block_size, cache_kv_heads, q_3d.shape[2]),
-            cache_kv_heads,
-            attn_scale,
-            attn_softcap,
-            gathered_table,
-            seq_lens,
-            cu_seqlens_q,
-            kernel_block_size,
-            max_seq_len,
-            layer_sliding_window,
-            out,
-            window_seqlen_q=ctx.verify_window_q,
-            sinks=sinks,
-            **mm_kwargs,
-        )
-    elif kv_cache.turboquant:
-        # Reshape scale/zero caches for kernel block size
+    if kv_cache.turboquant:
+        # Preserve the compressed primitive's layout and rejection contracts
+        # for decode, short continuations, verification, sinks and image rows.
         kernel_key_scale = new_key_scale_cache
         kernel_value_scale = new_value_scale_cache
         kernel_key_zero = new_key_zero_cache
@@ -936,40 +986,112 @@ def sdpa_forward(
             kernel_key_zero = new_key_zero_cache.reshape(
                 -1, kernel_block_size, cache_kv_heads, sg
             )
-        # Get Lloyd-Max centroids for V quantization (lazily computed, cached).
-        # Resolved once per layer and shared by tq_encode + paged_attention.
         if v_centroids is None:
             from vllm_metal.attention.caches.turboquant import get_v_centroids
 
             v_centroids = get_v_centroids(kv_cache.v_bits)
-        ops.paged_attention_primitive(
-            q_3d,
-            kernel_k_cache,
-            kernel_v_cache,
-            cache_kv_heads,
-            attn_scale,
-            attn_softcap,
-            block_tables,
-            seq_lens,
-            cu_seqlens_q,
-            kernel_block_size,
-            max_seq_len,
-            layer_sliding_window,
-            out,
-            # Passed through rather than dropped: the primitive rejects
-            # sinks + TurboQuant outright, so a sink model on a quantized
-            # cache fails loudly instead of silently losing the sink term.
-            sinks=sinks,
-            key_scale_cache=kernel_key_scale,
-            value_scale_cache=kernel_value_scale,
-            key_zero_cache=kernel_key_zero,
-            v_centroids=v_centroids,
-            use_turboquant=True,
-            quant_type=kv_cache.k_quant,
-            v_bits=kv_cache.v_bits,
-            window_seqlen_q=ctx.verify_window_q,
-            **mm_kwargs,
-        )
+
+        def quantized_attention(
+            query: mx.array, batch: _AttentionBatch | _KernelMetadata
+        ) -> mx.array:
+            result = mx.array(0)
+            ops.paged_attention_primitive(
+                query,
+                kernel_k_cache,
+                kernel_v_cache,
+                cache_kv_heads,
+                attn_scale,
+                attn_softcap,
+                batch.block_tables,
+                batch.seq_lens,
+                batch.cu_seqlens_q,
+                kernel_block_size,
+                batch.max_seq_len,
+                layer_sliding_window,
+                result,
+                sinks=sinks,
+                key_scale_cache=kernel_key_scale,
+                value_scale_cache=kernel_value_scale,
+                key_zero_cache=kernel_key_zero,
+                v_centroids=v_centroids,
+                use_turboquant=True,
+                quant_type=kv_cache.k_quant,
+                v_bits=kv_cache.v_bits,
+                window_seqlen_q=ctx.verify_window_q,
+                **mm_kwargs,
+            )
+            return result
+
+        plan = None
+        if (
+            q_3d.shape[0] > len(ctx.context_lens)
+            and (ctx.verify_window_q or 1) <= 1
+            and sinks is None
+            and not mm_kwargs
+            and not recompute_after_kernel
+            # Windowed layers already skip old KV in the compressed path;
+            # materializing that history would undo the saving.
+            and layer_sliding_window < 0
+            and q_3d.dtype in (mx.bfloat16, mx.float16)
+            and q_3d.shape[2] in (64, 128, 256, 512)
+            and kernel_block_size in _KERNEL_BLOCK_SIZES
+            and new_k_cache.shape[1] == cache_block_size
+            and cache_block_size % kernel_block_size == 0
+        ):
+            plan = _turboquant_prefill_plan(
+                ctx,
+                meta,
+                raw_block_tables,
+                cache_block_size,
+                q_3d.shape[1],
+                cache_kv_heads,
+                q_3d.shape[2],
+            )
+
+        if plan is None:
+            out = quantized_attention(q_3d, meta)
+        else:
+            from vllm_metal.attention.caches.turboquant import turbo_quant_decode
+
+            # Index fresh writer handles in the original strided pool. A
+            # full-pool reshape would copy padded pages before the gather.
+            # These temporary buffers belong to the lazy attention graph;
+            # limiting the one materialized batch also bounds overlapping KV.
+            def gather(cache: mx.array) -> mx.array:
+                return cache[plan.pool_pages, plan.pool_offsets]
+
+            k16, v16 = turbo_quant_decode(
+                (
+                    gather(new_k_cache),
+                    gather(new_key_scale_cache),
+                    gather(new_key_zero_cache),
+                ),
+                (gather(new_v_cache), gather(new_value_scale_cache)),
+                output_dtype=q_3d.dtype,
+                key_quant_type=kv_cache.k_quant,
+                value_bits=kv_cache.v_bits,
+            )
+            batch = plan.prefill
+            query = q_3d if batch.query_indices is None else q_3d[batch.query_indices]
+            ops.paged_attention_primitive(
+                query,
+                k16.reshape(-1, kernel_block_size, cache_kv_heads, q_3d.shape[2]),
+                v16.reshape(-1, kernel_block_size, cache_kv_heads, q_3d.shape[2]),
+                cache_kv_heads,
+                attn_scale,
+                attn_softcap,
+                batch.block_tables,
+                batch.seq_lens,
+                batch.cu_seqlens_q,
+                kernel_block_size,
+                batch.max_seq_len,
+                layer_sliding_window,
+                out,
+            )
+            if plan.fallback is not None:
+                fallback = plan.fallback
+                rest = quantized_attention(q_3d[fallback.query_indices], fallback)
+                out = mx.concatenate((out, rest), axis=0)[plan.restore_indices]
     else:
         ops.paged_attention_primitive(
             q_3d,
