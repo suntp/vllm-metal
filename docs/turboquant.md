@@ -109,9 +109,9 @@ Admission counts final K/V, page indices, block tables and any mixed-batch
 query/output copies. Independent histories add their sizes; shared physical
 pages count once. An entire batch that fits avoids the split-copy charge.
 Oversized histories fall back before materialization, while smaller requests
-can still qualify. Attention output is evaluated before returning to the model
-so temporary K/V from successive layers cannot accumulate. Normal model buffers
-remain in the existing profiled execution budget.
+can still qualify. Attention output is evaluated and its GPU stream synchronized
+before returning, so temporary K/V from successive layers cannot accumulate.
+Normal model buffers remain in the existing profiled execution budget.
 
 The worker logs the reserved allowance, first lane activation and first budget
 fallback. Debug logs include selected/fallback request counts, gathered tokens

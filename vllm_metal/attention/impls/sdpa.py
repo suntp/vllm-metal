@@ -1163,6 +1163,10 @@ def sdpa_forward(
             # the single workspace reserved by WorkerCachePlanner. Decode and
             # the compressed fallback retain their fully lazy execution.
             mx.eval(out)
+            # eval waits for the result event; Metal's completion handlers can
+            # still retain input buffers. Drain the stream before another layer
+            # allocates its K/V pair against the same workspace reservation.
+            mx.synchronize()
     else:
         ops.paged_attention_primitive(
             q_3d,

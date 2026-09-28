@@ -524,7 +524,7 @@ def test_long_context_admission_with_fused_workspace(
 
 
 def test_materialization_workspace_does_not_accumulate_across_layers(
-    materialized_lengths, monkeypatch
+    materialized_lengths, monkeypatch, prefill_backend
 ):
     monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "64")
     case = build_case(
