@@ -6,6 +6,7 @@ including key/value quantization metadata, bit packing helpers, and the FWHT
 rotation/sign tables used by the Metal dequantization kernels.
 """
 
+from functools import lru_cache
 from typing import cast
 
 import mlx.core as mx
@@ -21,11 +22,20 @@ def prefill_workspace_bytes() -> int:
 
     mode = envs.VLLM_METAL_TQ_PREFILL
     if mode not in ("auto", "0", "1"):
-        raise ValueError("VLLM_METAL_TQ_PREFILL must be auto, 0 or 1")
+        raise ValueError(f"VLLM_METAL_TQ_PREFILL must be auto, 0 or 1; got {mode!r}")
     setting = envs.VLLM_METAL_TQ_PREFILL_MAX_MIB
-    mib = None if setting == "auto" else int(setting)
-    if mib is not None and mib < 0:
-        raise ValueError("VLLM_METAL_TQ_PREFILL_MAX_MIB must be nonnegative")
+    mib = None
+    if setting != "auto":
+        error = (
+            "VLLM_METAL_TQ_PREFILL_MAX_MIB must be auto or a nonnegative "
+            f"integer in MiB; got {setting!r}"
+        )
+        try:
+            mib = int(setting)
+        except ValueError as exc:
+            raise ValueError(error) from exc
+        if mib < 0:
+            raise ValueError(error)
     if mode == "0" or mib == 0:
         return 0
     if mode == "auto" and not get_ops().nax_ready():
@@ -129,15 +139,21 @@ V_QUANT_PARAMS = {
 FWHT_SUPPORTED_HEAD_DIMS = (64, 128, 256, 512)
 
 
-def fwht(x: mx.array, encode: bool) -> mx.array:
-    dim = x.shape[-1]
-    if dim not in FWHT_SUPPORTED_HEAD_DIMS:
+@lru_cache(maxsize=len(FWHT_SUPPORTED_HEAD_DIMS))
+def get_fwht_signs(head_dim: int) -> mx.array:
+    """Signs shared by Python FWHT and fused page materialization."""
+    if head_dim not in FWHT_SUPPORTED_HEAD_DIMS:
         raise ValueError(
-            f"FWHT only supports head_dim in {FWHT_SUPPORTED_HEAD_DIMS}, got {dim}. "
+            f"FWHT only supports head_dim in {FWHT_SUPPORTED_HEAD_DIMS}, "
+            f"got {head_dim}. "
             "The Metal kernel has hardcoded sign tables only for these sizes."
         )
-    sign01 = mx.random.randint(0, 2, shape=(dim,), key=_RNG_KEY)
-    signs = 1 - 2 * sign01
+    sign01 = mx.random.randint(0, 2, shape=(head_dim,), key=_RNG_KEY)
+    return 1 - 2 * sign01
+
+
+def fwht(x: mx.array, encode: bool) -> mx.array:
+    signs = get_fwht_signs(x.shape[-1])
     if encode:
         x = x * signs
         x = mx.hadamard_transform(x)

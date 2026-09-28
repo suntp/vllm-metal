@@ -3,8 +3,15 @@
 
 from __future__ import annotations
 
+import importlib.metadata
+
 import mlx.core as mx
 import numpy as np
+
+
+def package_versions(*names: str) -> dict[str, str]:
+    """Record installed distributions used by a benchmark."""
+    return {name: importlib.metadata.version(name) for name in names}
 
 
 def ref_paged_attn(

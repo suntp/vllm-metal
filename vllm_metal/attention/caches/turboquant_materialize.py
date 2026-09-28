@@ -7,9 +7,9 @@ from typing import Any
 import mlx.core as mx
 
 from vllm_metal.attention.caches.turboquant import (
-    _RNG_KEY,
     FWHT_SUPPORTED_HEAD_DIMS,
     QUANT_PARAMS,
+    get_fwht_signs,
 )
 
 # One SIMD group owns one (token, KV head) vector. The inverse FWHT follows
@@ -115,13 +115,6 @@ def _kernel() -> Any:
     )
 
 
-@lru_cache(maxsize=4)
-def _signs(head_dim: int) -> mx.array:
-    return (1 - 2 * mx.random.randint(0, 2, (head_dim,), key=_RNG_KEY)).astype(
-        mx.float32
-    )
-
-
 def materialize_turboquant_pages(
     k_data: mx.array,
     v_data: mx.array,
@@ -156,7 +149,7 @@ def materialize_turboquant_pages(
             pages,
             offsets,
             centroids,
-            _signs(head_dim),
+            get_fwht_signs(head_dim),
         ],
         template=[
             ("T", output_dtype),

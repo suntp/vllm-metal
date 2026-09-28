@@ -17,12 +17,12 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from tests.stub_runner import make_stub_runner
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.turboquant import (
-    _RNG_KEY,
     BLOCK_SIZE,
     FWHT_SUPPORTED_HEAD_DIMS,
     QUANT_PARAMS,
     V_QUANT_PARAMS,
     fwht,
+    get_fwht_signs,
     get_v_centroids,
     packed_dim,
     turbo_quant_decode,
@@ -128,18 +128,11 @@ def _parse_metal_sign_table(head_size: int) -> np.ndarray:
     return signs
 
 
-def _python_signs(head_size: int) -> np.ndarray:
-    """Reproduce the Python sign vector using the same RNG recipe as ``fwht``."""
-    sign01 = mx.random.randint(0, 2, shape=(head_size,), key=_RNG_KEY)
-    signs = (1 - 2 * sign01).astype(mx.float32)
-    return np.asarray(signs)
-
-
 @pytest.mark.parametrize("head_size", FWHT_SUPPORTED_HEAD_DIMS)
 def test_metal_sign_table_matches_python_rng(head_size: int) -> None:
     """Metal constant table must equal the Python-generated signs element-wise."""
     metal_signs = _parse_metal_sign_table(head_size)
-    python_signs = _python_signs(head_size)
+    python_signs = np.asarray(get_fwht_signs(head_size))
     np.testing.assert_array_equal(
         python_signs,
         metal_signs,

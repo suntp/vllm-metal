@@ -53,10 +53,8 @@ def materialized_lengths(monkeypatch):
 
 @pytest.fixture(params=[False, True], ids=["native-default", "tiled"])
 def prefill_backend(request):
-    ops = get_ops()
-    ops.set_nax_enabled(not request.param)
-    yield
-    ops.set_nax_enabled(True)
+    if request.param:
+        request.getfixturevalue("force_tiled_prefill")
 
 
 def assert_parity(case):
@@ -95,6 +93,7 @@ def test_prefill_quantization_formats(
     assert len(recorded_ops) == 1
     args, kwargs = recorded_ops[0]
     assert not kwargs.get("use_turboquant", False)
+    assert kwargs["window_seqlen_q"] == case.ctx.verify_window_q == 1
     assert args[1].dtype == dtype
     assert args[1].shape == (17, 16, 2, 128)
 
@@ -389,7 +388,7 @@ def test_over_budget_history_falls_back_before_dequantization(
     monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "1")
     case = build_case(qlens=(128,), context_lens=(1153,))
 
-    def no_dequant(*args):
+    def no_dequant(*args, **kwargs):
         pytest.fail("over-budget history must not allocate dequantization buffers")
 
     monkeypatch.setattr(sdpa, "materialize_turboquant_pages", no_dequant)
@@ -483,6 +482,37 @@ def test_workspace_plan_key_includes_kv_geometry():
     assert plans[1].workspace_bytes > plans[0].workspace_bytes
     assert plans[2] is not plans[0]
     assert plans[2].workspace_bytes > plans[0].workspace_bytes
+
+
+def test_prefill_plan_rejects_missing_query_lengths():
+    case = build_case()
+    meta = sdpa._kernel_metadata(case.ctx, None, [], case.ctx.block_tables, 16)
+    case.ctx.cu_seqlens = None
+    with pytest.raises(ValueError, match="requires cumulative query lengths"):
+        sdpa._turboquant_prefill_plan(
+            case.ctx, meta, case.ctx.block_tables, 16, 8, 2, 128
+        )
+
+
+@pytest.mark.parametrize("mode", ["", "false", "2", "AUTO"])
+def test_prefill_rejects_invalid_mode(monkeypatch, mode):
+    monkeypatch.setenv("VLLM_METAL_TQ_PREFILL", mode)
+    with pytest.raises(ValueError, match="VLLM_METAL_TQ_PREFILL must be auto, 0 or 1"):
+        sdpa.prefill_workspace_bytes()
+
+
+@pytest.mark.parametrize("mode", ["0", "auto", "1"])
+@pytest.mark.parametrize("setting", ["", "-1", "1.5", "64MiB", "AUTO"])
+def test_prefill_rejects_invalid_workspace_even_when_disabled(
+    monkeypatch, mode, setting
+):
+    monkeypatch.setenv("VLLM_METAL_TQ_PREFILL", mode)
+    monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", setting)
+    with pytest.raises(
+        ValueError,
+        match="VLLM_METAL_TQ_PREFILL_MAX_MIB must be auto or a nonnegative integer",
+    ):
+        sdpa.prefill_workspace_bytes()
 
 
 @pytest.mark.parametrize(

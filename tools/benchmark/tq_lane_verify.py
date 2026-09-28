@@ -14,7 +14,6 @@ against the compressed native attention path on the same quantized cache.
 
 import argparse
 import gc
-import importlib.metadata
 import json
 import os
 import statistics
@@ -25,6 +24,7 @@ from unittest.mock import patch
 import mlx.core as mx
 import numpy as np
 
+from tools.attention_bench_utils import package_versions
 from tools.benchmark.tq_prefill_case import build_case
 from vllm_metal.attention.impls import sdpa
 from vllm_metal.metal import get_ops
@@ -185,9 +185,7 @@ def main():
                 "device": mx.device_info()["device_name"],
                 "nax_ready": ops.nax_ready(),
                 "workspace_limit_bytes": sdpa.prefill_workspace_bytes(),
-                "versions": {
-                    n: importlib.metadata.version(n) for n in ["vllm", "mlx", "mlx-lm"]
-                },
+                "versions": package_versions("vllm", "mlx", "mlx-lm"),
             }
         ),
         flush=True,

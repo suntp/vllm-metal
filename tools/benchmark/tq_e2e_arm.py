@@ -14,7 +14,6 @@ benchmark, excluding tokenization, HTTP and concurrent serving queues.
 
 import argparse
 import hashlib
-import importlib.metadata
 import json
 import math
 import os
@@ -77,6 +76,7 @@ def main():
     import numpy as np
     from vllm import LLM, SamplingParams
 
+    from tools.attention_bench_utils import package_versions
     from vllm_metal.attention.caches.turboquant import prefill_workspace_bytes
     from vllm_metal.attention.impls import sdpa
     from vllm_metal.metal import get_ops
@@ -164,10 +164,9 @@ def main():
         "device": mx.device_info()["device_name"],
         "nax_ready": get_ops().nax_ready(),
         "workspace_limit_bytes": prefill_workspace_bytes(),
-        "versions": {
-            n: importlib.metadata.version(n)
-            for n in ("vllm", "mlx", "mlx-lm", "mlx-vlm", "torch", "numpy")
-        },
+        "versions": package_versions(
+            "vllm", "mlx", "mlx-lm", "mlx-vlm", "torch", "numpy"
+        ),
         "mlx_enable_tf32": os.getenv("MLX_ENABLE_TF32"),
         "prefix_caching": args.prefix_probe,
         "arguments": vars(args),

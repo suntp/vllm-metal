@@ -212,9 +212,9 @@ class _TurboQuantPrefillPlan:
     workspace_bytes: int
 
 
-@dataclass(frozen=True, eq=False)
+@dataclass(eq=False)
 class _KernelMetadata:
-    """Kernel-format copies of the per-forward paged metadata.
+    """Kernel-format copies and mutable routing memo for one forward/group.
 
     ``eq=False``: the generated ``__eq__`` would compare mx arrays, which
     raises on ``bool()``; identity comparison is the only meaningful one.
@@ -309,7 +309,8 @@ def _turboquant_prefill_plan(
     )
     if key in meta.tq_prefill_plans:
         return meta.tq_prefill_plans[key]
-    assert ctx.cu_seqlens is not None
+    if ctx.cu_seqlens is None:
+        raise ValueError("TurboQuant prefill requires cumulative query lengths")
     cu_seqlens = ctx.cu_seqlens
     lengths = [b - a for a, b in zip(cu_seqlens[:-1], cu_seqlens[1:], strict=True)]
     candidates = [i for i, length in enumerate(lengths) if length >= min_tokens]
@@ -1079,7 +1080,7 @@ def sdpa_forward(
         plan = None
         if (
             q_3d.shape[0] > len(ctx.context_lens)
-            and (ctx.verify_window_q or 1) <= 1
+            and ctx.verify_window_q == 1
             and sinks is None
             and not mm_kwargs
             and not recompute_after_kernel
@@ -1148,6 +1149,7 @@ def sdpa_forward(
                 batch.max_seq_len,
                 layer_sliding_window,
                 out,
+                window_seqlen_q=ctx.verify_window_q,
             )
             if plan.fallback is not None:
                 fallback = plan.fallback

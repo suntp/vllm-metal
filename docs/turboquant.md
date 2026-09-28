@@ -203,6 +203,31 @@ TQ lane fails explicitly. This offline tool excludes HTTP and concurrent serving
 queues. `--prefix-probe --prompt-tokens 8192` instead seeds and reuses real cached
 prefixes with short/long suffixes, recording cache hits and dispatch.
 
+For HTTP latency and throughput, start the same model with prefix caching off:
+
+```bash
+MLX_ENABLE_TF32=0 VLLM_METAL_TQ_PREFILL=1 vllm serve /path/to/model \
+  --host 127.0.0.1 --served-model-name tq-prefill --dtype bfloat16 \
+  --max-model-len 9216 --max-num-batched-tokens 2048 --max-num-seqs 4 \
+  --gpu-memory-utilization 0.7 --no-enable-prefix-caching --generation-config vllm \
+  --additional-config '{"turboquant": true, "k_quant": "q8_0", "v_quant": "q3_0"}'
+```
+
+Run the upstream serving benchmark against that endpoint, then repeat with
+`VLLM_METAL_TQ_PREFILL=0` for the compressed reference. Set `--max-concurrency 4`
+to include concurrent requests; compare both arms at the same concurrency.
+
+```bash
+vllm bench serve --model /path/to/model --served-model-name tq-prefill \
+  --backend openai --endpoint /v1/completions --dataset-name random \
+  --random-input-len 8192 --random-output-len 32 --random-range-ratio 0 \
+  --num-prompts 8 --num-warmups 1 --max-concurrency 1 \
+  --ignore-eos --temperature 0 --seed 853 --save-result --save-detailed
+```
+
+The client reports median TTFT and throughput over the full HTTP workload,
+including server queueing. These differ from the in-process TTFT probe above.
+
 For teacher-forced perplexity, use a fixed corpus and score the same windows in
 both paths. This isolates the prefill implementation:
 
