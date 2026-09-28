@@ -109,7 +109,7 @@ retrieval, reasoning or code-generation accuracy.
 
 ### Normal Compression
 
-For production use with minimal quality impact:
+Using the default bit widths, after validating quality on the target workload:
 
 ```bash
 vllm serve meta-llama/Llama-3.2-1B-Instruct \
