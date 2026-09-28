@@ -217,6 +217,8 @@ class TestPrepare:
         assert ctx.cu_seqlens == [0, 3]
         assert ctx.verify_window_q == 3
         assert ctx.num_decode_requests == 1
+        assert ctx.num_decode_tokens == 3
+        assert ctx.max_decode_context_len == 10
 
     def test_prepare_unified_defaults_to_expanded_layout(self):
         # Window mode is opt-in runtime policy: a caller that does not pass
@@ -229,6 +231,8 @@ class TestPrepare:
         assert ctx.cu_seqlens == [0, 1, 2, 3]
         assert ctx.context_lens == [8, 9, 10]
         assert ctx.verify_window_q == 1
+        assert ctx.num_decode_tokens == 3
+        assert ctx.max_decode_context_len == 10
 
     def test_prepare_unified_expands_window_when_merge_disabled(self):
         # merge_verify_windows=False restores the expanded per-token layout
@@ -249,6 +253,8 @@ class TestPrepare:
         assert ctx.cu_seqlens == [0, 1, 2, 3]
         assert ctx.verify_window_q == 1
         assert ctx.num_decode_requests == 1
+        assert ctx.num_decode_tokens == 3
+        assert ctx.max_decode_context_len == 10
 
     def test_prepare_unified_mixed_window_and_prefill_stays_off_window_mode(self):
         # A verify window sharing the batch with a prefill chunk keeps its
@@ -271,6 +277,8 @@ class TestPrepare:
         assert ctx.offsets == [7, 0]
         assert ctx.verify_window_q == 1
         assert ctx.num_decode_requests == 1
+        assert ctx.num_decode_tokens == 3
+        assert ctx.max_decode_context_len == 10
 
     def test_prepare_unified_mixed(self):
         # 1 decode + 1 prefill
@@ -288,6 +296,9 @@ class TestPrepare:
         assert ctx.offsets == [7, 0]
         assert ctx.context_lens == [8, 5]
         assert ctx.block_tables == [[5, 6], [10, 11]]
+        assert ctx.num_decode_requests == 1
+        assert ctx.num_decode_tokens == 1
+        assert ctx.max_decode_context_len == 8
 
 
 class TestPrepareGrouped:

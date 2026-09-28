@@ -33,13 +33,11 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from functools import cached_property
-from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
 from vllm.logger import init_logger
 
-import vllm_metal.envs as envs
 from vllm_metal.attention.attention_contracts import (
     DEFAULT_ATTENTION_CONTRACT,
     AttentionContract,
@@ -57,7 +55,7 @@ from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.bidi_prefill import apply_bidirectional_segments
 from vllm_metal.attention.impls.mm_prefix import (
     build_mm_prefix_rows,
-    resolve_mm_prefix_path,
+    mm_prefix_path,
 )
 from vllm_metal.attention.impls.varlen_rope_compat import (
     apply_attention_rope,
@@ -435,18 +433,6 @@ def _turboquant_prefill_plan(
     )
     meta.tq_prefill_plans[key] = plan
     return plan
-
-
-def _mm_prefix_path(ops: Any) -> str:
-    """The configured image-block attention path for this forward.
-
-    The native ops always advertise ``supports_mm_prefix``, so the probe only
-    fails for a build that predates it (or a test fake).  Such ops serve image
-    blocks through the recompute: ``mm_prefix_ranges=`` is passed only on the
-    kernel path, and ``resolve_mm_prefix_path`` warns once about the fallback.
-    """
-    supported = bool(getattr(ops, "supports_mm_prefix", lambda: False)())
-    return resolve_mm_prefix_path(envs.VLLM_METAL_MM_PREFIX_PATH, supported)
 
 
 def _mm_prefix_rows(ctx: PagedAttentionContext) -> mx.array | None:
@@ -1023,7 +1009,7 @@ def sdpa_forward(
             # The tiled kernel has no float32 instantiation, so float32
             # caches keep the recompute instead of reaching the
             # primitive's eager ValueError mid-request.
-            if _mm_prefix_path(ops) == "kernel" and kernel_k_cache.dtype != mx.float32:
+            if mm_prefix_path(ops) == "kernel" and kernel_k_cache.dtype != mx.float32:
                 mm_prefix_ranges = _mm_prefix_rows(ctx)
                 if mm_prefix_ranges is not None and not ctx.bidi_logged:
                     ctx.bidi_logged = True
@@ -1179,6 +1165,15 @@ def sdpa_forward(
             # allocates its K/V pair against the same workspace reservation.
             mx.synchronize()
     else:
+        # Whole-batch decode routing belongs to the ordinary cache path. TQ
+        # uses its own sub-batch metadata and stays outside native decode split.
+        paged_kwargs: dict[str, int | mx.array] = dict(mm_kwargs)
+        if bool(getattr(ops, "supports_decode_routing_metadata", lambda: False)()):
+            paged_kwargs.update(
+                num_decode_requests=ctx.num_decode_requests,
+                num_decode_tokens=ctx.num_decode_tokens,
+                max_decode_context_len=ctx.max_decode_context_len,
+            )
         ops.paged_attention_primitive(
             q_3d,
             kernel_k_cache,
@@ -1195,7 +1190,7 @@ def sdpa_forward(
             out,
             window_seqlen_q=ctx.verify_window_q,
             sinks=sinks,
-            **mm_kwargs,
+            **paged_kwargs,
         )
 
     if recompute_after_kernel:

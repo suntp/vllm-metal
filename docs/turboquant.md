@@ -143,6 +143,10 @@ per layer **per scheduler step**; each prefill chunk re-materializes its
 referenced history. Scheduler-owned storage, block tables and their lifetime
 remain authoritative.
 
+Workspace resolution and routing plans are cached in the existing per-forward,
+per-KV-group metadata. A fully selected batch reuses the original sequence
+metadata without constructing query-reordering indices.
+
 `VLLM_METAL_TQ_PREFILL_MAX_MIB=auto` reserves 2% of the device's recommended
 working set, rounded up to 64 MiB, with a 256 MiB floor and 2 GiB ceiling. A
 number overrides the allowance in MiB; `0` disables materialization. Set these

@@ -132,6 +132,10 @@ def test_mixed_batch_routes_and_restores_rows(recorded_ops, prefill_backend):
         shared_prefix=True,
         softcap=2.0,
     )
+    # Whole-batch decode routing must not leak into the compacted TQ prefill.
+    case.ctx.num_decode_requests = 1
+    case.ctx.num_decode_tokens = 1
+    case.ctx.max_decode_context_len = 4097
     assert_parity(case)
     assert len(recorded_ops) == 2
     prefill, fallback = recorded_ops

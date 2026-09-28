@@ -39,6 +39,10 @@ void register_mlx_patch(nb::module_& m);
 
 static std::string v2_paged_attention_source_;
 constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
+// Split only after eight KV partitions amortize the extra dispatch.
+constexpr int kMixedDecodeMinPartitions = 8;
+constexpr int kMixedDecodeMinContext =
+    kMixedDecodeMinPartitions * kPartitionSize;
 
 // Window mode for spec-decode verification (per-token kernel): query rows
 // per threadgroup (2 = the measured register/occupancy sweet spot on Apple
@@ -385,7 +389,7 @@ static void dispatch_paged_attention_tiled(
     int num_kv_heads, float scale, float softcap,
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
-    int block_size, int max_seq_len, int sliding_window,
+    int block_size, int max_seq_len, int sliding_window, int q_block_offset,
     TileConfig cfg, Stream s, const array* sinks,
     const array* mm_prefix_ranges) {
   auto& d = metal::device(s.device);
@@ -395,6 +399,12 @@ static void dispatch_paged_attention_tiled(
   int num_seqs   = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
 
   int total_q_blocks = total_q_tokens / cfg.BQ + num_seqs;
+  if (q_block_offset < 0 || q_block_offset > total_q_blocks) {
+    throw std::invalid_argument(
+        "dispatch_paged_attention_tiled: q_block_offset (" +
+        std::to_string(q_block_offset) + ") out of range for total_q_blocks "
+        "(" + std::to_string(total_q_blocks) + ")");
+  }
   bool use_sinks = sinks != nullptr;
   bool use_mm_prefix = mm_prefix_ranges != nullptr;
 
@@ -438,6 +448,7 @@ static void dispatch_paged_attention_tiled(
                           num_kv_heads, softcap, block_tables, seq_lens,
                           cu_seqlens_q, block_size, sliding_window);
   enc.set_bytes(scale, 9);
+  enc.set_bytes(q_block_offset, 30);
   if (use_sinks) {
     enc.set_input_array(*sinks, 18);
   }
@@ -448,7 +459,7 @@ static void dispatch_paged_attention_tiled(
   }
 
   enc.dispatch_threadgroups(
-      MTL::Size::Make(num_heads, total_q_blocks, 1),
+      MTL::Size::Make(num_heads, total_q_blocks - q_block_offset, 1),
       MTL::Size::Make(cfg.NUM_THREADS, 1, 1));
 }
 
@@ -474,15 +485,20 @@ static void dispatch_paged_attention_v2_online(
     const array* sinks = nullptr,
     // Gemma 4 vision image-block ranges (optional): one inclusive absolute
     // [start, end] key range per query row, implemented in the tiled kernel.
-    const array* mm_prefix_ranges = nullptr) {
+    const array* mm_prefix_ranges = nullptr,
+    int num_decode_requests = 0,
+    int num_decode_tokens = 0,
+    int max_decode_context_len = 0,
+    int decode_only_rows = 0) {
   int head_size = static_cast<int>(query.shape(2));
 
   // Tiled kernel for prefill batches, matching vLLM Triton's 2D/3D dispatch
   // split.  Pure-decode batches (every sequence has exactly 1 query token)
   // use the original per-token kernel.
-  int total_q_tokens = static_cast<int>(query.shape(0));
+  int total_q_tokens = decode_only_rows > 0
+      ? decode_only_rows : static_cast<int>(query.shape(0));
   int num_seqs = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
-  bool has_prefill = total_q_tokens > num_seqs;
+  bool has_prefill = decode_only_rows == 0 && total_q_tokens > num_seqs;
   bool dtype_ok = query.dtype() != float32
                && query.dtype() == key_cache.dtype();
 
@@ -497,30 +513,59 @@ static void dispatch_paged_attention_v2_online(
   const bool window_batch =
       has_prefill && window_seqlen_q > 1 && head_size <= kWindowMaxHeadSize;
 
-  // TurboQuant stays excluded from the tiled kernel.  Sink prefill can use it:
+  const bool use_nax = has_prefill && !window_batch && !use_turboquant
+      && dtype_ok && mm_prefix_ranges == nullptr
+      && nax_eligible(query.dtype(), head_size, block_size);
+  const auto tile_config = has_prefill && !window_batch && !use_turboquant
+      && dtype_ok ? select_tile_config(head_size) : std::nullopt;
+
+  // Split long ordinary decode rows from tiled prefill. Keep spec and NAX on
+  // their established whole-batch routes.
+  const bool split_mixed_batch = num_decode_requests > 0
+      && num_decode_requests < num_seqs
+      && num_decode_tokens == num_decode_requests
+      && max_decode_context_len >= kMixedDecodeMinContext
+      && !use_nax && tile_config.has_value();
+  if (split_mixed_batch) {
+    dispatch_paged_attention_v2_online(
+        out, query, key_cache, value_cache,
+        num_kv_heads, scale, softcap,
+        block_tables, seq_lens, cu_seqlens_q,
+        block_size, max_seq_len, sliding_window, window_seqlen_q, s,
+        key_scale_cache, value_scale_cache, key_zero_cache, v_centroids,
+        use_turboquant, k_bits, v_bits, sinks, nullptr,
+        num_decode_requests, num_decode_tokens, max_decode_context_len,
+        num_decode_tokens);
+    const int q_block_offset =
+        num_decode_tokens / tile_config->BQ + num_decode_requests;
+    dispatch_paged_attention_tiled(
+        out, query, key_cache, value_cache,
+        num_kv_heads, scale, softcap,
+        block_tables, seq_lens, cu_seqlens_q,
+        block_size, max_seq_len, sliding_window, q_block_offset,
+        *tile_config, s, sinks, mm_prefix_ranges);
+    return;
+  }
+
+  // TurboQuant stays excluded from the tiled kernel. Sink prefill can use it:
   // pagedattention_tiled.metal folds the sink into each row's denominator-only
   // softmax state before final normalization.
-  if (has_prefill && !window_batch && !use_turboquant && dtype_ok) {
-    // Image-block ranges are implemented in the tiled kernel only; NAX keeps
-    // its causal/window mask, so a batch with ranges bypasses it.
-    if (mm_prefix_ranges == nullptr
-        && nax_eligible(query.dtype(), head_size, block_size)) {
-      dispatch_paged_attention_nax(
-          out, query, key_cache, value_cache,
-          num_kv_heads, scale, softcap,
-          block_tables, seq_lens, cu_seqlens_q,
-          block_size, sliding_window, s, sinks);
-      return;
-    }
-    if (auto cfg = select_tile_config(head_size)) {
-      dispatch_paged_attention_tiled(
-          out, query, key_cache, value_cache,
-          num_kv_heads, scale, softcap,
-          block_tables, seq_lens, cu_seqlens_q,
-          block_size, max_seq_len, sliding_window, *cfg, s, sinks,
-          mm_prefix_ranges);
-      return;
-    }
+  if (use_nax) {
+    dispatch_paged_attention_nax(
+        out, query, key_cache, value_cache,
+        num_kv_heads, scale, softcap,
+        block_tables, seq_lens, cu_seqlens_q,
+        block_size, sliding_window, s, sinks);
+    return;
+  }
+  if (tile_config) {
+    dispatch_paged_attention_tiled(
+        out, query, key_cache, value_cache,
+        num_kv_heads, scale, softcap,
+        block_tables, seq_lens, cu_seqlens_q,
+        block_size, max_seq_len, sliding_window, 0,
+        *tile_config, s, sinks, mm_prefix_ranges);
+    return;
   }
   if (mm_prefix_ranges != nullptr) {
     // paged_attention_primitive_fn already rejects every such batch eagerly;
@@ -768,14 +813,18 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
       int block_size, int max_seq_len, int sliding_window,
       bool use_turboquant = false, int k_bits = 8, int v_bits = 3,
       int window_seqlen_q = 1, bool use_sinks = false,
-      bool use_mm_prefix = false)
+      bool use_mm_prefix = false, int num_decode_requests = 0,
+      int num_decode_tokens = 0, int max_decode_context_len = 0)
       : UnaryPrimitive(stream),
         num_kv_heads_(num_kv_heads), scale_(scale), softcap_(softcap),
         block_size_(block_size), max_seq_len_(max_seq_len),
         sliding_window_(sliding_window),
         use_turboquant_(use_turboquant), k_bits_(k_bits), v_bits_(v_bits),
         window_seqlen_q_(window_seqlen_q), use_sinks_(use_sinks),
-        use_mm_prefix_(use_mm_prefix) {}
+        use_mm_prefix_(use_mm_prefix),
+        num_decode_requests_(num_decode_requests),
+        num_decode_tokens_(num_decode_tokens),
+        max_decode_context_len_(max_decode_context_len) {}
 
   void eval_cpu(const std::vector<array>&, array&) override {
     throw std::runtime_error(
@@ -806,7 +855,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         inputs[3], inputs[4], inputs[5],  // block_tables, seq_lens, cu_seqlens_q
         block_size_, max_seq_len_, sliding_window_, window_seqlen_q_,
         stream(),
-        ks, vs, kz, vc, use_turboquant_, k_bits_, v_bits_, sk, mp);
+        ks, vs, kz, vc, use_turboquant_, k_bits_, v_bits_, sk, mp,
+        num_decode_requests_, num_decode_tokens_, max_decode_context_len_);
   }
 
   const char* name() const override { return "PagedAttention"; }
@@ -823,7 +873,10 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         && rhs->v_bits_ == v_bits_
         && rhs->window_seqlen_q_ == window_seqlen_q_
         && rhs->use_sinks_ == use_sinks_
-        && rhs->use_mm_prefix_ == use_mm_prefix_;
+        && rhs->use_mm_prefix_ == use_mm_prefix_
+        && rhs->num_decode_requests_ == num_decode_requests_
+        && rhs->num_decode_tokens_ == num_decode_tokens_
+        && rhs->max_decode_context_len_ == max_decode_context_len_;
   }
 
  private:
@@ -839,6 +892,9 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
   int window_seqlen_q_;
   bool use_sinks_;
   bool use_mm_prefix_;
+  int num_decode_requests_;
+  int num_decode_tokens_;
+  int max_decode_context_len_;
 };
 
 static array paged_attention_primitive_fn(
@@ -855,7 +911,10 @@ static array paged_attention_primitive_fn(
     const array* v_centroids = nullptr,
     int v_bits = 3, int window_seqlen_q = 1,
     const array* sinks = nullptr,
-    const array* mm_prefix_ranges = nullptr) {
+    const array* mm_prefix_ranges = nullptr,
+    int num_decode_requests = 0,
+    int num_decode_tokens = 0,
+    int max_decode_context_len = 0) {
   if (sinks != nullptr) {
     // Upstream MLX refuses the same combination
     // (mlx_lm/models/base.py: "Quantized SDPA does not support attention
@@ -982,7 +1041,8 @@ static array paged_attention_primitive_fn(
       num_kv_heads, scale, softcap,
       block_size, max_seq_len, sliding_window,
       use_turboquant, k_bits, v_bits, window_seqlen_q, sinks != nullptr,
-      mm_prefix_ranges != nullptr);
+      mm_prefix_ranges != nullptr, num_decode_requests, num_decode_tokens,
+      max_decode_context_len);
   std::vector<array> inputs = {query, key_cache, value_cache,
                                block_tables, seq_lens, cu_seqlens_q};
   if (use_turboquant) {
@@ -1798,6 +1858,10 @@ NB_MODULE(_paged_ops, m) {
         "True when paged_attention_primitive accepts mm_prefix_ranges "
         "(Gemma 4 vision image-block attention in the tiled prefill kernel).");
 
+  m.def("supports_decode_routing_metadata", []() { return true; },
+        "True when paged_attention_primitive accepts mixed-batch decode "
+        "routing metadata.");
+
   m.def("tq_encode",
         [](nb::handle key_h, nb::handle value_h,
            nb::handle key_cache_h, nb::handle value_cache_h,
@@ -1951,7 +2015,10 @@ NB_MODULE(_paged_ops, m) {
            int v_bits,
            int window_seqlen_q,
            nb::object sinks_h,
-           nb::object mm_prefix_ranges_h) {
+           nb::object mm_prefix_ranges_h,
+           int num_decode_requests,
+           int num_decode_tokens,
+           int max_decode_context_len) {
           const array* sk = sinks_h.is_none()
               ? nullptr : nb::inst_ptr<array>(sinks_h);
           const array* mp = mm_prefix_ranges_h.is_none()
@@ -1974,7 +2041,8 @@ NB_MODULE(_paged_ops, m) {
               *nb::inst_ptr<array>(cu_seqlens_q_h),
               block_size, max_seq_len, sliding_window,
               use_turboquant, quant_type, ks, vs, kz, vc, v_bits,
-              window_seqlen_q, sk, mp);
+              window_seqlen_q, sk, mp, num_decode_requests,
+              num_decode_tokens, max_decode_context_len);
           nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
         },
         nb::arg("query"),
@@ -1995,6 +2063,9 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("window_seqlen_q") = 1,
         nb::arg("sinks") = nb::none(),
         nb::arg("mm_prefix_ranges") = nb::none(),
+        nb::arg("num_decode_requests") = 0,
+        nb::arg("num_decode_tokens") = 0,
+        nb::arg("max_decode_context_len") = 0,
         "Paged attention primitive (read-only). Cache writes are handled "
         "by MLX-native scatter upstream.  window_seqlen_q must equal the "
         "longest cu_seqlens_q segment (validated when > 1); small "
