@@ -68,63 +68,115 @@ At `max_model_len=32768` on Llama-3.2-1B, the default `q8_0/q3_0` configuration 
 - **Head dim must be 64, 128, 256, or 512** — sizes supported by the FWHT Metal kernel. Models outside this set are not supported yet.
 - Quality is model-dependent. For production use, spot-check perplexity with your target config before rolling out aggressive settings (`int2`, `q2_0`).
 
-## Known Quality Floors
+Three-bit V selects among eight non-uniform centroids for each rotated
+coordinate, with per-block scales. Rotation and Lloyd-Max centroids reduce
+distortion; they do not make compression lossless. K errors affect attention
+weights, while V errors affect their weighted sum. Validate both bit widths
+against a BF16-cache baseline with the same model weights and workload.
 
-Not every supported `(k_quant, v_quant)` combination is suitable for a given
-workload. K errors change the attention weights produced by softmax; V errors
-enter the weighted sum. V can therefore tolerate lower precision in some
-workloads, but its errors need not cancel, and later layers can change their
-effect on the answer. Keeping scale and inverse-transform arithmetic in FP32
-reduces additional rounding; it cannot recover information discarded by
-quantization.
+## Prefill Acceleration
 
-Three-bit V stores one of eight non-uniform centroids for each rotated
-coordinate, together with per-block scales. It does not round each original
-value to one of eight globally fixed numbers. Rotation distributes concentrated
-features across coordinates, and the centroids minimize distortion for the
-assumed distribution. These mechanisms reduce error; they do not imply
-lossless storage or universal task-quality equivalence.
+Eligible TurboQuant prefills materialize the referenced KV pages and use the
+existing NAX or tiled attention kernel. `VLLM_METAL_TQ_PREFILL=auto` enables this
+when NAX is available (M5); `1` opts into tiled prefill on other GPUs, and `0`
+disables it. The crossover was measured on M5 Pro; M1–M4 performance is unverified.
 
-Historical qualitative observations below are workload-specific, not a
-substitute for a BF16-cache comparison on the target model. Compression ratios
-use the same geometry as the table above and include scales; padding and hybrid
-cache groups can change the resulting scheduler capacity:
+Eligibility uses the **new query tokens in the current scheduler chunk**:
+`max(128, head_dim / 2, ceil(256 * num_kv_heads / num_query_heads))` or more.
+The lane supports single/multiple requests, mixed prefill/decode batches, and
+prefix caching on or off. After a prefix hit, only the uncached suffix contributes
+query tokens; the attention still reads the relevant cached history. Decode,
+short suffixes, speculative verification, FP32, sliding-window and image-block
+attention keep their existing paths. Only full-attention SDPA layers are
+accelerated; GDN/linear layers are unchanged. Attention sinks remain unsupported
+with TurboQuant.
 
-| Config | Compression | Qualitative quality | Recommended use |
-|--------|-------------|---------------------|-----------------|
-| `q8_0` / `q3_0` | 2.56x | Requires target-workload validation | **Default bit widths**, configurable |
-| `q8_0` / `q2_0` | 2.78x | Usable; minor fluency dip | Tight-memory serving |
-| `q4_0` / `q3_0` | 3.76x | Quality impact depends on the model | Memory-bound workloads |
-| `int2` / `q3_0` | 4.92x | **Degraded**: semi-coherent, topic-drift, numeric artefacts ("2018 2018") | Capacity benchmarks only |
-| `int2` / `q2_0` | 5.82x | **Broken**: degenerate repetition loops ("concept concept concept…") | Not for serving |
+The fused materializer reads the original strided packed cache and writes K/V
+directly in FP16/BF16. Unpacking, scale math and inverse FWHT stay in registers,
+with FP32 arithmetic; there are no context-sized packed gathers or FP32 arrays.
+Dequantized pages are temporary, and shared physical prefixes are decoded once
+per layer. Scheduler-owned storage, block tables and their lifetime remain
+authoritative.
 
-For a reproducible small quality probe, see the
-[BF16/TQ cache comparison](turboquant-prefill.md#validation-and-reproduction).
-Keep model weights fixed when changing cache precision. Comparing two attention
-paths that both use K8/V3 only measures the path change, not the loss from K8/V3
-relative to BF16. Perplexity on short windows also does not establish long-context
-retrieval, reasoning or code-generation accuracy.
+`VLLM_METAL_TQ_PREFILL_MAX_MIB=auto` reserves 2% of the device's recommended
+working set, rounded up to 64 MiB, with a 256 MiB floor and 2 GiB ceiling. A
+number overrides the allowance in MiB; `0` disables materialization. Set these
+variables before worker startup. The existing cache planner subtracts the
+allowance **once, inside `gpu_memory_utilization`**, before allocating KV blocks.
+This is a fixed allowance, not permission to borrow currently free memory.
 
-## Examples
+Admission counts final K/V, page indices, block tables and any mixed-batch
+query/output copies. Independent histories add their sizes; shared physical
+pages count once. An entire batch that fits avoids the split-copy charge.
+Oversized histories fall back before materialization, while smaller requests
+can still qualify. Attention output is evaluated before returning to the model
+so temporary K/V from successive layers cannot accumulate. Normal model buffers
+remain in the existing profiled execution budget.
 
-### Normal Compression
+The worker logs the reserved allowance, first lane activation and first budget
+fallback. Debug logs include selected/fallback request counts, gathered tokens
+and estimated bytes. Larger histories still need more scratch space: this is
+bounded materialization, not constant-memory streaming attention.
 
-Using the default bit widths, after validating quality on the target workload:
+## Validation and Reproduction
+
+`tests/attention/test_turboquant_prefill.py` checks the production wrapper using
+upstream-allocated storage, real cache writes and native attention. Coverage
+includes formats/dtypes, padded and translated pages, shared/independent
+histories, mixed-output ordering, fallbacks, admission and cross-layer memory
+bounds. Fused dequantization is compared with the independent Python decoder.
+
+The attention microbenchmark uses the same fixture, with interleaved timings,
+numerical error, actual dispatch and peak additional MLX memory. Suites are
+`crossover`, `geometry` and `long`; add `--tiled` to test the tiled backend:
 
 ```bash
-vllm serve meta-llama/Llama-3.2-1B-Instruct \
-  --dtype bfloat16 \
-  --max-model-len 65536 \
-  --additional-config '{"turboquant": true, "k_quant": "q8_0", "v_quant": "q3_0"}'
+PYTHONPATH=. VLLM_METAL_BUILD_FROM_SOURCE=1 MLX_ENABLE_TF32=0 \
+  python tools/benchmark/tq_lane_verify.py --suite crossover
 ```
 
-### Aggressive Compression
-
-For memory-bound workloads where some quality loss is acceptable:
+For whole-model TTFT, run both TQ paths in one warmed model with identical
+quantization. The reference disables only the prefill planner. Prefix caching
+is off so repeated prompts execute prefill:
 
 ```bash
-vllm serve meta-llama/Llama-3.2-1B-Instruct \
-  --dtype bfloat16 \
-  --max-model-len 65536 \
-  --additional-config '{"turboquant": true, "k_quant": "q4_0", "v_quant": "q3_0"}'
+PYTHONPATH=. MLX_ENABLE_TF32=0 python tools/benchmark/tq_e2e_arm.py \
+  --model /path/to/model --arm paired --prompt-tokens 8192 16384 \
+  --max-tokens 1 --reps 3 --warmup 1 --output latency.json
 ```
+
+JSON records vLLM's `first_token_latency`, wall time, actual layer dispatch,
+workspace, MLX memory and runtime versions. Missing TTFT or an inactive requested
+TQ lane fails explicitly. This offline tool excludes HTTP and concurrent serving
+queues. `--prefix-probe --prompt-tokens 8192` instead seeds and reuses real cached
+prefixes with short/long suffixes, recording cache hits and dispatch.
+
+For teacher-forced perplexity, use a fixed corpus and score the same windows in
+both paths. This isolates the prefill implementation:
+
+```bash
+PYTHONPATH=. MLX_ENABLE_TF32=0 python tools/benchmark/tq_e2e_arm.py \
+  --model /path/to/model --quality-text /path/to/wikitext-test.txt \
+  --quality-window 1024 --quality-windows 16 --output quality.json
+```
+
+Repeat with `--arm bf16` for an uncompressed cache, or `--arm tq --v-quant q4_0`
+for another TQ format, writing separate output files. Keep weights, tokenization
+and windows fixed; verify corpus/token-ID hashes match. Defaults score 16,368
+tokens from the first 16 × 1,024-token windows without extra special tokens.
+Paired runs report a window-bootstrap NLL interval. Record corpus source, split
+and revision with results. TQ-vs-TQ parity does not measure quantization loss
+relative to BF16; short-window perplexity does not establish long-context task
+accuracy. Different attention arithmetic also means greedy outputs can differ.
+
+For a whole-model long-context execution and memory check:
+
+```bash
+PYTHONPATH=. MLX_ENABLE_TF32=0 python tools/benchmark/tq_e2e_arm.py \
+  --model /path/to/model --arm tq --prompt-tokens 131072 --max-tokens 32 \
+  --reps 1 --warmup 0 --progress-interval 30 --output long-context.json
+```
+
+This reports progress, actual dispatch, peak active MLX allocation and peak above
+the pre-request allocation. A single run establishes neither paired speedup nor
+long-context retrieval quality.

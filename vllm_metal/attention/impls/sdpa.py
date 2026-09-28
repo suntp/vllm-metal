@@ -315,42 +315,55 @@ def _turboquant_prefill_plan(
     kernel_bs = meta.block_size
     ratio = cache_block_size // kernel_bs
     bytes_per_block = kernel_bs * prefill_bytes_per_token(num_kv_heads, head_dim)
-    block_limit = workspace_limit // bytes_per_block
     # Splitting also gathers Q and concatenates/restores the outputs. Charge
     # those three FP16/BF16 copies and both index arrays when any row falls back.
     routing_bytes = cu_seqlens[-1] * (6 * num_query_heads * head_dim + 8)
-    source_blocks: dict[int, int] = {}
-    prefill_ids: list[int] = []
-    rows: list[list[int]] = []
-    table_width = 0
-    for i in candidates:
-        num_blocks = (ctx.context_lens[i] + kernel_bs - 1) // kernel_bs
-        if num_blocks > block_limit:
-            continue
-        sources = [
-            raw_block_tables[i][j // ratio] * ratio + j % ratio
-            for j in range(num_blocks)
-        ]
-        # Only inspect this candidate's new blocks; do not copy the union of
-        # every previously admitted history for every candidate.
-        additions = dict.fromkeys(
-            source for source in sources if source not in source_blocks
+
+    def select_rows(
+        limit: int,
+    ) -> tuple[dict[int, int], list[int], list[list[int]], int]:
+        block_limit = max(0, limit) // bytes_per_block
+        source_blocks: dict[int, int] = {}
+        prefill_ids: list[int] = []
+        rows: list[list[int]] = []
+        table_width = 0
+        for i in candidates:
+            num_blocks = (ctx.context_lens[i] + kernel_bs - 1) // kernel_bs
+            if num_blocks > block_limit:
+                continue
+            sources = [
+                raw_block_tables[i][j // ratio] * ratio + j % ratio
+                for j in range(num_blocks)
+            ]
+            # Inspect only new blocks, without copying all admitted histories.
+            additions = dict.fromkeys(
+                source for source in sources if source not in source_blocks
+            )
+            next_width = max(table_width, num_blocks)
+            next_bytes = (len(source_blocks) + len(additions)) * bytes_per_block
+            next_bytes += (len(rows) + 1) * next_width * 4
+            if next_bytes > limit:
+                continue
+            row = []
+            for source in sources:
+                if source not in source_blocks:
+                    source_blocks[source] = len(source_blocks)
+                row.append(source_blocks[source])
+            prefill_ids.append(i)
+            rows.append(row)
+            table_width = next_width
+        return source_blocks, prefill_ids, rows, table_width
+
+    # First allow the whole batch to fit without copies. If a split becomes
+    # necessary, repeat CPU-only admission with its routing cost reserved.
+    must_split = len(candidates) < len(lengths)
+    source_blocks, prefill_ids, rows, table_width = select_rows(
+        workspace_limit - (routing_bytes if must_split else 0)
+    )
+    if not must_split and 0 < len(prefill_ids) < len(lengths):
+        source_blocks, prefill_ids, rows, table_width = select_rows(
+            workspace_limit - routing_bytes
         )
-        next_width = max(table_width, num_blocks)
-        next_bytes = (len(source_blocks) + len(additions)) * bytes_per_block
-        next_bytes += (len(rows) + 1) * next_width * 4
-        if len(prefill_ids) + 1 < len(lengths):
-            next_bytes += routing_bytes
-        if next_bytes > workspace_limit:
-            continue
-        row = []
-        for source in sources:
-            if source not in source_blocks:
-                source_blocks[source] = len(source_blocks)
-            row.append(source_blocks[source])
-        prefill_ids.append(i)
-        rows.append(row)
-        table_width = next_width
     if len(prefill_ids) < len(candidates):
         logger.info_once(
             "Metal: TurboQuant prefill workspace limit reached; "

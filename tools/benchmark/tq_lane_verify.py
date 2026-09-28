@@ -8,7 +8,7 @@ padding, shared prefixes and extra unused pool capacity. Reported error is
 against the compressed native attention path on the same quantized cache.
 
     PYTHONPATH=. python tools/benchmark/tq_lane_verify.py --suite crossover
-    PYTHONPATH=. python tools/benchmark/tq_lane_verify.py --suite memory
+    PYTHONPATH=. python tools/benchmark/tq_lane_verify.py --suite long
     PYTHONPATH=. python tools/benchmark/tq_lane_verify.py --suite geometry --tiled
 """
 
@@ -144,31 +144,6 @@ def cases(suite):
                             "context_lens": (8192,),
                         },
                     )
-    elif suite == "limits":
-        # Run with MAX_MIB=256 for the fixed-budget boundary, or leave auto
-        # enabled to exercise admission under the device-specific allowance.
-        for context in [8192, 16384, 65264, 65280, 65536, 131072]:
-            yield (
-                f"cap-kv{context}",
-                dict(common, qlens=(128,), context_lens=(context,)),
-            )
-        for count in [2, 4]:
-            yield (
-                f"independent4k-{count}",
-                dict(common, qlens=(128,) * count, context_lens=(4096,) * count),
-            )
-        for kq, vq in [
-            ("q4_0", "q4_0"),
-            ("q5_0", "q5_0"),
-            ("int2", "q2_0"),
-            ("uint8", "q8_0"),
-        ]:
-            yield (
-                f"cap-formats-{kq}-{vq}",
-                dict(
-                    common, qlens=(128,), context_lens=(16384,), k_quant=kq, v_quant=vq
-                ),
-            )
     elif suite == "long":
         for context in [8192, 16384, 32768, 65536, 131072, 262144]:
             yield (
@@ -185,49 +160,13 @@ def cases(suite):
                 common, qlens=(128,) * 4, context_lens=(131072,) * 4, shared_prefix=True
             ),
         )
-    else:
-        for padding in [0, 512]:
-            for pool in [1024, 16384]:
-                yield (
-                    f"padding{padding}-pool{pool}",
-                    dict(
-                        common,
-                        page_padding=padding,
-                        pool_blocks=pool,
-                        qlens=(128,),
-                        context_lens=(513,),
-                    ),
-                )
-        for batch in [1, 4, 8]:
-            yield (
-                f"mixed{batch}",
-                dict(
-                    common,
-                    qlens=(128,) + (1,) * (batch - 1),
-                    context_lens=(8192,) + (16,) * (batch - 1),
-                ),
-            )
-        yield (
-            "shared-prefix",
-            dict(
-                common,
-                qlens=(128,) * 8,
-                context_lens=(8192,) * 8,
-                shared_prefix=True,
-            ),
-        )
-
-        yield (
-            "independent-histories",
-            dict(common, qlens=(128,) * 8, context_lens=(8192,) * 8),
-        )
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--suite",
-        choices=["crossover", "geometry", "memory", "limits", "long"],
+        choices=["crossover", "geometry", "long"],
         default="crossover",
     )
     ap.add_argument("--reps", type=int, default=7)

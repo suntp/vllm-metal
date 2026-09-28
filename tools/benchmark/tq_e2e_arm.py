@@ -30,16 +30,10 @@ PARA = (
     "by the tall windows, and the librarians moved quietly between the "
     "shelves, returning books to their places. "
 )
-PROMPT = (
-    "Below is a passage from a local newspaper. Read it carefully.\n\n"
-    + PARA * 18
-    + "\n\nBased on the passage above, describe in detail what a typical "
-    "morning at the library looks like. Your description:"
-)
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True)
     ap.add_argument(
         "--arm", choices=("paired", "bf16", "tq", "tq-reference"), default="paired"
@@ -231,23 +225,21 @@ def main():
                 ids
             ):
                 raise RuntimeError("Missing teacher-forced prompt logprobs")
-            logprobs, top1 = [], []
+            logprobs = []
             for target, probs in zip(ids[1:], result.prompt_logprobs[1:], strict=True):
                 if not probs or target not in probs:
                     raise RuntimeError("Missing ground-truth prompt token logprob")
                 logprobs.append(probs[target].logprob)
-                top1.append(min(probs, key=lambda token: probs[token].rank))
             if not all(math.isfinite(p) for p in logprobs):
                 raise RuntimeError("Nonfinite prompt logprobs")
             row.update(
                 scored_tokens=len(logprobs),
                 nll_sum=-sum(logprobs),
                 logprobs=logprobs,
-                top1=top1,
             )
         records.append(row)
         print(
-            json.dumps({k: v for k, v in row.items() if k not in ("logprobs", "top1")}),
+            json.dumps({k: v for k, v in row.items() if k != "logprobs"}),
             flush=True,
         )
         return row
@@ -312,22 +304,13 @@ def main():
                 json.dumps(token_ids[:needed]).encode()
             ).hexdigest()
             nll = {arm: [] for arm in arms}
-            agrees = 0
             for window in range(args.quality_windows):
                 ids = token_ids[
                     window * args.quality_window : (window + 1) * args.quality_window
                 ]
-                pair = {}
                 for arm in arms if window % 2 == 0 else arms[::-1]:
-                    pair[arm] = run(ids, arm, "quality", window, quality=True)
-                    nll[arm].append(pair[arm]["nll_sum"])
-                if len(arms) == 2:
-                    agrees += sum(
-                        a == b
-                        for a, b in zip(
-                            pair[arms[0]]["top1"], pair[arms[1]]["top1"], strict=True
-                        )
-                    )
+                    row = run(ids, arm, "quality", window, quality=True)
+                    nll[arm].append(row["nll_sum"])
             count = args.quality_windows * (args.quality_window - 1)
             ppl = {arm: math.exp(sum(values) / count) for arm, values in nll.items()}
             summary = {
@@ -352,7 +335,6 @@ def main():
                     delta_nll_bootstrap_95ci=np.quantile(
                         bootstrap, [0.025, 0.975]
                     ).tolist(),
-                    teacher_forced_top1_agreement=agrees / count,
                 )
             summaries.append(summary)
             print(json.dumps(summary), flush=True)

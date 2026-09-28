@@ -321,7 +321,15 @@ def _pack_3bit(vals: mx.array) -> mx.array:
 
 
 def _unpack_3bit(packed: mx.array, orig_dim: int) -> mx.array:
-    return _unpack_byte_pairs(packed, orig_dim, 3)
+    shape = packed.shape
+    g = packed.reshape(*shape[:-1], -1, 3).astype(mx.uint32)
+    b0, b1, b2 = g[..., 0], g[..., 1], g[..., 2]
+    combined = b0 | (b1 << 8) | (b2 << 16)
+    vals = []
+    for i in range(8):
+        vals.append((combined >> (i * 3)) & 0x7)
+    unpacked = mx.stack(vals, axis=-1).astype(mx.uint8)
+    return unpacked.reshape(*shape[:-1], orig_dim)
 
 
 def _pack_4bit(vals: mx.array) -> mx.array:
@@ -353,23 +361,19 @@ def _pack_5bit(vals: mx.array) -> mx.array:
 
 
 def _unpack_5bit(packed: mx.array, orig_dim: int) -> mx.array:
-    return _unpack_byte_pairs(packed, orig_dim, 5)
-
-
-def _unpack_byte_pairs(packed: mx.array, orig_dim: int, bits: int) -> mx.array:
-    """Extract eight sub-byte values without widening a full tensor to u32/u64."""
     shape = packed.shape
-    g = packed.reshape(*shape[:-1], -1, bits)
+    g = packed.reshape(*shape[:-1], -1, 5).astype(mx.uint64)
+    combined = (
+        g[..., 0]
+        | (g[..., 1] << 8)
+        | (g[..., 2] << 16)
+        | (g[..., 3] << 24)
+        | (g[..., 4] << 32)
+    )
     vals = []
     for i in range(8):
-        byte, shift = divmod(i * bits, 8)
-        value = g[..., byte] >> shift
-        if shift + bits > 8:
-            # Only the low `bits` bits survive; any uint8 overflow discards
-            # bits outside this value, never bits we need to reconstruct.
-            value = value | (g[..., byte + 1] << (8 - shift))
-        vals.append(value & ((1 << bits) - 1))
-    unpacked = mx.stack(vals, axis=-1)
+        vals.append((combined >> (i * 5)) & 0x1F)
+    unpacked = mx.stack(vals, axis=-1).astype(mx.uint8)
     return unpacked.reshape(*shape[:-1], orig_dim)
 
 

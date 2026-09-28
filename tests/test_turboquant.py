@@ -27,7 +27,6 @@ from vllm_metal.attention.caches.turboquant import (
     packed_dim,
     turbo_quant_decode,
     turbo_quant_encode,
-    unpack_bits,
 )
 from vllm_metal.config import get_config, reset_config
 from vllm_metal.metal import get_ops
@@ -36,29 +35,6 @@ from vllm_metal.v1.cache_policy import (
     _build_turboquant_attention_spec,
     turboquant_page_size_bytes,
 )
-
-
-@pytest.mark.parametrize("bits", [3, 5])
-def test_unpack_subbyte_preserves_cross_byte_values(bits):
-    # Independent integer reference includes all-zero/all-one groups and
-    # random byte patterns, rather than roundtripping the Python encoder.
-    packed = np.random.default_rng(37).integers(0, 256, (259, bits), dtype=np.uint8)
-    packed[0] = 0
-    packed[1] = 255
-    expected = np.array(
-        [
-            [
-                (int.from_bytes(row.tobytes(), "little") >> (i * bits))
-                & ((1 << bits) - 1)
-                for i in range(8)
-            ]
-            for row in packed
-        ],
-        dtype=np.uint8,
-    )
-    output = unpack_bits(mx.array(packed), bits, 8)
-    assert output.dtype == mx.uint8
-    np.testing.assert_array_equal(np.asarray(output), expected)
 
 
 def mean_cosine_similarity(a: mx.array, b: mx.array) -> float:

@@ -36,6 +36,21 @@ def recorded_ops(monkeypatch):
     return calls
 
 
+@pytest.fixture
+def materialized_lengths(monkeypatch):
+    original = sdpa.materialize_turboquant_pages
+    lengths = []
+
+    def record(*args, **kwargs):
+        result = original(*args, **kwargs)
+        # Record sizes without retaining tensors and extending their lifetime.
+        lengths.append(result[0].shape[0])
+        return result
+
+    monkeypatch.setattr(sdpa, "materialize_turboquant_pages", record)
+    return lengths
+
+
 @pytest.fixture(params=[False, True], ids=["native-default", "tiled"])
 def prefill_backend(request):
     ops = get_ops()
@@ -199,7 +214,9 @@ def test_prefill_scratch_does_not_scale_with_unrelated_histories(monkeypatch):
 
 
 @pytest.mark.parametrize("k_quant,v_quant", [("q8_0", "q3_0"), ("q5_0", "q5_0")])
-def test_peak_materialization_fits_reserved_allowance(monkeypatch, k_quant, v_quant):
+def test_peak_materialization_fits_reserved_allowance(
+    materialized_lengths, monkeypatch, k_quant, v_quant
+):
     import gc
 
     monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "64")
@@ -214,6 +231,7 @@ def test_peak_materialization_fits_reserved_allowance(monkeypatch, k_quant, v_qu
     )
     mx.eval(case.forward())
     mx.eval(case.reference())
+    materialized_lengths.clear()
     gc.collect()
     mx.synchronize()
     mx.clear_cache()
@@ -223,6 +241,7 @@ def test_peak_materialization_fits_reserved_allowance(monkeypatch, k_quant, v_qu
     mx.eval(result)
     mx.synchronize()
     extra = mx.get_peak_memory() - before
+    assert materialized_lengths == [14080]
     assert extra < sdpa.prefill_workspace_bytes(), extra
 
 
@@ -392,6 +411,27 @@ def test_split_budget_includes_query_and_output_copies(recorded_ops, monkeypatch
     assert mx.array_equal(output, reference).item()
 
 
+@pytest.mark.parametrize("shared_prefix", [False, True])
+def test_whole_batch_does_not_reserve_unused_split_copies(
+    recorded_ops, monkeypatch, shared_prefix
+):
+    monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "6")
+    # Both histories fit, whereas the unnecessary split-routing copies alone
+    # would exceed the allowance. The entire batch needs no query reordering.
+    case = build_case(
+        qlens=(128, 128),
+        context_lens=(257, 257),
+        n_heads=24,
+        n_kv_heads=4,
+        head_dim=256,
+        shared_prefix=shared_prefix,
+    )
+    assert_parity(case)
+    assert len(recorded_ops) == 1
+    assert not recorded_ops[0][1].get("use_turboquant", False)
+    assert recorded_ops[0][0][7].tolist() == [257, 257]
+
+
 def test_128k_history_does_not_block_smaller_candidate(recorded_ops):
     # Admission only: reject the large row without allocating its cache.
     case = build_case(qlens=(128, 128), context_lens=(257, 257))
@@ -483,7 +523,9 @@ def test_long_context_admission_with_fused_workspace(
         assert plan.workspace_bytes <= sdpa.prefill_workspace_bytes()
 
 
-def test_materialization_workspace_does_not_accumulate_across_layers(monkeypatch):
+def test_materialization_workspace_does_not_accumulate_across_layers(
+    materialized_lengths, monkeypatch
+):
     monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "64")
     case = build_case(
         qlens=(128,), context_lens=(8192,), head_dim=256, n_heads=24, n_kv_heads=4
@@ -496,6 +538,7 @@ def test_materialization_workspace_does_not_accumulate_across_layers(monkeypatch
         return x
 
     mx.eval(chain())
+    materialized_lengths.clear()
     mx.synchronize()
     mx.clear_cache()
     before = mx.get_active_memory()
@@ -503,8 +546,9 @@ def test_materialization_workspace_does_not_accumulate_across_layers(monkeypatch
     result = chain()
     mx.eval(result)
     mx.synchronize()
-    # A lazy graph kept four 32 MiB K/V pairs alive at once. The reserved
-    # workspace must cover consecutive layers, not just an isolated call.
+    assert materialized_lengths == [8192] * 8
+    # The reservation must cover consecutive layers without retaining each
+    # layer's temporary K/V until the end of the forward pass.
     assert mx.get_peak_memory() - before < sdpa.prefill_workspace_bytes()
     assert mx.all(mx.isfinite(result)).item()
 
