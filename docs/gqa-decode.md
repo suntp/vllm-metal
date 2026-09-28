@@ -6,6 +6,19 @@ Each partition has FP16/BF16 specializations for head dimensions 128/256
 with kernel block16, plus head256 with kernel block32. These form 24 active
 shader specializations.
 
+This is a Metal-backend split-KV occupancy heuristic over precompiled
+partitions. It uses a fixed work budget, counts only complete partitions,
+and greedily tries 512, 256, 128, then 64: among eligible tiers it prefers
+fewer splits. This is the same class of backend-internal scheduling choice
+as [FA3 split selection](https://github.com/Dao-AILab/flash-attention/blob/main/hopper/heuristics.h),
+[FlashInfer planning](https://github.com/flashinfer-ai/flashinfer/blob/main/include/flashinfer/attention/scheduler.cuh),
+and [ROCm partition choices](https://github.com/vllm-project/vllm/blob/main/csrc/rocm/attention.cu),
+not an equivalent cost model. FA3 also favors fewer splits near its estimated
+best efficiency; this implementation does not adopt its wave-efficiency model.
+A P1024 tier was evaluated but did not consistently beat P512 across the
+tested workloads, so P512 is the largest shipped tier. Some very-long-context
+P1024 measurements improved; this is not a claim that P1024 always loses.
+
 ## Automatic eligibility and partition selection
 
 The supported `(query heads, KV heads, head dimension)` geometries are
@@ -71,6 +84,9 @@ operational fallback; it cannot enable an otherwise ineligible call.
 There is no startup calibration or disk-cached performance threshold for
 this gate. `VLLM_METAL_GQA_AUTOTUNE` and the former mutable gate-parameter
 APIs are no longer used.
+The switch is captured once when each forward's `PagedAttentionContext` is
+created and shared by its layers. Only an enabled disable switch adds the
+`gqa_disabled` keyword, preserving the default call to older native builds.
 
 ## Validation
 
@@ -94,10 +110,17 @@ translated page with its 32-token stride.
 `tests/test_attention_sdpa.py` checks that the environment switch and scheduler
 decode count reach the primitive.
 
-Positive route tests need a reported GPU core count and sufficient partition
-grid. They skip on hosts that cannot enable GQA, including some virtual CI
-GPUs; the unknown-core fallback test runs there instead. Unconditional
-feature/dtype/page-size fallback tests do not require core-count detection.
+Default-policy positive route tests need a reported GPU core count and
+sufficient partition grid. They skip on hosts that cannot enable GQA;
+the unknown-core fallback test still verifies the production policy there.
+Kernel correctness is tested separately through the private
+`_gqa_paged_attention_for_test` entry, which selects an explicit partition
+without changing global state or the public primitive's routing API.
+Its partition is captured in the lazy primitive and its equivalence key.
+These tests execute all four partitions, both dtypes, every shipped shader
+specialization, tails and upstream shared-page writes/copies even when CI
+cannot report GPU cores. Numerical parity does not establish performance
+eligibility. Feature/dtype/page-size fallback tests remain independent.
 The library-availability check loads all 24 active GQA specializations and
 their matching reducers even when the reported core count is unavailable.
 Validate the positive path on a capable GPU before reporting GQA coverage.
@@ -138,3 +161,41 @@ implementation.
 These limitations motivate the explicit scope above; they do not establish
 that a more general optimization is impossible. Expanding automatic routing
 requires its own dispatch, numerical, and real-serving benchmark evidence.
+
+## Follow-up work (separate PRs)
+
+These are directions for evaluation after this scoped change, not additional
+enablement or performance claims in #715:
+
+1. **Multi-request decode:** extend the grid, reduction and selection policy
+   for different request lengths and batch sizes. This broadens the useful
+   workload range; batches that already fill the GPU may need different
+   choices from the single-request policy.
+2. **Mixed prefill/decode:** integrate with the decode prefix split by merged
+   [#851](https://github.com/vllm-project/vllm-metal/pull/851), after validating
+   multi-request decode. Preserve row offsets, page tables and the prefill
+   path; benchmark continuous batching rather than inferring its benefit
+   from isolated decode. The integration point is clear, but correctness
+   and admission need their own tests.
+3. **TurboQuant decode:** evaluate consuming packed KV/scales in the GQA
+   kernel. This could complement the prefill optimization in
+   [#853](https://github.com/vllm-project/vllm-metal/pull/853), which remains
+   a separate open PR. Avoid assuming that materializing the whole history
+   on every decode step is cheap; validate format, memory and quality effects.
+4. **Sliding windows:** bound loads and split selection by the actual visible
+   KV window. This is relevant to Gemma/Mistral-style attention, but their
+   geometries and other features such as sinks or soft-capping must also
+   satisfy the supported kernel contract.
+5. **Speculative verification:** evaluate sharing KV across both grouped heads
+   and multiple query rows. The existing verification kernel already shares
+   KV across rows; compare against it while preserving causal masks and
+   controlling register pressure. A larger gain is possible, not established.
+6. **Kernel pipeline and explicit KV sharing:** independently test processing
+   two to four tokens per loop and cooperative threadgroup-memory staging.
+   Compare latency savings against barriers, extra registers/shared memory
+   and occupancy changes; repeat numerical and serving validation before
+   adopting either algorithmic change.
+
+[#714](https://github.com/vllm-project/vllm-metal/pull/714) is closed and is
+not a pending dependency. The disable switch is included in #715; the
+benchmarking pitfalls remain documented in issue #713.

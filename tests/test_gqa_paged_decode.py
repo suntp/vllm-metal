@@ -221,6 +221,7 @@ def _run_primitive(
     sink_value: float | None = None,
     turboquant: bool = False,
     native_reference: bool = False,
+    test_partition: int | None = None,
 ) -> tuple[mx.array, mx.array]:
     mx.random.seed(seed)
     num_seqs = len(kv_lens)
@@ -290,28 +291,42 @@ def _run_primitive(
         mx.eval(key_cache, value_cache, k_scale, k_zero, v_scale, key_ref, value_ref)
 
     out = mx.array(0)
-    get_ops().paged_attention_primitive(
-        query,
-        key_cache,
-        value_cache,
-        num_kv_heads,
-        scale,
-        softcap,
-        block_tables,
-        kv_lens_arr,
-        cu_seqlens_q,
-        block_size,
-        max_kv_len,
-        sliding_window,
-        out,
-        window_seqlen_q=window_seqlen_q,
-        num_decode_requests=num_decode_requests,
-        num_decode_tokens=num_decode_tokens,
-        max_decode_context_len=max_decode_context_len,
-        gqa_disabled=gqa_disabled,
-        sinks=sinks,
-        **quant_kwargs,
-    )
+    if test_partition is not None:
+        get_ops()._gqa_paged_attention_for_test(
+            query,
+            key_cache,
+            value_cache,
+            scale,
+            block_tables,
+            kv_lens_arr,
+            block_size,
+            max_kv_len,
+            test_partition,
+            out,
+        )
+    else:
+        get_ops().paged_attention_primitive(
+            query,
+            key_cache,
+            value_cache,
+            num_kv_heads,
+            scale,
+            softcap,
+            block_tables,
+            kv_lens_arr,
+            cu_seqlens_q,
+            block_size,
+            max_kv_len,
+            sliding_window,
+            out,
+            window_seqlen_q=window_seqlen_q,
+            num_decode_requests=num_decode_requests,
+            num_decode_tokens=num_decode_tokens,
+            max_decode_context_len=max_decode_context_len,
+            gqa_disabled=gqa_disabled,
+            sinks=sinks,
+            **quant_kwargs,
+        )
     mx.eval(out)
     if sinks is None and not native_reference:
         ref = _grouped_paged_reference(
@@ -348,6 +363,82 @@ def test_gqa_decode_kernel_is_in_default_library() -> None:
     )
 
 
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("part", [64, 128, 256, 512])
+@pytest.mark.parametrize("tail", [False, True])
+@pytest.mark.parametrize(
+    "q,kv,head,block",
+    [
+        (32, 8, 128, 16),
+        (24, 4, 256, 16),
+        (16, 2, 128, 16),
+        (16, 2, 256, 16),
+        (16, 2, 256, 32),
+    ],
+)
+def test_gqa_kernel_numerics_without_core_detection(
+    dtype, part, tail, q, kv, head, block
+):
+    """CI executes every specialization, including single and partial partitions."""
+    out, ref = _run_primitive(
+        [2 * part + 17 if tail else part],
+        dtype,
+        interleaved=True,
+        seed=42,
+        num_query_heads=q,
+        num_kv_heads=kv,
+        head_size=head,
+        block_size=block,
+        test_partition=part,
+    )
+    assert _dispatch_family() == "gqa_decode"
+    assert get_ops().last_gqa_partition_size() == part
+    _assert_close(out, ref, dtype)
+
+
+@pytest.mark.parametrize("part", [0, 32, 1024])
+def test_private_gqa_entry_rejects_unshipped_partitions(part):
+    with pytest.raises(ValueError, match="GQA test partition"):
+        _run_primitive([65], mx.float16, interleaved=False, seed=0, test_partition=part)
+
+
+def test_private_gqa_partition_is_local_to_lazy_primitive():
+    """Building another node must not change a pending node or production routing."""
+    ops = get_ops()
+    q = mx.ones((1, 32, 128), dtype=mx.float16)
+    k = mx.ones((40, 16, 8, 128), dtype=mx.float16)
+    v = mx.full(k.shape, 2, dtype=mx.float16)
+    tables = mx.arange(40, dtype=mx.int32)[None]
+    lengths = mx.array([513], dtype=mx.int32)
+    outputs = [mx.array(0) for _ in range(3)]
+    for part, out in zip([64, 512], outputs[:2], strict=True):
+        ops._gqa_paged_attention_for_test(
+            q, k, v, 128**-0.5, tables, lengths, 16, 513, part, out
+        )
+    ops.paged_attention_primitive(
+        q,
+        k,
+        v,
+        8,
+        128**-0.5,
+        0.0,
+        tables,
+        lengths,
+        mx.array([0, 1], dtype=mx.int32),
+        16,
+        513,
+        -1,
+        outputs[2],
+        gqa_disabled=True,
+    )
+    for part, out in zip([64, 512, 0], outputs, strict=True):
+        mx.eval(out)
+        assert ops.last_gqa_partition_size() == part
+        assert np.allclose(np.array(out), 2, atol=2e-3)
+    _assert_fallback()
+    assert ops.gqa_decode_partition_size(32, 8, 128, 32768, 0) == 0
+
+
 def test_unknown_core_count_keeps_measured_shape_on_baseline() -> None:
     if get_ops().detected_gpu_core_count() > 0:
         pytest.skip("This platform exposes GPU core count")
@@ -378,19 +469,30 @@ def test_gqa_decode_matches_reference(dtype, offset, interleaved) -> None:
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("disabled", [False, True])
+@pytest.mark.parametrize(
+    "disabled,test_partition",
+    [
+        (False, None),
+        (True, None),
+        (False, 64),
+        (False, 128),
+        (False, 256),
+        (False, 512),
+    ],
+)
 @pytest.mark.parametrize(
     "q_heads,kv_heads,head,block_size",
     [
         (32, 8, 128, 16),
         (24, 4, 256, 16),
+        (24, 4, 256, 784),
         (16, 2, 256, 16),
         (16, 2, 256, 32),
         (16, 2, 256, 1056),  # Actual hybrid scheduler-page translation.
     ],
 )
 def test_gqa_reads_upstream_views_after_writes_and_block_copy(
-    dtype, disabled, q_heads, kv_heads, head, block_size
+    dtype, disabled, test_partition, q_heads, kv_heads, head, block_size
 ):
     """Exercise every shipped GQA specialization on shared K/V storage.
 
@@ -410,7 +512,11 @@ def test_gqa_reads_upstream_views_after_writes_and_block_copy(
     from vllm_metal.attention.caches.storage import KVCacheStorage
     from vllm_metal.attention.impls.sdpa import _build_block_tables
 
-    n = _eligible_context(q_heads) + 1
+    n = (
+        2 * max(block_size, test_partition) + 1
+        if test_partition
+        else _eligible_context(q_heads) + 1
+    )
     pages = _interleaved_table((n + 1 + block_size - 1) // block_size)
     num_blocks = max(pages) + 2
     spec = FullAttentionSpec(
@@ -489,28 +595,44 @@ def test_gqa_reads_upstream_views_after_writes_and_block_copy(
         kernel_keys = cache.key_caches[0]
         kernel_values = cache.value_caches[0]
         out = mx.array(0)
-        ops.paged_attention_primitive(
-            query,
-            kernel_keys,
-            kernel_values,
-            kv_heads,
-            head**-0.5,
-            0.0,
-            kernel_tables,
-            mx.array([length], dtype=mx.int32),
-            mx.array([0, 1], dtype=mx.int32),
-            kernel_block_size,
-            length,
-            -1,
-            out,
-            num_decode_requests=1,
-            gqa_disabled=disabled,
-        )
+        if test_partition is not None:
+            ops._gqa_paged_attention_for_test(
+                query,
+                kernel_keys,
+                kernel_values,
+                head**-0.5,
+                kernel_tables,
+                mx.array([length], dtype=mx.int32),
+                kernel_block_size,
+                length,
+                test_partition,
+                out,
+            )
+        else:
+            ops.paged_attention_primitive(
+                query,
+                kernel_keys,
+                kernel_values,
+                kv_heads,
+                head**-0.5,
+                0.0,
+                kernel_tables,
+                mx.array([length], dtype=mx.int32),
+                mx.array([0, 1], dtype=mx.int32),
+                kernel_block_size,
+                length,
+                -1,
+                out,
+                num_decode_requests=1,
+                gqa_disabled=disabled,
+            )
         mx.eval(out)
         if disabled:
             _assert_fallback()
         else:
             assert _dispatch_family() == "gqa_decode"
+        if test_partition is not None:
+            assert ops.last_gqa_partition_size() == test_partition
         # Independent logical history; never gather the cache under test.
         ref = _grouped_paged_reference(
             query=query,

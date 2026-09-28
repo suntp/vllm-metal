@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING, Any
 
 from mlx_lm.models.base import create_causal_mask
 
+from vllm_metal import envs
+
 if TYPE_CHECKING:
     from vllm_metal.attention.impls.mla import MLAForwardMetadata
 
@@ -132,6 +134,11 @@ class PagedAttentionContext:
     # MLA kernel-format metadata memo (``impls.mla.MLAForwardMetadata``);
     # same one-forward lifetime as ``kernel_metadata_cache``.
     mla_metadata: MLAForwardMetadata | None = None
+    # Snapshot once per forward, rather than reading the environment in every
+    # layer. A subsequent forward sees updates to the operational kill switch.
+    gqa_disabled: bool = field(
+        default_factory=lambda: envs.VLLM_METAL_DISABLE_GQA_DECODE
+    )
 
 
 def set_context(ctx: PagedAttentionContext) -> None:

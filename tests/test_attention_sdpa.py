@@ -715,14 +715,12 @@ class _PreMmPrefixOps:
         window_seqlen_q=1,
         sinks=None,
         num_decode_requests=-1,
-        gqa_disabled=False,
     ):
         self._spy.paged_attention_primitive(
             *args,
             window_seqlen_q=window_seqlen_q,
             sinks=sinks,
             num_decode_requests=num_decode_requests,
-            gqa_disabled=gqa_disabled,
         )
 
 
@@ -806,7 +804,15 @@ class TestSDPAForward:
         self, monkeypatch: pytest.MonkeyPatch, disabled: bool
     ) -> None:
         """The environment escape hatch and scheduler decode count reach native code."""
+        from vllm_metal import envs
+
         monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", str(int(disabled)))
+        read_env = MagicMock(
+            wraps=envs.environment_variables["VLLM_METAL_DISABLE_GQA_DECODE"]
+        )
+        monkeypatch.setitem(
+            envs.environment_variables, "VLLM_METAL_DISABLE_GQA_DECODE", read_env
+        )
         spy = _PagedRoutingOpsSpy()
         inner = _make_inner()
         inner.o_proj = lambda out: out
@@ -827,7 +833,15 @@ class TestSDPAForward:
             patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
         ):
             sdpa_forward(inner, x, ctx, cache, layer_idx=0)
-        assert spy.calls[-1].gqa_disabled is disabled
+            monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", str(int(not disabled)))
+            sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+            assert spy.calls[-1].gqa_disabled is disabled
+            assert read_env.call_count == 1
+            next_ctx = _make_ctx(_SEQ_LEN)
+            next_ctx.num_decode_requests = 1
+            sdpa_forward(inner, x, next_ctx, cache, layer_idx=0)
+        assert read_env.call_count == 2
+        assert spy.calls[-1].gqa_disabled is not disabled
         assert spy.calls[-1].num_decode_requests == 1
 
     def test_mixed_batch_routes_slots_and_page_tables_by_layer_group(self) -> None:
@@ -1431,8 +1445,15 @@ class TestBidirectionalDispatch:
         assert bidi.call_count == 1
         assert spy.calls[-1].mm_prefix_ranges is None
 
-    def test_ops_predating_mm_prefix_serve_the_recompute(self) -> None:
+    @pytest.mark.parametrize("disable_env", [None, "0"])
+    def test_ops_predating_mm_prefix_serve_the_recompute(
+        self, monkeypatch, disable_env
+    ) -> None:
         # No probe and no keyword: the image rows still reach the recompute.
+        if disable_env is None:
+            monkeypatch.delenv("VLLM_METAL_DISABLE_GQA_DECODE", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", disable_env)
         bidi, _, _ = self._run(
             frozenset({"sliding"}), [None, [(0, 2)]], 1, ops=_PreMmPrefixOps()
         )

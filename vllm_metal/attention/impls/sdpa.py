@@ -37,7 +37,6 @@ import mlx.core as mx
 import mlx.nn as nn
 from vllm.logger import init_logger
 
-from vllm_metal import envs
 from vllm_metal.attention.attention_contracts import (
     DEFAULT_ATTENTION_CONTRACT,
     AttentionContract,
@@ -815,6 +814,9 @@ def sdpa_forward(
                 recompute_after_kernel = True
     # Older native builds keep the existing whole-batch route.
     paged_kwargs: dict[str, int | mx.array] = {}
+    # Omit the new keyword on the default path for older native builds.
+    if ctx.gqa_disabled:
+        paged_kwargs["gqa_disabled"] = True
     if bool(getattr(ops, "supports_decode_routing_metadata", lambda: False)()):
         paged_kwargs.update(
             num_decode_requests=ctx.num_decode_requests,
@@ -872,7 +874,6 @@ def sdpa_forward(
             quant_type=kv_cache.k_quant,
             v_bits=kv_cache.v_bits,
             window_seqlen_q=ctx.verify_window_q,
-            gqa_disabled=envs.VLLM_METAL_DISABLE_GQA_DECODE,
             **paged_kwargs,
         )
     else:
@@ -892,7 +893,6 @@ def sdpa_forward(
             out,
             window_seqlen_q=ctx.verify_window_q,
             sinks=sinks,
-            gqa_disabled=envs.VLLM_METAL_DISABLE_GQA_DECODE,
             **paged_kwargs,
         )
 

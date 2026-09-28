@@ -300,6 +300,21 @@ static int get_bits(const std::string& quant_type) {
 // paged_attention_v2_online — dispatch helper (used by PagedAttentionPrimitive)
 // ---------------------------------------------------------------------------
 
+// Both GQA and the established kernels address translated subpages this way.
+static void bind_paged_attn_strides(
+    metal::CommandEncoder& enc, const array& query,
+    const array& key_cache, int block_size) {
+  int32_t q_stride = static_cast<int32_t>(query.shape(1) * query.shape(2));
+  int32_t kv_block_stride = static_cast<int32_t>(key_cache.strides()[0]);
+  if (static_cast<int>(key_cache.shape(1)) > block_size) {
+    kv_block_stride = static_cast<int32_t>(block_size * key_cache.strides()[1]);
+  }
+  int32_t kv_head_stride = static_cast<int32_t>(key_cache.strides()[2]);
+  enc.set_bytes(q_stride, 15);
+  enc.set_bytes(kv_block_stride, 16);
+  enc.set_bytes(kv_head_stride, 17);
+}
+
 // Shared buffer binding for paged attention kernels (slots 2-21).
 static void bind_paged_attn_buffers(
     metal::CommandEncoder& enc,
@@ -309,9 +324,6 @@ static void bind_paged_attn_buffers(
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
     int block_size, int sliding_window) {
-  int num_heads = static_cast<int>(query.shape(1));
-  int head_size = static_cast<int>(query.shape(2));
-
   enc.set_output_array(out, 2);
   enc.set_input_array(query,        3);
   enc.set_input_array(key_cache,    4);
@@ -328,16 +340,7 @@ static void bind_paged_attn_buffers(
   int32_t max_blocks_i = static_cast<int32_t>(block_tables.shape(1));
   enc.set_bytes(max_blocks_i, 13);
 
-  int32_t q_stride = static_cast<int32_t>(num_heads * head_size);
-  int32_t kv_block_stride = static_cast<int32_t>(key_cache.strides()[0]);
-  // Expanded block IDs address dense sub-blocks within an upstream page.
-  if (static_cast<int>(key_cache.shape(1)) > block_size) {
-    kv_block_stride = static_cast<int32_t>(block_size * key_cache.strides()[1]);
-  }
-  int32_t kv_head_stride = static_cast<int32_t>(key_cache.strides()[2]);
-  enc.set_bytes(q_stride,        15);
-  enc.set_bytes(kv_block_stride, 16);
-  enc.set_bytes(kv_head_stride,  17);
+  bind_paged_attn_strides(enc, query, key_cache, block_size);
 
   enc.set_input_array(cu_seqlens_q, 19);
   int32_t num_seqs_i = static_cast<int32_t>(cu_seqlens_q.shape(0) - 1);
@@ -599,7 +602,8 @@ static void dispatch_paged_attention_v2_online(
     int num_decode_requests = -1,
     int num_decode_tokens = 0,
     int max_decode_context_len = 0,
-    int decode_only_rows = 0, bool gqa_disabled = false) {
+    int decode_only_rows = 0, bool gqa_disabled = false,
+    int gqa_test_partition = 0) {
   int head_size = static_cast<int>(query.shape(2));
 
   // Tiled kernel for prefill batches, matching vLLM Triton's 2D/3D dispatch
@@ -759,8 +763,12 @@ static void dispatch_paged_attention_v2_online(
       block_size == 16 ||
       (block_size == 32 && num_heads == 16 && num_kv_heads == 2 &&
        head_size == 256);
-  const int gqa_partition_size = gqa_decode_partition_size(
-      num_heads, num_kv_heads, head_size, max_seq_len, detected_gpu_core_count());
+  // Only the private numerical-test entry supplies a partition. The public
+  // primitive always uses the unchanged device/length policy below.
+  const int gqa_partition_size = gqa_test_partition > 0 ? gqa_test_partition
+      : gqa_decode_partition_size(
+          num_heads, num_kv_heads, head_size, max_seq_len,
+          detected_gpu_core_count());
   const int64_t gqa_partitions = gqa_partition_size > 0
       ? (static_cast<int64_t>(max_seq_len) + gqa_partition_size - 1) /
             gqa_partition_size : 0;
@@ -814,18 +822,7 @@ static void dispatch_paged_attention_v2_online(
     enc.set_input_array(seq_lens, 12);
     int32_t g_max_blocks = static_cast<int32_t>(block_tables.shape(1));
     enc.set_bytes(g_max_blocks, 13);
-    int32_t g_q_stride = static_cast<int32_t>(num_heads * head_size);
-    int32_t g_kv_block_stride = static_cast<int32_t>(key_cache.strides()[0]);
-    // Match the established kernels when scheduler pages stay unreshaped:
-    // translated page IDs address block_size-token sub-blocks of the cache.
-    if (static_cast<int>(key_cache.shape(1)) > block_size) {
-      g_kv_block_stride =
-          static_cast<int32_t>(block_size * key_cache.strides()[1]);
-    }
-    int32_t g_kv_head_stride = static_cast<int32_t>(key_cache.strides()[2]);
-    enc.set_bytes(g_q_stride, 15);
-    enc.set_bytes(g_kv_block_stride, 16);
-    enc.set_bytes(g_kv_head_stride, 17);
+    bind_paged_attn_strides(enc, query, key_cache, block_size);
     // One threadgroup per (partition, kv head, sequence); each simdgroup
     // owns one query head of the GQA group.
     enc.dispatch_threadgroups(
@@ -988,7 +985,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
       int window_seqlen_q = 1, bool use_sinks = false,
       bool use_mm_prefix = false, int num_decode_requests = -1,
       int num_decode_tokens = 0, int max_decode_context_len = 0,
-      bool gqa_disabled = false)
+      bool gqa_disabled = false, int gqa_test_partition = 0)
       : UnaryPrimitive(stream),
         num_kv_heads_(num_kv_heads), scale_(scale), softcap_(softcap),
         block_size_(block_size), max_seq_len_(max_seq_len),
@@ -999,7 +996,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         num_decode_requests_(num_decode_requests),
         num_decode_tokens_(num_decode_tokens),
         max_decode_context_len_(max_decode_context_len),
-        gqa_disabled_(gqa_disabled) {}
+        gqa_disabled_(gqa_disabled), gqa_test_partition_(gqa_test_partition) {}
 
   void eval_cpu(const std::vector<array>&, array&) override {
     throw std::runtime_error(
@@ -1032,7 +1029,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         stream(),
         ks, vs, kz, vc, use_turboquant_, k_bits_, v_bits_, sk, mp,
         num_decode_requests_, num_decode_tokens_, max_decode_context_len_,
-        0, gqa_disabled_);
+        0, gqa_disabled_, gqa_test_partition_);
   }
 
   const char* name() const override { return "PagedAttention"; }
@@ -1053,7 +1050,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         && rhs->num_decode_requests_ == num_decode_requests_
         && rhs->num_decode_tokens_ == num_decode_tokens_
         && rhs->max_decode_context_len_ == max_decode_context_len_
-        && rhs->gqa_disabled_ == gqa_disabled_;
+        && rhs->gqa_disabled_ == gqa_disabled_
+        && rhs->gqa_test_partition_ == gqa_test_partition_;
   }
 
  private:
@@ -1073,6 +1071,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
   int num_decode_tokens_;
   int max_decode_context_len_;
   bool gqa_disabled_;
+  int gqa_test_partition_;
 };
 
 static array paged_attention_primitive_fn(
@@ -1092,7 +1091,8 @@ static array paged_attention_primitive_fn(
     const array* mm_prefix_ranges = nullptr,
     int num_decode_requests = -1,
     int num_decode_tokens = 0,
-    int max_decode_context_len = 0, bool gqa_disabled = false) {
+    int max_decode_context_len = 0, bool gqa_disabled = false,
+    int gqa_test_partition = 0) {
   if (sinks != nullptr) {
     // Upstream MLX refuses the same combination
     // (mlx_lm/models/base.py: "Quantized SDPA does not support attention
@@ -1220,7 +1220,7 @@ static array paged_attention_primitive_fn(
       block_size, max_seq_len, sliding_window,
       use_turboquant, k_bits, v_bits, window_seqlen_q, sinks != nullptr,
       mm_prefix_ranges != nullptr, num_decode_requests, num_decode_tokens,
-      max_decode_context_len, gqa_disabled);
+      max_decode_context_len, gqa_disabled, gqa_test_partition);
   std::vector<array> inputs = {query, key_cache, value_cache,
                                block_tables, seq_lens, cu_seqlens_q};
   if (use_turboquant) {
@@ -2226,6 +2226,53 @@ NB_MODULE(_paged_ops, m) {
         "backing storage are preserved, so the caller MUST rebind its pool "
         "reference. dst_ids must be distinct int32 slots; src is "
         "[n, *pool.shape[1:]] with pool's dtype.");
+
+  // Private numerical-test entry: bypass only the performance selector, never
+  // mutate process-wide policy or expose an override on the production API.
+  m.def("_gqa_paged_attention_for_test",
+        [](nb::handle query_h, nb::handle key_h, nb::handle value_h,
+           float scale, nb::handle tables_h, nb::handle lengths_h,
+           int block_size, int max_seq_len, int partition_size,
+           nb::handle out_h) {
+          const auto& q = *nb::inst_ptr<array>(query_h);
+          const auto& k = *nb::inst_ptr<array>(key_h);
+          const auto& v = *nb::inst_ptr<array>(value_h);
+          const auto& tables = *nb::inst_ptr<array>(tables_h);
+          const auto& lengths = *nb::inst_ptr<array>(lengths_h);
+          if (partition_size != 64 && partition_size != 128 &&
+              partition_size != 256 && partition_size != 512) {
+            throw std::invalid_argument("GQA test partition must be 64/128/256/512");
+          }
+          if (q.ndim() != 3 || q.shape(0) != 1 || k.ndim() != 4 ||
+              k.shape() != v.shape() || k.strides() != v.strides() ||
+              (q.dtype() != float16 && q.dtype() != bfloat16) ||
+              k.dtype() != q.dtype() || v.dtype() != q.dtype() ||
+              k.shape(3) != q.shape(2) ||
+              !gqa_decode_geometry_supported(q.shape(1), k.shape(2), q.shape(2)) ||
+              !(block_size == 16 || (block_size == 32 && q.shape(1) == 16 &&
+                                    k.shape(2) == 2 && q.shape(2) == 256)) ||
+              k.shape(1) % block_size != 0 ||
+              tables.ndim() != 2 || tables.shape(0) != 1 ||
+              tables.dtype() != int32 || lengths.ndim() != 1 ||
+              lengths.shape(0) != 1 || lengths.dtype() != int32 ||
+              max_seq_len <= 0 ||
+              max_seq_len > static_cast<int64_t>(tables.shape(1)) * block_size) {
+            throw std::invalid_argument("GQA test entry requires one supported decode row");
+          }
+          auto cu = array({0, 1}, int32);
+          auto result = paged_attention_primitive_fn(
+              q, k, v, k.shape(2), scale, 0.f, tables, lengths, cu,
+              block_size, max_seq_len, -1, false, "", nullptr, nullptr,
+              nullptr, nullptr, 3, 1, nullptr, nullptr, 1, 0, 0, false,
+              partition_size);
+          nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
+        }, nb::arg("query"), nb::arg("key_cache"), nb::arg("value_cache"),
+        nb::arg("scale"), nb::arg("block_tables"), nb::arg("seq_lens"),
+        nb::arg("block_size"), nb::arg("max_seq_len"), nb::arg("partition_size"),
+        nb::arg("out"),
+        "Private test-only single-request GQA dispatch with an explicit partition. "
+        "Page IDs and sequence lengths must describe valid cache contents. "
+        "Does not change the default selector or require GPU core detection.");
 
   // Paged attention primitive (read-only): dispatches paged_attention_v2_online.
   // Cache writes are handled by MLX-native scatter upstream.
