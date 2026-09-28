@@ -55,6 +55,7 @@ def main():
     ap.add_argument("--prefix-probe", action="store_true")
     ap.add_argument("--quality-windows", type=int, default=16)
     ap.add_argument("--quality-window", type=int, default=1024)
+    ap.add_argument("--progress-interval", type=float, default=0)
     ap.add_argument("--output", type=Path)
     args = ap.parse_args()
     if (
@@ -68,10 +69,11 @@ def main():
         )
         < 1
         or args.warmup < 0
+        or args.progress_interval < 0
     ):
         ap.error("lengths/repetitions must be positive and warmup nonnegative")
-    if args.quality_text and (args.arm != "paired" or args.quality_window < 256):
-        ap.error("quality comparison requires --arm paired and window >= 256")
+    if args.quality_text and args.quality_window < 256:
+        ap.error("quality scoring requires window >= 256")
     if args.prefix_probe and (args.arm != "paired" or args.quality_text):
         ap.error("prefix probe requires --arm paired without --quality-text")
 
@@ -88,12 +90,16 @@ def main():
     original_planner = sdpa._turboquant_prefill_plan
     dispatch = {}
     active_arm = args.arm
+    progress_start = last_progress = time.perf_counter()
 
     def counted_planner(*planner_args, **kwargs):
+        nonlocal last_progress
         dispatch["prefill_layer_calls"] += 1
-        if active_arm == "tq-reference":
-            return None
-        plan = original_planner(*planner_args, **kwargs)
+        plan = (
+            None
+            if active_arm == "tq-reference"
+            else original_planner(*planner_args, **kwargs)
+        )
         if plan is not None:
             dispatch["lane_layer_calls"] += 1
             dispatch["lane_segments"] += plan.prefill.seq_lens.shape[0]
@@ -103,6 +109,25 @@ def main():
             dispatch["max_workspace_bytes"] = max(
                 dispatch["max_workspace_bytes"], plan.workspace_bytes
             )
+        if args.progress_interval:
+            now = time.perf_counter()
+            if now - last_progress >= args.progress_interval:
+                print(
+                    json.dumps(
+                        {
+                            "progress": {
+                                "arm": active_arm,
+                                "elapsed_s": now - progress_start,
+                                "context_tokens": max(planner_args[0].context_lens),
+                                "dispatch": dict(dispatch),
+                                "active_bytes": mx.get_active_memory(),
+                                "peak_active_bytes": mx.get_peak_memory(),
+                            }
+                        }
+                    ),
+                    flush=True,
+                )
+                last_progress = now
         return plan
 
     sdpa._turboquant_prefill_plan = counted_planner
@@ -159,13 +184,14 @@ def main():
     print(json.dumps({"metadata": metadata}, default=str), flush=True)
 
     def run(ids, arm, phase, trial, *, quality=False, allow_no_lane=False):
-        nonlocal active_arm
+        nonlocal active_arm, progress_start, last_progress
         active_arm = arm
         reset_dispatch()
         mx.synchronize()
         active_bytes = mx.get_active_memory()
         mx.reset_peak_memory()
         start = time.perf_counter()
+        progress_start = last_progress = start
         result = llm.generate(
             [{"prompt_token_ids": ids}],
             SamplingParams(
@@ -191,6 +217,8 @@ def main():
             "ttft_s": ttft,
             "gen_wall_s": elapsed,
             "num_cached_tokens": result.num_cached_tokens,
+            "active_before_bytes": active_bytes,
+            "peak_active_bytes": mx.get_peak_memory(),
             "peak_extra_bytes": max(0, mx.get_peak_memory() - active_bytes),
             "dispatch": dict(dispatch),
         }
@@ -293,35 +321,39 @@ def main():
                 for arm in arms if window % 2 == 0 else arms[::-1]:
                     pair[arm] = run(ids, arm, "quality", window, quality=True)
                     nll[arm].append(pair[arm]["nll_sum"])
-                agrees += sum(
-                    a == b
-                    for a, b in zip(
-                        pair[arms[0]]["top1"], pair[arms[1]]["top1"], strict=True
+                if len(arms) == 2:
+                    agrees += sum(
+                        a == b
+                        for a, b in zip(
+                            pair[arms[0]]["top1"], pair[arms[1]]["top1"], strict=True
+                        )
                     )
-                )
             count = args.quality_windows * (args.quality_window - 1)
             ppl = {arm: math.exp(sum(values) / count) for arm, values in nll.items()}
-            # Resample paired windows, preserving token alignment and context.
-            deltas = (np.array(nll["tq"]) - np.array(nll["tq-reference"])) / (
-                args.quality_window - 1
-            )
-            bootstrap = (
-                np.random.default_rng(0)
-                .choice(deltas, (10000, len(deltas)))
-                .mean(axis=1)
-            )
             summary = {
                 "kind": "quality",
                 "scored_tokens": count,
                 "perplexity": ppl,
-                "relative_ppl_change_percent": (ppl["tq"] / ppl["tq-reference"] - 1)
-                * 100,
-                "mean_delta_nll": float(deltas.mean()),
-                "delta_nll_bootstrap_95ci": np.quantile(
-                    bootstrap, [0.025, 0.975]
-                ).tolist(),
-                "teacher_forced_top1_agreement": agrees / count,
             }
+            if len(arms) == 2:
+                # Resample paired windows, preserving token alignment and context.
+                deltas = (np.array(nll["tq"]) - np.array(nll["tq-reference"])) / (
+                    args.quality_window - 1
+                )
+                bootstrap = (
+                    np.random.default_rng(0)
+                    .choice(deltas, (10000, len(deltas)))
+                    .mean(axis=1)
+                )
+                summary.update(
+                    relative_ppl_change_percent=(ppl["tq"] / ppl["tq-reference"] - 1)
+                    * 100,
+                    mean_delta_nll=float(deltas.mean()),
+                    delta_nll_bootstrap_95ci=np.quantile(
+                        bootstrap, [0.025, 0.975]
+                    ).tolist(),
+                    teacher_forced_top1_agreement=agrees / count,
+                )
             summaries.append(summary)
             print(json.dumps(summary), flush=True)
         else:

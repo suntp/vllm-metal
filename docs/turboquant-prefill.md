@@ -165,6 +165,37 @@ PYTHONPATH=. MLX_ENABLE_TF32=0 python tools/benchmark/tq_e2e_arm.py \
   --quality-window 1024 --quality-windows 16 --output quality.json
 ```
 
+That paired run uses identical TQ quantization in both arms and isolates this
+prefill implementation. To measure the effect of quantizing KV itself, also
+score a BF16-cache baseline and the desired TQ format on the same corpus:
+
+```bash
+PYTHONPATH=. MLX_ENABLE_TF32=0 python tools/benchmark/tq_e2e_arm.py \
+  --model /path/to/model --arm bf16 --quality-text /path/to/wikitext-test.txt \
+  --output quality-bf16.json
+PYTHONPATH=. MLX_ENABLE_TF32=0 python tools/benchmark/tq_e2e_arm.py \
+  --model /path/to/model --arm tq --k-quant q8_0 --v-quant q4_0 \
+  --quality-text /path/to/wikitext-test.txt --output quality-k8v4.json
+```
+
+Keep model weights, activation dtype, tokenization and scoring windows fixed;
+check the corpus and token-ID hashes before comparing separate runs. A TQ-path
+parity result alone does not establish equivalence to a BF16 cache. Quantizing
+already discards information; FP32 dequantization arithmetic does not recover it.
+
+For a long-context whole-model functional run, including subsequent decode:
+
+```bash
+PYTHONPATH=. MLX_ENABLE_TF32=0 python tools/benchmark/tq_e2e_arm.py \
+  --model /path/to/model --arm tq --prompt-tokens 131072 --max-tokens 32 \
+  --reps 1 --warmup 0 --progress-interval 30 --output long-context.json
+```
+
+Progress reports context length, route counts and active/peak MLX allocation.
+The final record includes the absolute peak and peak above the pre-request
+allocation. This single run checks whole-model execution and memory; it does
+not measure a paired speedup or long-context retrieval quality.
+
 The tool tokenizes without additional special tokens, splits the first 16,384
 tokens into 16 independent windows, and scores all but the first token of each
 window using vLLM prompt logprobs (16,368 scored tokens). Both arms receive the
