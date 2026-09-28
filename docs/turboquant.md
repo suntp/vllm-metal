@@ -74,12 +74,52 @@ distortion; they do not make compression lossless. K errors affect attention
 weights, while V errors affect their weighted sum. Validate both bit widths
 against a BF16-cache baseline with the same model weights and workload.
 
+## Known Quality Floors
+
+The historical observations below are workload-specific, not guarantees for
+every model. Compression ratios use the geometry and scale metadata from the
+table above. In particular, the lowest-bit settings have produced severe output
+degradation and should not be treated as interchangeable serving presets.
+
+| Config | Compression | Quality guidance |
+|--------|-------------|------------------|
+| `q8_0` / `q3_0` | 2.56x | Default bit widths; validate against a BF16 cache on the target workload |
+| `q8_0` / `q2_0` | 2.78x | A fluency dip has been observed; validate before using it to save memory |
+| `q4_0` / `q3_0` | 3.76x | Lower-memory option with model-dependent quality loss |
+| `int2` / `q3_0` | 4.92x | **Degraded**: topic drift and numeric artefacts have been observed; capacity benchmarks only |
+| `int2` / `q2_0` | 5.82x | **Broken output observed**: degenerate repetition loops; not for serving |
+
+## Examples
+
+### Normal Compression
+
+Use the default bit widths after validating quality on the target workload:
+
+```bash
+vllm serve meta-llama/Llama-3.2-1B-Instruct \
+  --dtype bfloat16 \
+  --max-model-len 65536 \
+  --additional-config '{"turboquant": true, "k_quant": "q8_0", "v_quant": "q3_0"}'
+```
+
+### Aggressive Compression
+
+For memory-bound workloads where the measured quality loss is acceptable:
+
+```bash
+vllm serve meta-llama/Llama-3.2-1B-Instruct \
+  --dtype bfloat16 \
+  --max-model-len 65536 \
+  --additional-config '{"turboquant": true, "k_quant": "q4_0", "v_quant": "q3_0"}'
+```
+
 ## Prefill Acceleration
 
 Eligible TurboQuant prefills materialize the referenced KV pages and use the
 existing NAX or tiled attention kernel. `VLLM_METAL_TQ_PREFILL=auto` enables this
 when NAX is available (M5); `1` opts into tiled prefill on other GPUs, and `0`
-disables it. The crossover was measured on M5 Pro; M1–M4 performance is unverified.
+disables it. The crossover was calibrated on M5 Pro; broader hardware and shape
+calibration is required before enabling tiled prefill by default on M1–M4.
 
 Eligibility uses the **new query tokens in the current scheduler chunk**:
 `max(128, head_dim / 2, ceil(256 * num_kv_heads / num_query_heads))` or more.
@@ -92,11 +132,16 @@ accelerated; GDN/linear layers are unchanged. Attention sinks remain unsupported
 with TurboQuant.
 
 The fused materializer reads the original strided packed cache and writes K/V
-directly in FP16/BF16. Unpacking, scale math and inverse FWHT stay in registers,
-with FP32 arithmetic; there are no context-sized packed gathers or FP32 arrays.
-Dequantized pages are temporary, and shared physical prefixes are decoded once
-per layer. Scheduler-owned storage, block tables and their lifetime remain
-authoritative.
+directly in FP16/BF16. Unpacking stays in registers; scale math and inverse FWHT
+use FP32 arithmetic. There are no context-sized packed gathers or FP32 arrays.
+It uses `mx.fast.metal_kernel`, JIT-compiled on first use for each dtype,
+geometry and quantization-format specialization; warmed timings exclude this
+initial compilation cost.
+
+Dequantized pages are temporary. Shared physical prefixes are decoded once
+per layer **per scheduler step**; each prefill chunk re-materializes its
+referenced history. Scheduler-owned storage, block tables and their lifetime
+remain authoritative.
 
 `VLLM_METAL_TQ_PREFILL_MAX_MIB=auto` reserves 2% of the device's recommended
 working set, rounded up to 64 MiB, with a 256 MiB floor and 2 GiB ceiling. A
@@ -109,9 +154,11 @@ Admission counts final K/V, page indices, block tables and any mixed-batch
 query/output copies. Independent histories add their sizes; shared physical
 pages count once. An entire batch that fits avoids the split-copy charge.
 Oversized histories fall back before materialization, while smaller requests
-can still qualify. Attention output is evaluated and its GPU stream synchronized
-before returning, so temporary K/V from successive layers cannot accumulate.
-Normal model buffers remain in the existing profiled execution budget.
+can still qualify. Each accelerated layer evaluates its output with `mx.eval`
+and drains the GPU stream with `mx.synchronize` before returning. This adds a
+host synchronization boundary in each scheduler step, so temporary K/V from
+successive layers cannot accumulate. Normal model buffers remain in the
+existing profiled execution budget.
 
 The worker logs the reserved allowance, first lane activation and first budget
 fallback. Debug logs include selected/fallback request counts, gathered tokens
@@ -146,7 +193,8 @@ PYTHONPATH=. MLX_ENABLE_TF32=0 python tools/benchmark/tq_e2e_arm.py \
 ```
 
 JSON records vLLM's `first_token_latency`, wall time, actual layer dispatch,
-workspace, MLX memory and runtime versions. Missing TTFT or an inactive requested
+workspace, MLX memory and runtime versions. TTFT summaries are medians of the
+measured repetitions, excluding warmup. Missing TTFT or an inactive requested
 TQ lane fails explicitly. This offline tool excludes HTTP and concurrent serving
 queues. `--prefix-probe --prompt-tokens 8192` instead seeds and reuses real cached
 prefixes with short/long suffixes, recording cache hits and dispatch.

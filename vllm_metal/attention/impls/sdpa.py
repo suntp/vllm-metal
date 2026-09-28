@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import Any
 
 import mlx.core as mx
@@ -233,6 +234,12 @@ class _KernelMetadata:
         default_factory=dict
     )
 
+    @cached_property
+    def tq_prefill_workspace_bytes(self) -> int:
+        # Configuration is fixed while a cache is allocated. Resolve it once
+        # per forward/group, alongside the routing metadata reused by its layers.
+        return prefill_workspace_bytes()
+
 
 def _kernel_metadata(
     ctx: PagedAttentionContext,
@@ -284,7 +291,7 @@ def _turboquant_prefill_plan(
     gather fits the absolute workspace reserved before KV allocation. An
     oversized candidate is skipped before building its gather indices.
     """
-    workspace_limit = prefill_workspace_bytes()
+    workspace_limit = meta.tq_prefill_workspace_bytes
     if not workspace_limit:
         return None
     min_tokens = max(
@@ -377,21 +384,25 @@ def _turboquant_prefill_plan(
     query_order: list[int] = []
 
     def batch(ids: list[int], tables: mx.array) -> _AttentionBatch:
+        if not fallback_ids:
+            # The whole batch keeps its original query order and metadata.
+            return _AttentionBatch(
+                None, tables, meta.seq_lens, meta.cu_seqlens_q, meta.max_seq_len
+            )
         indices = [q for i in ids for q in range(cu_seqlens[i], cu_seqlens[i + 1])]
         query_order.extend(indices)
         cu = [0]
         for i in ids:
             cu.append(cu[-1] + lengths[i])
         return _AttentionBatch(
-            None if not fallback_ids else mx.array(indices, dtype=mx.int32),
+            mx.array(indices, dtype=mx.int32),
             tables,
             mx.array([ctx.context_lens[i] for i in ids], dtype=mx.int32),
             mx.array(cu, dtype=mx.int32),
             max(ctx.context_lens[i] for i in ids),
         )
 
-    width = max(map(len, rows))
-    tables = mx.array([row + [0] * (width - len(row)) for row in rows], mx.int32)
+    tables = mx.array([row + [0] * (table_width - len(row)) for row in rows], mx.int32)
     prefill = batch(prefill_ids, tables)
     fallback = (
         batch(fallback_ids, meta.block_tables[mx.array(fallback_ids, mx.int32)])
