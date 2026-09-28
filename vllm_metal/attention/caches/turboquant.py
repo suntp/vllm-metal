@@ -6,8 +6,6 @@ including key/value quantization metadata, bit packing helpers, and the FWHT
 rotation/sign tables used by the Metal dequantization kernels.
 """
 
-from collections.abc import Callable
-from functools import lru_cache
 from typing import cast
 
 import mlx.core as mx
@@ -24,8 +22,9 @@ def prefill_workspace_bytes() -> int:
     mode = envs.VLLM_METAL_TQ_PREFILL
     if mode not in ("auto", "0", "1"):
         raise ValueError("VLLM_METAL_TQ_PREFILL must be auto, 0 or 1")
-    mib = envs.VLLM_METAL_TQ_PREFILL_MAX_MIB
-    if mib < 0:
+    setting = envs.VLLM_METAL_TQ_PREFILL_MAX_MIB
+    mib = None if setting == "auto" else int(setting)
+    if mib is not None and mib < 0:
         raise ValueError("VLLM_METAL_TQ_PREFILL_MAX_MIB must be nonnegative")
     if mode == "0" or mib == 0:
         return 0
@@ -35,18 +34,26 @@ def prefill_workspace_bytes() -> int:
             "VLLM_METAL_TQ_PREFILL=1 opts into uncalibrated tiled prefill."
         )
         return 0
+    if mib is None:
+        # Reserve this once before KV sizing; never borrow from a live cache.
+        # 2% of the device's stable recommended working set, rounded up to
+        # 64 MiB, with a 256 MiB floor and a 2 GiB ceiling.
+        recommended = int(mx.device_info().get("max_recommended_working_set_size", 0))
+        step = 64 * 2**20
+        rounded = (recommended + 50 * step - 1) // (50 * step) * step
+        return max(256 * 2**20, min(2 * 2**30, rounded))
     return mib * 2**20
 
 
 def prefill_bytes_per_token(num_kv_heads: int, head_dim: int) -> int:
-    """Conservative allowance for both compiled decoders and gather indices.
+    """Final K/V pair (4 bytes per element) and gather-index allowance.
 
-    Per KV element: 4 bytes for the final K/V pair, 8 for FP32 value
-    reconstruction/FWHT, and 12 for packed gathers, unpacking and conversion.
-    The FP32 math is retained; only each decoder's final store is FP16/BF16.
+    The fused kernel reads the original strided pool directly and retains
+    unpacking, scale arithmetic and inverse FWHT in registers. There are no
+    context-sized packed gathers or FP32 dequantization intermediates.
     Query/projection/attention buffers remain in the existing profile budget.
     """
-    return 24 * num_kv_heads * head_dim + 16
+    return 4 * num_kv_heads * head_dim + 16
 
 
 _RNG_KEY = mx.random.key(42)
@@ -586,29 +593,3 @@ def turbo_quant_decode(
         v_indices, v_scale, output_dtype, block_size, bits=value_bits
     )
     return k, v
-
-
-@lru_cache(maxsize=64)
-def prefill_dequantizers(
-    key_quant_type: str, value_bits: int, output_dtype: mx.Dtype
-) -> tuple[Callable[..., mx.array], Callable[..., mx.array]]:
-    """Separate fused K/V graphs, casting before each graph returns.
-
-    Compiling unpack/elementwise operations avoids their full-sized eager
-    intermediates. Keep the FP32 FWHT and scale arithmetic used by the
-    reference decoder; lowering those operations to BF16 changes accuracy.
-    Only functions are cached, never a request's materialized K/V arrays.
-    """
-    k_bits: int = QUANT_PARAMS[key_quant_type]["bits"]
-
-    def decode_key(indices: mx.array, scale: mx.array, zero: mx.array) -> mx.array:
-        if k_bits < 8:
-            indices = unpack_bits(indices, k_bits, scale.shape[-1] * BLOCK_SIZE)
-        return turbo_quant_decode_key(indices, scale, zero, output_dtype)
-
-    def decode_value(indices: mx.array, scale: mx.array) -> mx.array:
-        if value_bits < 8:
-            indices = unpack_bits(indices, value_bits, scale.shape[-1] * BLOCK_SIZE)
-        return turbo_quant_decode_value(indices, scale, output_dtype, bits=value_bits)
-
-    return mx.compile(decode_key), mx.compile(decode_value)

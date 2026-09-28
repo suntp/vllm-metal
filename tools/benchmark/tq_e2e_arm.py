@@ -2,7 +2,8 @@
 """Warm paired model TTFT or teacher-forced perplexity through real vLLM.
 
 Both TQ arms share a loaded model and quantized cache settings; the reference
-disables only the prefill planner. Prefix caching is off. vLLM request metrics
+disables only the prefill planner. Prefix caching is off except in the explicit
+prefix-reuse probe. vLLM request metrics
 provide TTFT separately from total generation time. This is an in-process
 benchmark, excluding tokenization, HTTP and concurrent serving queues.
 
@@ -51,6 +52,7 @@ def main():
     ap.add_argument("--k-quant", default="q8_0")
     ap.add_argument("--v-quant", default="q3_0")
     ap.add_argument("--quality-text", type=Path)
+    ap.add_argument("--prefix-probe", action="store_true")
     ap.add_argument("--quality-windows", type=int, default=16)
     ap.add_argument("--quality-window", type=int, default=1024)
     ap.add_argument("--output", type=Path)
@@ -70,6 +72,8 @@ def main():
         ap.error("lengths/repetitions must be positive and warmup nonnegative")
     if args.quality_text and (args.arm != "paired" or args.quality_window < 256):
         ap.error("quality comparison requires --arm paired and window >= 256")
+    if args.prefix_probe and (args.arm != "paired" or args.quality_text):
+        ap.error("prefix probe requires --arm paired without --quality-text")
 
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
@@ -129,7 +133,7 @@ def main():
         max_num_batched_tokens=args.batch_tokens,
         max_num_seqs=1,
         gpu_memory_utilization=0.7,
-        enable_prefix_caching=False,
+        enable_prefix_caching=args.prefix_probe,
         disable_log_stats=False,
         **kwargs,
     )
@@ -146,7 +150,7 @@ def main():
             for n in ("vllm", "mlx", "mlx-lm", "mlx-vlm", "torch", "numpy")
         },
         "mlx_enable_tf32": os.getenv("MLX_ENABLE_TF32"),
-        "prefix_caching": False,
+        "prefix_caching": args.prefix_probe,
         "arguments": vars(args),
         "load_s": load_s,
     }
@@ -154,11 +158,13 @@ def main():
     summaries = []
     print(json.dumps({"metadata": metadata}, default=str), flush=True)
 
-    def run(ids, arm, phase, trial, *, quality=False):
+    def run(ids, arm, phase, trial, *, quality=False, allow_no_lane=False):
         nonlocal active_arm
         active_arm = arm
         reset_dispatch()
         mx.synchronize()
+        active_bytes = mx.get_active_memory()
+        mx.reset_peak_memory()
         start = time.perf_counter()
         result = llm.generate(
             [{"prompt_token_ids": ids}],
@@ -171,6 +177,7 @@ def main():
             use_tqdm=False,
         )[0]
         elapsed = time.perf_counter() - start
+        mx.synchronize()
         metrics = result.metrics
         ttft = getattr(metrics, "first_token_latency", None)
         if ttft is None or ttft <= 0:
@@ -183,9 +190,11 @@ def main():
             "tokens": list(result.outputs[0].token_ids),
             "ttft_s": ttft,
             "gen_wall_s": elapsed,
+            "num_cached_tokens": result.num_cached_tokens,
+            "peak_extra_bytes": max(0, mx.get_peak_memory() - active_bytes),
             "dispatch": dict(dispatch),
         }
-        if arm == "tq" and not dispatch["lane_layer_calls"]:
+        if arm == "tq" and not allow_no_lane and not dispatch["lane_layer_calls"]:
             raise RuntimeError(
                 "No prefill lane calls: check hardware opt-in, lengths and workspace budget"
             )
@@ -216,7 +225,53 @@ def main():
         return row
 
     try:
-        if args.quality_text:
+        if args.prefix_probe:
+            block_size = llm.llm_engine.vllm_config.cache_config.block_size
+            prefix_length = 2 * block_size + 1
+            if prefix_length + 256 > max_prompt:
+                raise ValueError(
+                    f"Prefix probe needs --prompt-tokens >= {prefix_length + 256}"
+                )
+            all_ids = tokenizer.encode(
+                PARA * ((prefix_length + 256) // 32 + 2), add_special_tokens=False
+            )[: prefix_length + 256]
+            for suffix in (0, 8, 256):
+                for arm in arms:
+                    if not llm.reset_prefix_cache():
+                        raise RuntimeError("Unable to reset the prefix cache")
+                    seed = run(all_ids[:prefix_length], arm, "prefix-seed", suffix)
+                    row = run(
+                        all_ids[: prefix_length + suffix],
+                        arm,
+                        "prefix-reuse",
+                        suffix,
+                        allow_no_lane=True,
+                    )
+                    if seed["num_cached_tokens"] != 0 or row["num_cached_tokens"] <= 0:
+                        raise RuntimeError("Prefix probe did not exercise a fresh hit")
+                    remaining = (
+                        len(all_ids[: prefix_length + suffix])
+                        - row["num_cached_tokens"]
+                    )
+                    # This probe uses the default GQA crossover. The final
+                    # dispatch record is authoritative for other geometries.
+                    if arm == "tq" and remaining < 128:
+                        assert row["dispatch"]["lane_layer_calls"] == 0
+                    if arm == "tq" and suffix == 256:
+                        assert row["dispatch"]["lane_layer_calls"] > 0
+                    summaries.append(
+                        {
+                            "kind": "prefix-reuse",
+                            "arm": arm,
+                            "block_size": block_size,
+                            "suffix_tokens": suffix,
+                            "remaining_query_tokens": remaining,
+                            "num_cached_tokens": row["num_cached_tokens"],
+                            "lane_layer_calls": row["dispatch"]["lane_layer_calls"],
+                            "ttft_s": row["ttft_s"],
+                        }
+                    )
+        elif args.quality_text:
             text = args.quality_text.read_text()
             token_ids = tokenizer.encode(text, add_special_tokens=False)
             needed = args.quality_windows * args.quality_window

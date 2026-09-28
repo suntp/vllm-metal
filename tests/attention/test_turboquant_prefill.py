@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from tools.benchmark.tq_prefill_case import build_case
+from vllm_metal.attention.caches.turboquant import get_v_centroids, turbo_quant_decode
 from vllm_metal.attention.impls import sdpa
 from vllm_metal.metal import get_ops
 
@@ -155,7 +156,7 @@ def test_independent_histories_batch_when_they_fit_workspace(
 
 
 def test_capacity_fallback_restores_interleaved_rows(recorded_ops, monkeypatch):
-    monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "16")
+    monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "5")
     case = build_case(
         qlens=(128, 1, 129, 5, 128), context_lens=(2049, 4097, 2063, 515, 2177)
     )
@@ -166,9 +167,10 @@ def test_capacity_fallback_restores_interleaved_rows(recorded_ops, monkeypatch):
     assert recorded_ops[-1][0][0].shape[0] == 263
 
 
-def test_prefill_scratch_does_not_scale_with_unrelated_histories():
+def test_prefill_scratch_does_not_scale_with_unrelated_histories(monkeypatch):
     import gc
 
+    monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "64")
     peaks = []
     for count in [1, 4]:
         case = build_case(
@@ -197,12 +199,13 @@ def test_prefill_scratch_does_not_scale_with_unrelated_histories():
 
 
 @pytest.mark.parametrize("k_quant,v_quant", [("q8_0", "q3_0"), ("q5_0", "q5_0")])
-def test_peak_materialization_fits_reserved_allowance(k_quant, v_quant):
+def test_peak_materialization_fits_reserved_allowance(monkeypatch, k_quant, v_quant):
     import gc
 
+    monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "64")
     case = build_case(
         qlens=(128,),
-        context_lens=(10880,),
+        context_lens=(14080,),
         head_dim=256,
         n_heads=24,
         n_kv_heads=4,
@@ -366,7 +369,7 @@ def test_over_budget_history_falls_back_before_dequantization(
     def no_dequant(*args):
         pytest.fail("over-budget history must not allocate dequantization buffers")
 
-    monkeypatch.setattr(sdpa, "prefill_dequantizers", no_dequant)
+    monkeypatch.setattr(sdpa, "materialize_turboquant_pages", no_dequant)
     output, reference = assert_parity(case)
     assert len(recorded_ops) == 1
     assert recorded_ops[0][1]["use_turboquant"]
@@ -374,8 +377,8 @@ def test_over_budget_history_falls_back_before_dequantization(
 
 
 def test_split_budget_includes_query_and_output_copies(recorded_ops, monkeypatch):
-    monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "8")
-    # KV alone fits 8 MiB, but gathering Q and reassembling this many query
+    monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "6")
+    # KV alone fits 6 MiB, but gathering Q and reassembling this many query
     # heads would exceed the reservation when splitting off the decode row.
     case = build_case(
         qlens=(128, 1),
@@ -433,6 +436,143 @@ def test_workspace_plan_key_includes_kv_geometry():
     ]
     assert all(plan is not None for plan in plans)
     assert plans[0] is not plans[1]
-    assert plans[1].workspace_bytes > 3 * plans[0].workspace_bytes
+    assert plans[1].workspace_bytes > plans[0].workspace_bytes
     assert plans[2] is not plans[0]
     assert plans[2].workspace_bytes > plans[0].workspace_bytes
+
+
+@pytest.mark.parametrize(
+    "working_mib,expected_mib",
+    [(8192, 256), (32768, 704), (53088, 1088), (262144, 2048)],
+)
+def test_auto_workspace_scales_with_device_and_keeps_a_ceiling(
+    monkeypatch, working_mib, expected_mib
+):
+    monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "auto")
+    monkeypatch.setattr(
+        mx,
+        "device_info",
+        lambda: {"max_recommended_working_set_size": working_mib * 2**20},
+    )
+    assert sdpa.prefill_workspace_bytes() == expected_mib * 2**20
+
+
+@pytest.mark.parametrize(
+    "setting,length,selected",
+    [("256", 65264, True), ("256", 65280, False), ("auto", 262144, True)],
+)
+def test_long_context_admission_with_fused_workspace(
+    monkeypatch, setting, length, selected
+):
+    case = build_case()
+    monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", setting)
+    monkeypatch.setattr(
+        mx,
+        "device_info",
+        lambda: {"max_recommended_working_set_size": 53088 * 2**20},
+    )
+    # Inspect long-context admission without allocating a full KV pool.
+    case.ctx.context_lens = [length]
+    case.ctx.block_tables = [list(range((length + 15) // 16))]
+    meta = sdpa._kernel_metadata(case.ctx, None, [], case.ctx.block_tables, 16)
+    plan = sdpa._turboquant_prefill_plan(
+        case.ctx, meta, case.ctx.block_tables, 16, 24, 4, 256
+    )
+    assert (plan is not None) == selected
+    if plan is not None:
+        assert plan.workspace_bytes <= sdpa.prefill_workspace_bytes()
+
+
+def test_materialization_workspace_does_not_accumulate_across_layers(monkeypatch):
+    monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "64")
+    case = build_case(
+        qlens=(128,), context_lens=(8192,), head_dim=256, n_heads=24, n_kv_heads=4
+    )
+
+    def chain():
+        x = case.x
+        for _ in range(8):
+            x = sdpa.sdpa_forward(case.inner, x, case.ctx, case.cache, 0)[0][..., :32]
+        return x
+
+    mx.eval(chain())
+    mx.synchronize()
+    mx.clear_cache()
+    before = mx.get_active_memory()
+    mx.reset_peak_memory()
+    result = chain()
+    mx.eval(result)
+    mx.synchronize()
+    # A lazy graph kept four 32 MiB K/V pairs alive at once. The reserved
+    # workspace must cover consecutive layers, not just an isolated call.
+    assert mx.get_peak_memory() - before < sdpa.prefill_workspace_bytes()
+    assert mx.all(mx.isfinite(result)).item()
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "k_quant,v_quant",
+    [
+        ("q8_0", "q3_0"),
+        ("q4_0", "q4_0"),
+        ("q5_0", "q5_0"),
+        ("int2", "q2_0"),
+        ("uint8", "q8_0"),
+    ],
+)
+def test_fused_materialization_matches_independent_decode(
+    head_dim, dtype, k_quant, v_quant
+):
+    # Strided scheduler pages also exercise byte/half view offsets in each
+    # packed cache field. The reference uses ordinary MLX operations.
+    case = build_case(
+        head_dim=head_dim,
+        dtype=dtype,
+        k_quant=k_quant,
+        v_quant=v_quant,
+        block_size=544,
+        page_padding=512,
+        qlens=(256,),
+        context_lens=(1153,),
+    )
+    mx.eval(case.forward())
+    meta = next(iter(case.ctx.kernel_metadata_cache.values()))
+    plan = next(plan for plan in meta.tq_prefill_plans.values() if plan is not None)
+    cache = case.cache
+    arrays = [
+        cache.key_caches[0],
+        cache.value_caches[0],
+        cache.key_scale_caches[0],
+        cache.key_zero_caches[0],
+        cache.value_scale_caches[0],
+    ]
+    actual = sdpa.materialize_turboquant_pages(
+        *arrays,
+        plan.pool_pages,
+        plan.pool_offsets,
+        get_v_centroids(cache.v_bits),
+        head_dim=head_dim,
+        key_quant_type=k_quant,
+        value_bits=cache.v_bits,
+        output_dtype=dtype,
+    )
+
+    def gather(array):
+        return array[plan.pool_pages, plan.pool_offsets]
+
+    expected = turbo_quant_decode(
+        (gather(arrays[0]), gather(arrays[2]), gather(arrays[3])),
+        (gather(arrays[1]), gather(arrays[4])),
+        output_dtype=dtype,
+        key_quant_type=k_quant,
+        value_bits=cache.v_bits,
+    )
+    mx.eval(*actual, *expected)
+    for value, reference in zip(actual, expected, strict=True):
+        np.testing.assert_allclose(
+            np.array(value.astype(mx.float32)),
+            np.array(reference.astype(mx.float32)),
+            atol=1e-5,
+            rtol=2 * mx.finfo(dtype).eps,
+        )

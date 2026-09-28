@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     VLLM_METAL_MLA_KERNEL: bool = False
     VLLM_METAL_DISABLE_NAX: bool = False
     VLLM_METAL_TQ_PREFILL: str = "auto"
-    VLLM_METAL_TQ_PREFILL_MAX_MIB: int = 256
+    VLLM_METAL_TQ_PREFILL_MAX_MIB: str = "auto"
     VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
     VLLM_METAL_SPEC_INGEST_CHUNK: int = 1024
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
@@ -97,10 +97,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TQ materialized prefill: auto enables only when NAX is available;
     # 1 explicitly opts into tiled prefill on older GPUs, 0 disables it.
     "VLLM_METAL_TQ_PREFILL": lambda: os.getenv("VLLM_METAL_TQ_PREFILL", "auto"),
-    # Absolute temporary-workspace allowance, deducted before KV sizing.
-    # Oversized histories stay compressed. Set before worker startup.
-    "VLLM_METAL_TQ_PREFILL_MAX_MIB": lambda: int(
-        os.getenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "256")
+    # Temporary-workspace allowance, deducted before KV sizing. Auto takes
+    # 2% of the recommended working set (256 MiB to 2 GiB). A numeric value
+    # sets an explicit MiB limit; 0 disables. Set before worker startup.
+    "VLLM_METAL_TQ_PREFILL_MAX_MIB": lambda: os.getenv(
+        "VLLM_METAL_TQ_PREFILL_MAX_MIB", "auto"
     ),
     # Spec-decode verification window mode (issue #465). Off by default —
     # verify windows keep the expanded per-token layout (main behavior)

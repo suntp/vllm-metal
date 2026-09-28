@@ -145,7 +145,9 @@ def cases(suite):
                         },
                     )
     elif suite == "limits":
-        for context in [8192, 10880, 10912, 10928, 16384, 131072]:
+        # Run with MAX_MIB=256 for the fixed-budget boundary, or leave auto
+        # enabled to exercise admission under the device-specific allowance.
+        for context in [8192, 16384, 65264, 65280, 65536, 131072]:
             yield (
                 f"cap-kv{context}",
                 dict(common, qlens=(128,), context_lens=(context,)),
@@ -164,9 +166,25 @@ def cases(suite):
             yield (
                 f"cap-formats-{kq}-{vq}",
                 dict(
-                    common, qlens=(128,), context_lens=(10880,), k_quant=kq, v_quant=vq
+                    common, qlens=(128,), context_lens=(16384,), k_quant=kq, v_quant=vq
                 ),
             )
+    elif suite == "long":
+        for context in [8192, 16384, 32768, 65536, 131072, 262144]:
+            yield (
+                f"long-kv{context}",
+                dict(common, qlens=(128,), context_lens=(context,)),
+            )
+        yield (
+            "independent4k-4",
+            dict(common, qlens=(128,) * 4, context_lens=(4096,) * 4),
+        )
+        yield (
+            "shared128k-4",
+            dict(
+                common, qlens=(128,) * 4, context_lens=(131072,) * 4, shared_prefix=True
+            ),
+        )
     else:
         for padding in [0, 512]:
             for pool in [1024, 16384]:
@@ -209,7 +227,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--suite",
-        choices=["crossover", "geometry", "memory", "limits"],
+        choices=["crossover", "geometry", "memory", "limits", "long"],
         default="crossover",
     )
     ap.add_argument("--reps", type=int, default=7)

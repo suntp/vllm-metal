@@ -47,8 +47,10 @@ from vllm_metal.attention.attention_contracts import (
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.turboquant import (
     prefill_bytes_per_token,
-    prefill_dequantizers,
     prefill_workspace_bytes,
+)
+from vllm_metal.attention.caches.turboquant_materialize import (
+    materialize_turboquant_pages,
 )
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.bidi_prefill import apply_bidirectional_segments
@@ -958,9 +960,9 @@ def sdpa_forward(
         # Rebind so next layer / decode step uses the updated cache
         kv_cache.replace_layer_cache(layer_idx, new_k_cache, new_v_cache)
 
-    # --- Attention: paged attention primitive (read-only, fully lazy) ---
-    # No per-layer eval or sync.  The primitive participates in MLX's lazy
-    # graph and is evaluated by the model runner at the end of the forward
+    # --- Attention: paged attention primitive (read-only) ---
+    # The primitive normally participates in MLX's lazy graph and is
+    # evaluated by the model runner at the end of the forward
     # pass.  Fence-based synchronisation across command buffer boundaries
     # works correctly because eval_gpu skips add_temporary (which would
     # remove buffers from the encoder's fence tracking).
@@ -1105,22 +1107,23 @@ def sdpa_forward(
                 0 if plan.fallback is None else plan.fallback.seq_lens.shape[0],
             )
 
-            # Index fresh writer handles in the original strided pool. A
-            # full-pool reshape would copy padded pages before the gather.
-            # These temporary buffers belong to the lazy attention graph;
-            # limiting the one materialized batch also bounds overlapping KV.
-            def gather(cache: mx.array) -> mx.array:
-                return cache[plan.pool_pages, plan.pool_offsets]
-
-            decode_key, decode_value = prefill_dequantizers(
-                kv_cache.k_quant, kv_cache.v_bits, q_3d.dtype
+            # Fresh writer handles preserve encode -> gather dependencies.
+            # The fused read respects padded upstream views and writes only
+            # the final K/V pair, without packed or FP32 temporary arrays.
+            k16, v16 = materialize_turboquant_pages(
+                new_k_cache,
+                new_v_cache,
+                new_key_scale_cache,
+                new_key_zero_cache,
+                new_value_scale_cache,
+                plan.pool_pages,
+                plan.pool_offsets,
+                v_centroids,
+                head_dim=q_3d.shape[2],
+                key_quant_type=kv_cache.k_quant,
+                value_bits=kv_cache.v_bits,
+                output_dtype=q_3d.dtype,
             )
-            k16 = decode_key(
-                gather(new_k_cache),
-                gather(new_key_scale_cache),
-                gather(new_key_zero_cache),
-            )
-            v16 = decode_value(gather(new_v_cache), gather(new_value_scale_cache))
             batch = plan.prefill
             query = q_3d if batch.query_indices is None else q_3d[batch.query_indices]
             ops.paged_attention_primitive(
@@ -1142,6 +1145,11 @@ def sdpa_forward(
                 fallback = plan.fallback
                 rest = quantized_attention(q_3d[fallback.query_indices], fallback)
                 out = mx.concatenate((out, rest), axis=0)[plan.restore_indices]
+            # Finish this lane before building the next layer. Otherwise MLX
+            # can keep several materialized K/V pairs in flight, multiplying
+            # the single workspace reserved by WorkerCachePlanner. Decode and
+            # the compressed fallback retain their fully lazy execution.
+            mx.eval(out)
     else:
         ops.paged_attention_primitive(
             q_3d,
