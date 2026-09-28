@@ -373,6 +373,22 @@ def test_over_budget_history_falls_back_before_dequantization(
     assert mx.array_equal(output, reference).item()
 
 
+def test_split_budget_includes_query_and_output_copies(recorded_ops, monkeypatch):
+    monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "8")
+    # KV alone fits 8 MiB, but gathering Q and reassembling this many query
+    # heads would exceed the reservation when splitting off the decode row.
+    case = build_case(
+        qlens=(128, 1),
+        context_lens=(1153, 32),
+        n_heads=64,
+        n_kv_heads=2,
+    )
+    output, reference = assert_parity(case)
+    assert len(recorded_ops) == 1
+    assert recorded_ops[0][1]["use_turboquant"]
+    assert mx.array_equal(output, reference).item()
+
+
 def test_128k_history_does_not_block_smaller_candidate(recorded_ops):
     # Admission only: reject the large row without allocating its cache.
     case = build_case(qlens=(128, 128), context_lens=(257, 257))
@@ -407,14 +423,16 @@ def test_rollout_requires_nax_or_explicit_opt_in(
 
 
 def test_workspace_plan_key_includes_kv_geometry():
-    case = build_case()
+    case = build_case(qlens=(128, 1), context_lens=(257, 16))
     meta = sdpa._kernel_metadata(case.ctx, None, [], case.ctx.block_tables, 16)
     plans = [
         sdpa._turboquant_prefill_plan(
-            case.ctx, meta, case.ctx.block_tables, 16, 8, heads, dim
+            case.ctx, meta, case.ctx.block_tables, 16, queries, heads, dim
         )
-        for heads, dim in [(2, 128), (4, 256)]
+        for queries, heads, dim in [(8, 2, 128), (8, 4, 256), (64, 2, 128)]
     ]
     assert all(plan is not None for plan in plans)
     assert plans[0] is not plans[1]
     assert plans[1].workspace_bytes > 3 * plans[0].workspace_bytes
+    assert plans[2] is not plans[0]
+    assert plans[2].workspace_bytes > plans[0].workspace_bytes

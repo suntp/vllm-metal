@@ -292,7 +292,14 @@ def _turboquant_prefill_plan(
         (_TQ_MIN_QUERIES_PER_KV_HEAD * num_kv_heads + num_query_heads - 1)
         // num_query_heads,
     )
-    key = (cache_block_size, min_tokens, num_kv_heads, head_dim, workspace_limit)
+    key = (
+        cache_block_size,
+        min_tokens,
+        num_query_heads,
+        num_kv_heads,
+        head_dim,
+        workspace_limit,
+    )
     if key in meta.tq_prefill_plans:
         return meta.tq_prefill_plans[key]
     assert ctx.cu_seqlens is not None
@@ -307,6 +314,9 @@ def _turboquant_prefill_plan(
     ratio = cache_block_size // kernel_bs
     bytes_per_block = kernel_bs * prefill_bytes_per_token(num_kv_heads, head_dim)
     block_limit = workspace_limit // bytes_per_block
+    # Splitting also gathers Q and concatenates/restores the outputs. Charge
+    # those three FP16/BF16 copies and both index arrays when any row falls back.
+    routing_bytes = cu_seqlens[-1] * (6 * num_query_heads * head_dim + 8)
     source_blocks: dict[int, int] = {}
     prefill_ids: list[int] = []
     rows: list[list[int]] = []
@@ -327,6 +337,8 @@ def _turboquant_prefill_plan(
         next_width = max(table_width, num_blocks)
         next_bytes = (len(source_blocks) + len(additions)) * bytes_per_block
         next_bytes += (len(rows) + 1) * next_width * 4
+        if len(prefill_ids) + 1 < len(lengths):
+            next_bytes += routing_bytes
         if next_bytes > workspace_limit:
             continue
         row = []
@@ -391,7 +403,9 @@ def _turboquant_prefill_plan(
         restore,
         pages,
         offsets,
-        len(source_blocks) * bytes_per_block + len(rows) * table_width * 4,
+        len(source_blocks) * bytes_per_block
+        + len(rows) * table_width * 4
+        + (routing_bytes if fallback_ids else 0),
     )
     meta.tq_prefill_plans[key] = plan
     return plan

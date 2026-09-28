@@ -40,6 +40,10 @@ starting the worker, rather than changing the budget while a cache is allocated.
 Admission accounts for both decoders, gathered inputs, final FP16/BF16 K/V,
 gather indices and the compact block table. Its conservative estimate is
 `gathered_tokens * (24 * KV_heads * head_dim + 16) + table_entries * 4` bytes.
+Mixed selected/fallback batches also charge
+`query_tokens * (6 * query_heads * head_dim + 8)` for query/output copies and
+reordering indices. Admission can conservatively reject a candidate that would
+need a split, even if selecting the entire batch at once could avoid those copies.
 The gathered length is rounded to the kernel block size. Requests exceeding the
 allowance use compressed attention **before** any dequantization allocation;
 smaller candidates can still be selected. Independent histories can batch when
@@ -126,7 +130,9 @@ same ground-truth history, rather than comparing logprobs after greedy outputs
 have already diverged. It reports aggregate perplexity, paired-window bootstrap
 NLL intervals, top-1 agreement and corpus/token-ID hashes. Record the corpus
 source, split and revision with the result. This small subset is a regression
-probe, not a full benchmark-quality evaluation.
+probe, not a full benchmark-quality evaluation. The auxiliary top-1 comparison
+uses the first returned rank-1 candidate on ties; it is not a greedy-generation
+agreement metric.
 
 Dequantization rounds K/V to the query dtype before attention, and NAX/tiled
 accumulation differs from the compressed kernel's deferred value transform.
