@@ -2,7 +2,7 @@
 """Scoped GQA decode routing, verified after the native primitive executes.
 
 The default optimization covers four measured attention geometries, one
-request, ordinary FP16/BF16 caches, scoped kernel pages, and long contexts.
+request, ordinary FP16/BF16 caches, scoped pages, and four context partitions.
 Numerical support for another shape does not authorize its default
 use. These tests inspect the actual dispatcher and compare both selected and
 fallback paths against attention references; timing is deliberately excluded.
@@ -62,23 +62,23 @@ def _assert_close(out: mx.array, ref: mx.array, dtype: mx.Dtype) -> None:
     )
 
 
-def _require_grid(kv_len: int, kv_heads: int) -> None:
+def _require_grid(kv_len: int, query_heads: int) -> None:
     """Positive route tests need the measured grid guard on this GPU."""
     cores = get_ops().detected_gpu_core_count()
     if cores <= 0:
         pytest.skip("GPU core count unavailable: GQA conservatively disabled")
-    if ((kv_len + 511) // 512) * kv_heads < 3 * cores:
+    if (kv_len // 64) * query_heads < 33 * cores:
         pytest.skip("This boundary is below the GQA grid guard on this GPU")
 
 
-def _eligible_context(kv_heads: int = NUM_KV_HEADS, minimum: int = 32768) -> int:
+def _eligible_context(query_heads: int = NUM_QUERY_HEADS, minimum: int = 32768) -> int:
     cores = get_ops().detected_gpu_core_count()
     if cores <= 0:
         pytest.skip("GPU core count unavailable: GQA conservatively disabled")
     # Round to whole partitions; this helper only sizes positive-test inputs.
     # Expected shape/length decisions are explicit in the boundary tests.
-    partitions = (3 * cores + kv_heads - 1) // kv_heads
-    n = max(minimum, partitions * 512)
+    partitions = (33 * cores + query_heads - 1) // query_heads
+    n = max(minimum, partitions * 64)
     return n
 
 
@@ -209,6 +209,8 @@ def _run_primitive(
     window_seqlen_q: int = 1,
     query_lens: list[int] | None = None,
     num_decode_requests: int = -1,
+    num_decode_tokens: int = 0,
+    max_decode_context_len: int = 0,
     gqa_disabled: bool = False,
     num_query_heads: int = NUM_QUERY_HEADS,
     num_kv_heads: int = NUM_KV_HEADS,
@@ -304,6 +306,8 @@ def _run_primitive(
         out,
         window_seqlen_q=window_seqlen_q,
         num_decode_requests=num_decode_requests,
+        num_decode_tokens=num_decode_tokens,
+        max_decode_context_len=max_decode_context_len,
         gqa_disabled=gqa_disabled,
         sinks=sinks,
         **quant_kwargs,
@@ -342,7 +346,6 @@ def test_gqa_decode_kernel_is_in_default_library() -> None:
         "default shader library is missing paged_attention_gqa_decode; "
         "rebuild with `python -m vllm_metal.metal.build`"
     )
-    assert ops.GQA_DECODE_MIN_SEQ_LEN == 32768
 
 
 def test_unknown_core_count_keeps_measured_shape_on_baseline() -> None:
@@ -407,7 +410,7 @@ def test_gqa_reads_upstream_views_after_writes_and_block_copy(
     from vllm_metal.attention.caches.storage import KVCacheStorage
     from vllm_metal.attention.impls.sdpa import _build_block_tables
 
-    n = _eligible_context(kv_heads) + 1
+    n = _eligible_context(q_heads) + 1
     pages = _interleaved_table((n + 1 + block_size - 1) // block_size)
     num_blocks = max(pages) + 2
     spec = FullAttentionSpec(
@@ -535,22 +538,24 @@ def test_one_decode_request_takes_gqa(num_decode_requests) -> None:
 
 
 @pytest.mark.parametrize(
-    "q,kv,head,minimum,block_size",
+    "q,kv,head,block_size",
     [
-        (32, 8, 128, 32768, 16),
-        (24, 4, 256, 32768, 16),
-        (16, 2, 128, 65536, 16),
-        (16, 2, 256, 32768, 16),
-        (16, 2, 256, 32768, 32),
+        (32, 8, 128, 16),
+        (24, 4, 256, 16),
+        (16, 2, 128, 16),
+        (16, 2, 256, 16),
+        (16, 2, 256, 32),
     ],
 )
 @pytest.mark.parametrize("offset", [-1, 0, 1])
-def test_each_geometry_lower_boundary_dispatch(
-    q, kv, head, minimum, block_size, offset
-):
+def test_each_geometry_lower_boundary_dispatch(q, kv, head, block_size, offset):
+    cores = get_ops().detected_gpu_core_count()
+    if cores <= 0:
+        pytest.skip("GPU core count unavailable")
+    minimum = 64 * ((33 * cores + q - 1) // q)
     n = minimum + offset
     if offset >= 0:
-        _require_grid(n, kv)
+        _require_grid(n, q)
     out, ref = _run_primitive(
         [n],
         mx.bfloat16,
@@ -581,7 +586,7 @@ def test_each_geometry_lower_boundary_dispatch(
 @pytest.mark.parametrize("n", [131071, 131072, 131073, 196608, 262144, 262145])
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 def test_each_geometry_continues_gqa_beyond_128k(q, kv, head, block_size, n, dtype):
-    _require_grid(n, kv)
+    _require_grid(n, q)
     out, ref = _run_primitive(
         [n],
         dtype,
@@ -599,11 +604,6 @@ def test_each_geometry_continues_gqa_beyond_128k(q, kv, head, block_size, n, dty
 @pytest.mark.parametrize(
     "q,kv,head,n",
     [
-        (16, 2, 128, 16384),  # Reproduced MiniCPM5 regression.
-        (16, 2, 128, 32768),  # Small measured gain deliberately omitted.
-        (32, 8, 128, 16384),
-        (24, 4, 256, 16384),
-        (16, 2, 256, 16384),
         (16, 4, 256, 16384),
         (16, 4, 256, 32768),  # Paired model-generation validation is unresolved.
         (16, 4, 256, 65536),
@@ -698,6 +698,25 @@ def test_prefill_and_mixed_batches_stay_off_gqa(query_lens):
     _assert_close(out, ref, mx.float16)
 
 
+@pytest.mark.parametrize("disabled", [False, True])
+def test_split_mixed_decode_stays_on_upstream_path(disabled, force_tiled_prefill):
+    """Splitting one decode row out of a mixed batch must not enable GQA."""
+    out, ref = _run_primitive(
+        [8192, 128],
+        mx.float16,
+        interleaved=True,
+        seed=720,
+        query_lens=[1, 32],
+        num_decode_requests=1,
+        num_decode_tokens=1,
+        max_decode_context_len=8192,
+        gqa_disabled=disabled,
+    )
+    assert _dispatch_family() == "mixed_prefill_decode"
+    assert get_ops().last_gqa_partition_size() == 0
+    _assert_close(out, ref, mx.float16)
+
+
 def test_spec_window_does_not_switch_kernel_family() -> None:
     out, ref = _run_primitive(
         [32768 + 4],
@@ -758,7 +777,7 @@ def test_gqa_disable_flag_forces_established_kernels(
 
     monkeypatch.delenv("VLLM_METAL_DISABLE_GQA_DECODE", raising=False)
     assert envs.VLLM_METAL_DISABLE_GQA_DECODE is False
-    n = _eligible_context(kv, minimum=minimum)
+    n = _eligible_context(q, minimum=minimum)
     shape = {
         "num_query_heads": q,
         "num_kv_heads": kv,
@@ -791,25 +810,24 @@ def test_gqa_disable_flag_forces_established_kernels(
 @pytest.mark.parametrize(
     "q,kv,head,n,cores,expected",
     [
-        (32, 8, 128, 32767, 40, False),
-        (32, 8, 128, 32768, 40, True),
-        (24, 4, 256, 32767, 40, False),
-        (24, 4, 256, 32768, 40, True),
-        (16, 2, 256, 32767, 40, False),
-        (16, 2, 256, 32768, 40, True),
-        (16, 4, 256, 32767, 40, False),
+        (32, 8, 128, 2687, 40, False),
+        (32, 8, 128, 2688, 40, True),
+        (24, 4, 256, 3519, 40, False),
+        (24, 4, 256, 3520, 40, True),
+        (16, 2, 256, 5311, 40, False),
+        (16, 2, 256, 5312, 40, True),
+        (16, 2, 128, 5311, 40, False),
+        (16, 2, 128, 5312, 40, True),
+        (32, 8, 128, 1343, 20, False),
+        (32, 8, 128, 1344, 20, True),
+        (16, 2, 128, 10559, 80, False),
+        (16, 2, 128, 10560, 80, True),
+        (16, 2, 128, 11391, 86, False),
+        (16, 2, 128, 11392, 86, True),
+        (24, 4, 256, 7615, 86, False),
+        (24, 4, 256, 7616, 86, True),
         (16, 4, 256, 32768, 40, False),
-        (16, 2, 256, 32768, 43, False),
-        (16, 2, 256, 32769, 43, True),
-        (16, 2, 128, 16384, 20, False),
-        (16, 2, 128, 32768, 40, False),
-        (16, 2, 128, 65535, 40, False),
-        (16, 2, 128, 65536, 40, True),
-        (16, 2, 128, 65536, 80, True),
-        (16, 2, 128, 65536, 86, False),  # Grid256 < 258.
-        (16, 2, 128, 65537, 86, True),  # Partial partition raises grid to258.
-        (24, 4, 256, 32768, 86, False),
-        (24, 4, 256, 32769, 86, True),
+        (32, 8, 128, 0, 40, False),
         (32, 8, 128, 131072, 40, True),
         (24, 4, 256, 131072, 40, True),
         (16, 2, 128, 131072, 40, True),
@@ -839,3 +857,63 @@ def test_gqa_disable_flag_forces_established_kernels(
 )
 def test_shape_and_device_performance_gate(q, kv, head, n, cores, expected):
     assert get_ops().gqa_decode_shape_eligible(q, kv, head, n, cores) == expected
+
+
+@pytest.mark.parametrize(
+    "q,kv,head,thresholds",
+    [
+        (32, 8, 128, [2688, 5376, 10752, 21504]),
+        (24, 4, 256, [3520, 7040, 14080, 28160]),
+        (16, 2, 128, [5312, 10624, 21248, 42496]),
+        (16, 2, 256, [5312, 10624, 21248, 42496]),
+    ],
+)
+def test_default_partition_thresholds(q, kv, head, thresholds):
+    ops = get_ops()
+    for previous, part, threshold in zip(
+        [0, 64, 128, 256], [64, 128, 256, 512], thresholds, strict=True
+    ):
+        assert ops.gqa_decode_partition_size(q, kv, head, threshold - 1, 40) == previous
+        assert ops.gqa_decode_partition_size(q, kv, head, threshold, 40) == part
+        assert ops.gqa_decode_partition_size(q, kv, head, threshold + 1, 40) == part
+
+
+@pytest.mark.parametrize(
+    "q,kv,head,block",
+    [
+        (32, 8, 128, 16),
+        (24, 4, 256, 16),
+        (16, 2, 128, 16),
+        (16, 2, 256, 16),
+        (16, 2, 256, 32),
+    ],
+)
+@pytest.mark.parametrize("part", [64, 128, 256, 512])
+@pytest.mark.parametrize("offset", [-1, 0, 17])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_default_partition_executes_and_matches_oracle(
+    q, kv, head, block, part, offset, dtype
+):
+    ops = get_ops()
+    cores = ops.detected_gpu_core_count()
+    if cores <= 0:
+        pytest.skip("GPU core count unavailable")
+    threshold = part * ((33 * cores + q - 1) // q)
+    out, ref = _run_primitive(
+        [threshold + offset],
+        dtype,
+        interleaved=True,
+        seed=719,
+        num_query_heads=q,
+        num_kv_heads=kv,
+        head_size=head,
+        block_size=block,
+        num_decode_requests=1,
+    )
+    expected = part if offset >= 0 else (0 if part == 64 else part // 2)
+    if expected:
+        assert _dispatch_family() == "gqa_decode"
+    else:
+        _assert_fallback()
+    assert ops.last_gqa_partition_size() == expected
+    _assert_close(out, ref, dtype)

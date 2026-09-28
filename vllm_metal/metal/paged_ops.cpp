@@ -40,19 +40,22 @@ void register_mlx_patch(nb::module_& m);
 
 static std::string v2_paged_attention_source_;
 constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
-// Default routing is limited to the documented long-context geometries.
-// Numerical shader support is broader than this empirical performance policy.
-constexpr int kGqaDecodeMinSeqLen = 32768;
 
 // Process-wide diagnostic for tests; not a per-request trace or routing input.
 enum class PagedDispatch {
   None, GqaDecode, PerToken, SplitKv, Window, WindowSplitKv, NaxPrefill,
-  TiledPrefill
+  TiledPrefill, MixedPrefillDecode
 };
 static std::atomic<PagedDispatch> g_last_dispatch{PagedDispatch::None};
-inline void record_paged_dispatch(PagedDispatch family) {
+static std::atomic<int> g_last_gqa_partition{0};
+inline void record_paged_dispatch(PagedDispatch family, int gqa_partition = 0) {
   g_last_dispatch.store(family, std::memory_order_relaxed);
+  g_last_gqa_partition.store(gqa_partition, std::memory_order_relaxed);
 }
+// Split only after eight KV partitions amortize the extra dispatch.
+constexpr int kMixedDecodeMinPartitions = 8;
+constexpr int kMixedDecodeMinContext =
+    kMixedDecodeMinPartitions * kPartitionSize;
 
 // Window mode for spec-decode verification (per-token kernel): query rows
 // per threadgroup (2 = the measured register/occupancy sweet spot on Apple
@@ -122,32 +125,38 @@ static int gpu_core_count() {
   return cores > 0 ? cores : 14;
 }
 
-// Conservative default scope, based on the measured single-request cases in
-// docs/gqa-decode.md. This is an empirical policy, not a universal cost model:
-// do not infer eligibility for unmeasured geometries from a byte-traffic proxy.
-// The MiniCPM-style 32K gain was small, so its default starts at 64K.
-// There is no additional GQA context ceiling: model, cache and primitive
-// resource limits still apply as they do to the established attention paths.
+// Keep default eligibility independent of model and device names.
+static bool gqa_decode_geometry_supported(int num_heads, int num_kv_heads,
+                                           int head_size) {
+  return (num_heads == 32 && num_kv_heads == 8 && head_size == 128) ||
+         (num_heads == 24 && num_kv_heads == 4 && head_size == 256) ||
+         (num_heads == 16 && num_kv_heads == 2 &&
+          (head_size == 128 || head_size == 256));
+}
+
+static int gqa_decode_partition_size(int num_heads, int num_kv_heads,
+                                      int head_size, int max_seq_len,
+                                      int gpu_cores) {
+  if (kPartitionSize != 512 || gpu_cores <= 0 || max_seq_len <= 0 ||
+      !gqa_decode_geometry_supported(num_heads, num_kv_heads, head_size))
+    return 0;
+  // One empirical SIMD-group budget for admission and every promotion.
+  // Core-count scaling does not imply cross-device performance validation.
+  constexpr int64_t kSimdGroupsPerCore = 33;
+  for (int p : {512, 256, 128, 64}) {
+    const int64_t full_partitions = static_cast<int64_t>(max_seq_len) / p;
+    if (full_partitions * num_heads >= kSimdGroupsPerCore * gpu_cores) return p;
+  }
+  // Only selection counts full partitions. Dispatch, scratch and reduction
+  // still use ceil(L / p), so no partial tail is discarded.
+  return 0;
+}
+
 static bool gqa_decode_shape_eligible(int num_heads, int num_kv_heads,
                                      int head_size, int max_seq_len,
                                      int gpu_cores) {
-  if (gpu_cores <= 0 || max_seq_len < kGqaDecodeMinSeqLen)
-    return false;
-  const bool measured_32k =
-      (num_heads == 32 && num_kv_heads == 8 && head_size == 128) ||
-      (num_heads == 24 && num_kv_heads == 4 && head_size == 256) ||
-      (num_heads == 16 && num_kv_heads == 2 && head_size == 256);
-  const bool measured_64k =
-      num_heads == 16 && num_kv_heads == 2 && head_size == 128 &&
-      max_seq_len >= 65536;
-  if (!measured_32k && !measured_64k) return false;
-
-  // Retain the conservative occupancy floor to avoid routing an underfilled
-  // GQA grid on a larger GPU. Core count is detected, not a device-name table.
-  // This guard does not promise that shared-GPU load cannot change the gain.
-  const int64_t partitions =
-      (static_cast<int64_t>(max_seq_len) + kPartitionSize - 1) / kPartitionSize;
-  return partitions * num_kv_heads >= 3LL * gpu_cores;
+  return gqa_decode_partition_size(num_heads, num_kv_heads, head_size,
+                                   max_seq_len, gpu_cores) > 0;
 }
 
 // Engage the split while the base decode grid (num_q_heads * num_seqs) stays
@@ -433,7 +442,7 @@ static void dispatch_paged_attention_tiled(
     int num_kv_heads, float scale, float softcap,
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
-    int block_size, int max_seq_len, int sliding_window,
+    int block_size, int max_seq_len, int sliding_window, int q_block_offset,
     TileConfig cfg, Stream s, const array* sinks,
     const array* mm_prefix_ranges) {
   auto& d = metal::device(s.device);
@@ -443,6 +452,12 @@ static void dispatch_paged_attention_tiled(
   int num_seqs   = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
 
   int total_q_blocks = total_q_tokens / cfg.BQ + num_seqs;
+  if (q_block_offset < 0 || q_block_offset > total_q_blocks) {
+    throw std::invalid_argument(
+        "dispatch_paged_attention_tiled: q_block_offset (" +
+        std::to_string(q_block_offset) + ") out of range for total_q_blocks "
+        "(" + std::to_string(total_q_blocks) + ")");
+  }
   bool use_sinks = sinks != nullptr;
   bool use_mm_prefix = mm_prefix_ranges != nullptr;
 
@@ -486,6 +501,7 @@ static void dispatch_paged_attention_tiled(
                           num_kv_heads, softcap, block_tables, seq_lens,
                           cu_seqlens_q, block_size, sliding_window);
   enc.set_bytes(scale, 9);
+  enc.set_bytes(q_block_offset, 30);
   if (use_sinks) {
     enc.set_input_array(*sinks, 18);
   }
@@ -496,7 +512,7 @@ static void dispatch_paged_attention_tiled(
   }
 
   enc.dispatch_threadgroups(
-      MTL::Size::Make(num_heads, total_q_blocks, 1),
+      MTL::Size::Make(num_heads, total_q_blocks - q_block_offset, 1),
       MTL::Size::Make(cfg.NUM_THREADS, 1, 1));
 }
 
@@ -511,10 +527,10 @@ static void dispatch_paged_attention_v2_reduce(
     const array& seq_lens, const array& cu_seqlens_q, int num_seqs,
     int total_q_tokens, int num_heads, int head_size, int max_num_partitions,
     const std::string& dt, bool use_sinks, const array* sinks,
-    bool use_tq_fc) {
+    bool use_tq_fc, int partition_size = kPartitionSize) {
   std::string rname =
       "paged_attention_v2_reduce_" + dt + "_hs" + std::to_string(head_size) +
-      "_nt256_nsl32_ps" + std::to_string(kPartitionSize);
+      "_nt256_nsl32_ps" + std::to_string(partition_size);
   // The reduce kernel reads only use_sinks (40) and use_turboquant (50); the
   // other function constants are inert for it.  TurboQuant batches take this
   // path (use_tq_fc varies: the TQ reduce applies the deferred inverse FWHT),
@@ -564,8 +580,7 @@ static void dispatch_paged_attention_v2_online(
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
     int block_size, int max_seq_len, int sliding_window,
-    int window_seqlen_q, int num_decode_requests, bool gqa_disabled,
-    Stream s,
+    int window_seqlen_q, Stream s,
     // TurboQuant (optional, all nullptr when disabled):
     const array* key_scale_cache = nullptr,
     const array* value_scale_cache = nullptr,
@@ -580,15 +595,20 @@ static void dispatch_paged_attention_v2_online(
     const array* sinks = nullptr,
     // Gemma 4 vision image-block ranges (optional): one inclusive absolute
     // [start, end] key range per query row, implemented in the tiled kernel.
-    const array* mm_prefix_ranges = nullptr) {
+    const array* mm_prefix_ranges = nullptr,
+    int num_decode_requests = -1,
+    int num_decode_tokens = 0,
+    int max_decode_context_len = 0,
+    int decode_only_rows = 0, bool gqa_disabled = false) {
   int head_size = static_cast<int>(query.shape(2));
 
   // Tiled kernel for prefill batches, matching vLLM Triton's 2D/3D dispatch
   // split.  Pure-decode batches (every sequence has exactly 1 query token)
   // use the original per-token kernel.
-  int total_q_tokens = static_cast<int>(query.shape(0));
+  int total_q_tokens = decode_only_rows > 0
+      ? decode_only_rows : static_cast<int>(query.shape(0));
   int num_seqs = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
-  bool has_prefill = total_q_tokens > num_seqs;
+  bool has_prefill = decode_only_rows == 0 && total_q_tokens > num_seqs;
   bool dtype_ok = query.dtype() != float32
                && query.dtype() == key_cache.dtype();
 
@@ -603,32 +623,62 @@ static void dispatch_paged_attention_v2_online(
   const bool window_batch =
       has_prefill && window_seqlen_q > 1 && head_size <= kWindowMaxHeadSize;
 
-  // TurboQuant stays excluded from the tiled kernel.  Sink prefill can use it:
+  const bool use_nax = has_prefill && !window_batch && !use_turboquant
+      && dtype_ok && mm_prefix_ranges == nullptr
+      && nax_eligible(query.dtype(), head_size, block_size);
+  const auto tile_config = has_prefill && !window_batch && !use_turboquant
+      && dtype_ok ? select_tile_config(head_size) : std::nullopt;
+
+  // Split long ordinary decode rows from tiled prefill. Keep spec and NAX on
+  // their established whole-batch routes.
+  const bool split_mixed_batch = num_decode_requests > 0
+      && num_decode_requests < num_seqs
+      && num_decode_tokens == num_decode_requests
+      && max_decode_context_len >= kMixedDecodeMinContext
+      && !use_nax && tile_config.has_value();
+  if (split_mixed_batch) {
+    dispatch_paged_attention_v2_online(
+        out, query, key_cache, value_cache,
+        num_kv_heads, scale, softcap,
+        block_tables, seq_lens, cu_seqlens_q,
+        block_size, max_seq_len, sliding_window, window_seqlen_q, s,
+        key_scale_cache, value_scale_cache, key_zero_cache, v_centroids,
+        use_turboquant, k_bits, v_bits, sinks, nullptr,
+        num_decode_requests, num_decode_tokens, max_decode_context_len,
+        num_decode_tokens, gqa_disabled);
+    const int q_block_offset =
+        num_decode_tokens / tile_config->BQ + num_decode_requests;
+    dispatch_paged_attention_tiled(
+        out, query, key_cache, value_cache,
+        num_kv_heads, scale, softcap,
+        block_tables, seq_lens, cu_seqlens_q,
+        block_size, max_seq_len, sliding_window, q_block_offset,
+        *tile_config, s, sinks, mm_prefix_ranges);
+    record_paged_dispatch(PagedDispatch::MixedPrefillDecode);
+    return;
+  }
+
+  // TurboQuant stays excluded from the tiled kernel. Sink prefill can use it:
   // pagedattention_tiled.metal folds the sink into each row's denominator-only
   // softmax state before final normalization.
-  if (has_prefill && !window_batch && !use_turboquant && dtype_ok) {
-    // Image-block ranges are implemented in the tiled kernel only; NAX keeps
-    // its causal/window mask, so a batch with ranges bypasses it.
-    if (mm_prefix_ranges == nullptr
-        && nax_eligible(query.dtype(), head_size, block_size)) {
-      record_paged_dispatch(PagedDispatch::NaxPrefill);
-      dispatch_paged_attention_nax(
-          out, query, key_cache, value_cache,
-          num_kv_heads, scale, softcap,
-          block_tables, seq_lens, cu_seqlens_q,
-          block_size, sliding_window, s, sinks);
-      return;
-    }
-    if (auto cfg = select_tile_config(head_size)) {
-      record_paged_dispatch(PagedDispatch::TiledPrefill);
-      dispatch_paged_attention_tiled(
-          out, query, key_cache, value_cache,
-          num_kv_heads, scale, softcap,
-          block_tables, seq_lens, cu_seqlens_q,
-          block_size, max_seq_len, sliding_window, *cfg, s, sinks,
-          mm_prefix_ranges);
-      return;
-    }
+  if (use_nax) {
+    record_paged_dispatch(PagedDispatch::NaxPrefill);
+    dispatch_paged_attention_nax(
+        out, query, key_cache, value_cache,
+        num_kv_heads, scale, softcap,
+        block_tables, seq_lens, cu_seqlens_q,
+        block_size, sliding_window, s, sinks);
+    return;
+  }
+  if (tile_config) {
+    record_paged_dispatch(PagedDispatch::TiledPrefill);
+    dispatch_paged_attention_tiled(
+        out, query, key_cache, value_cache,
+        num_kv_heads, scale, softcap,
+        block_tables, seq_lens, cu_seqlens_q,
+        block_size, max_seq_len, sliding_window, 0,
+        *tile_config, s, sinks, mm_prefix_ranges);
+    return;
   }
   if (mm_prefix_ranges != nullptr) {
     // paged_attention_primitive_fn already rejects every such batch eagerly;
@@ -701,13 +751,22 @@ static void dispatch_paged_attention_v2_online(
   // Only measured single-request shapes use the new pass. Keep policy below
   // the Python boundary so direct primitive callers obey the same scope.
   const bool gqa_single_request =
-      num_seqs == 1 && (num_decode_requests == -1 || num_decode_requests == 1);
+      decode_only_rows == 0 && num_seqs == 1 &&
+      (num_decode_requests == -1 || num_decode_requests == 1);
   // Hybrid scheduler pages of 1056 tokens translate to a 32-token kernel
   // view. Keep this additional page size limited to its measured geometry.
   const bool gqa_page_size =
       block_size == 16 ||
       (block_size == 32 && num_heads == 16 && num_kv_heads == 2 &&
        head_size == 256);
+  const int gqa_partition_size = gqa_decode_partition_size(
+      num_heads, num_kv_heads, head_size, max_seq_len, detected_gpu_core_count());
+  const int64_t gqa_partitions = gqa_partition_size > 0
+      ? (static_cast<int64_t>(max_seq_len) + gqa_partition_size - 1) /
+            gqa_partition_size : 0;
+  // The reducer needs two FP32 values per partition, aligned for Metal.
+  const uint64_t gqa_reduce_bytes =
+      (static_cast<uint64_t>(gqa_partitions) * 8 + 15) & ~uint64_t(15);
   const bool gqa_decode =
       !gqa_disabled
       && pure_decode && window_seqlen_q <= 1 && gqa_single_request
@@ -715,15 +774,16 @@ static void dispatch_paged_attention_v2_online(
       && dtype_ok && query.dtype() == value_cache.dtype()
       && !use_turboquant && softcap <= 0.f && sinks == nullptr
       && sliding_window < 0 && gqa_page_size
-      && gqa_decode_shape_eligible(num_heads, num_kv_heads, head_size,
-                                  max_seq_len, detected_gpu_core_count());
+      && gqa_partition_size > 0
+      && gqa_reduce_bytes <= d.mtl_device()->maxThreadgroupMemoryLength();
   if (gqa_decode) {
+    const int gqa_num_partitions = static_cast<int>(gqa_partitions);
     const int gqa_group = num_heads / num_kv_heads;
-    record_paged_dispatch(PagedDispatch::GqaDecode);
+    record_paged_dispatch(PagedDispatch::GqaDecode, gqa_partition_size);
     std::string gname =
         "paged_attention_gqa_decode_" + dt + "_hs" + std::to_string(head_size) +
         "_bs" + std::to_string(block_size) + "_ps" +
-        std::to_string(kPartitionSize);
+        std::to_string(gqa_partition_size);
     // Instantiated in pagedattention.metal and shipped in the v2 metallib.
     // A missing specialization is a build/packaging bug: fail loudly
     // rather than silently drop eligible long decode back to the slower
@@ -731,12 +791,12 @@ static void dispatch_paged_attention_v2_online(
     auto* gkernel = d.get_kernel(gname, lib, gname, {});
 
     array g_tmp_out = make_temp(
-        Shape{total_q_tokens, num_heads, max_num_partitions, head_size},
+        Shape{total_q_tokens, num_heads, gqa_num_partitions, head_size},
         query.dtype());
     array g_exp_sums =
-        make_temp(Shape{total_q_tokens, num_heads, max_num_partitions}, float32);
+        make_temp(Shape{total_q_tokens, num_heads, gqa_num_partitions}, float32);
     array g_max_logits =
-        make_temp(Shape{total_q_tokens, num_heads, max_num_partitions}, float32);
+        make_temp(Shape{total_q_tokens, num_heads, gqa_num_partitions}, float32);
 
     // Binds mirror paged_attention_gqa_decode's signature exactly (the
     // kernel declares only these slots; no shared-mem carve).
@@ -769,14 +829,14 @@ static void dispatch_paged_attention_v2_online(
     // One threadgroup per (partition, kv head, sequence); each simdgroup
     // owns one query head of the GQA group.
     enc.dispatch_threadgroups(
-        MTL::Size::Make(max_num_partitions, num_kv_heads, num_seqs),
+        MTL::Size::Make(gqa_num_partitions, num_kv_heads, num_seqs),
         MTL::Size::Make(32 * gqa_group, 1, 1));
 
     dispatch_paged_attention_v2_reduce(
         d, enc, out, g_exp_sums, g_max_logits, g_tmp_out, seq_lens,
         cu_seqlens_q, num_seqs, total_q_tokens, num_heads, head_size,
-        max_num_partitions, dt, /*use_sinks=*/false, nullptr,
-        /*use_tq_fc=*/false);
+        gqa_num_partitions, dt, /*use_sinks=*/false, nullptr,
+        /*use_tq_fc=*/false, gqa_partition_size);
     return;
   }
 
@@ -926,8 +986,9 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
       int block_size, int max_seq_len, int sliding_window,
       bool use_turboquant = false, int k_bits = 8, int v_bits = 3,
       int window_seqlen_q = 1, bool use_sinks = false,
-      bool use_mm_prefix = false,
-      int num_decode_requests = -1, bool gqa_disabled = false)
+      bool use_mm_prefix = false, int num_decode_requests = -1,
+      int num_decode_tokens = 0, int max_decode_context_len = 0,
+      bool gqa_disabled = false)
       : UnaryPrimitive(stream),
         num_kv_heads_(num_kv_heads), scale_(scale), softcap_(softcap),
         block_size_(block_size), max_seq_len_(max_seq_len),
@@ -936,6 +997,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         window_seqlen_q_(window_seqlen_q), use_sinks_(use_sinks),
         use_mm_prefix_(use_mm_prefix),
         num_decode_requests_(num_decode_requests),
+        num_decode_tokens_(num_decode_tokens),
+        max_decode_context_len_(max_decode_context_len),
         gqa_disabled_(gqa_disabled) {}
 
   void eval_cpu(const std::vector<array>&, array&) override {
@@ -966,9 +1029,10 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         num_kv_heads_, scale_, softcap_,
         inputs[3], inputs[4], inputs[5],  // block_tables, seq_lens, cu_seqlens_q
         block_size_, max_seq_len_, sliding_window_, window_seqlen_q_,
-        num_decode_requests_, gqa_disabled_,
         stream(),
-        ks, vs, kz, vc, use_turboquant_, k_bits_, v_bits_, sk, mp);
+        ks, vs, kz, vc, use_turboquant_, k_bits_, v_bits_, sk, mp,
+        num_decode_requests_, num_decode_tokens_, max_decode_context_len_,
+        0, gqa_disabled_);
   }
 
   const char* name() const override { return "PagedAttention"; }
@@ -987,6 +1051,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         && rhs->use_sinks_ == use_sinks_
         && rhs->use_mm_prefix_ == use_mm_prefix_
         && rhs->num_decode_requests_ == num_decode_requests_
+        && rhs->num_decode_tokens_ == num_decode_tokens_
+        && rhs->max_decode_context_len_ == max_decode_context_len_
         && rhs->gqa_disabled_ == gqa_disabled_;
   }
 
@@ -1004,6 +1070,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
   bool use_sinks_;
   bool use_mm_prefix_;
   int num_decode_requests_;
+  int num_decode_tokens_;
+  int max_decode_context_len_;
   bool gqa_disabled_;
 };
 
@@ -1022,7 +1090,9 @@ static array paged_attention_primitive_fn(
     int v_bits = 3, int window_seqlen_q = 1,
     const array* sinks = nullptr,
     const array* mm_prefix_ranges = nullptr,
-    int num_decode_requests = -1, bool gqa_disabled = false) {
+    int num_decode_requests = -1,
+    int num_decode_tokens = 0,
+    int max_decode_context_len = 0, bool gqa_disabled = false) {
   if (sinks != nullptr) {
     // Upstream MLX refuses the same combination
     // (mlx_lm/models/base.py: "Quantized SDPA does not support attention
@@ -1149,7 +1219,8 @@ static array paged_attention_primitive_fn(
       num_kv_heads, scale, softcap,
       block_size, max_seq_len, sliding_window,
       use_turboquant, k_bits, v_bits, window_seqlen_q, sinks != nullptr,
-      mm_prefix_ranges != nullptr, num_decode_requests, gqa_disabled);
+      mm_prefix_ranges != nullptr, num_decode_requests, num_decode_tokens,
+      max_decode_context_len, gqa_disabled);
   std::vector<array> inputs = {query, key_cache, value_cache,
                                block_tables, seq_lens, cu_seqlens_q};
   if (use_turboquant) {
@@ -1927,9 +1998,17 @@ static std::vector<array> gdn_linear_attention_primitive_fn(
 NB_MODULE(_paged_ops, m) {
   register_mlx_patch(m);
   m.attr("PARTITION_SIZE") = nb::int_(kPartitionSize);
-  m.attr("GQA_DECODE_MIN_SEQ_LEN") = nb::int_(kGqaDecodeMinSeqLen);
   m.def("detected_gpu_core_count", &detected_gpu_core_count,
         "Detected GPU core count, or zero when detection is unavailable.");
+  m.def("gqa_decode_partition_size", &gqa_decode_partition_size,
+        nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
+        nb::arg("max_seq_len"), nb::arg("gpu_cores"),
+        "Default GQA partition in the measured geometry scope, or zero. "
+        "Functional dispatch checks also apply.");
+  m.def("last_gqa_partition_size", []() {
+    return g_last_gqa_partition.load(std::memory_order_relaxed);
+  }, "Partition selected by the most recent paged eval, or zero for a fallback. "
+     "Process-wide diagnostic; not a request trace or routing input.");
   m.def("gqa_decode_shape_eligible", &gqa_decode_shape_eligible,
         nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
         nb::arg("max_seq_len"), nb::arg("gpu_cores"),
@@ -1947,15 +2026,25 @@ NB_MODULE(_paged_ops, m) {
           // Check every shipped specialization even on hosts whose missing
           // core count keeps the positive dispatch tests on the fallback.
           for (const char* dtype : {"half", "bfloat16_t"}) {
-            for (int head : {128, 256}) {
-              for (int block : {16, 32}) {
-                if (head == 128 && block == 32) continue;
-                std::string name =
-                    "paged_attention_gqa_decode_" + std::string(dtype) +
-                    "_hs" + std::to_string(head) + "_bs" +
-                    std::to_string(block) + "_ps" +
-                    std::to_string(kPartitionSize);
-                if (d.get_kernel(name, lib, name, {}) == nullptr) return false;
+            for (int part : {64, 128, 256, 512}) {
+              for (int head : {128, 256}) {
+                const std::string reducer =
+                    "paged_attention_v2_reduce_" + std::string(dtype) +
+                    "_hs" + std::to_string(head) + "_nt256_nsl32_ps" +
+                    std::to_string(part);
+                bool no = false;
+                if (d.get_kernel(reducer, lib, reducer + "_gqa_check",
+                    {{&no, MTL::DataType::DataTypeBool, NS::UInteger(40)},
+                     {&no, MTL::DataType::DataTypeBool, NS::UInteger(50)}})
+                    == nullptr) return false;
+                for (int block : {16, 32}) {
+                  if (head == 128 && block == 32) continue;
+                  const std::string name =
+                      "paged_attention_gqa_decode_" + std::string(dtype) +
+                      "_hs" + std::to_string(head) + "_bs" +
+                      std::to_string(block) + "_ps" + std::to_string(part);
+                  if (d.get_kernel(name, lib, name, {}) == nullptr) return false;
+                }
               }
             }
           }
@@ -2000,6 +2089,10 @@ NB_MODULE(_paged_ops, m) {
   m.def("supports_mm_prefix", []() { return true; },
         "True when paged_attention_primitive accepts mm_prefix_ranges "
         "(Gemma 4 vision image-block attention in the tiled prefill kernel).");
+
+  m.def("supports_decode_routing_metadata", []() { return true; },
+        "True when paged_attention_primitive accepts mixed-batch decode "
+        "routing metadata.");
 
   m.def("tq_encode",
         [](nb::handle key_h, nb::handle value_h,
@@ -2156,7 +2249,8 @@ NB_MODULE(_paged_ops, m) {
            nb::object sinks_h,
            nb::object mm_prefix_ranges_h,
            int num_decode_requests,
-           bool gqa_disabled) {
+           int num_decode_tokens,
+           int max_decode_context_len, bool gqa_disabled) {
           const array* sk = sinks_h.is_none()
               ? nullptr : nb::inst_ptr<array>(sinks_h);
           const array* mp = mm_prefix_ranges_h.is_none()
@@ -2179,7 +2273,8 @@ NB_MODULE(_paged_ops, m) {
               *nb::inst_ptr<array>(cu_seqlens_q_h),
               block_size, max_seq_len, sliding_window,
               use_turboquant, quant_type, ks, vs, kz, vc, v_bits,
-              window_seqlen_q, sk, mp, num_decode_requests, gqa_disabled);
+              window_seqlen_q, sk, mp, num_decode_requests,
+              num_decode_tokens, max_decode_context_len, gqa_disabled);
           nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
         },
         nb::arg("query"),
@@ -2201,6 +2296,8 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("sinks") = nb::none(),
         nb::arg("mm_prefix_ranges") = nb::none(),
         nb::arg("num_decode_requests") = -1,
+        nb::arg("num_decode_tokens") = 0,
+        nb::arg("max_decode_context_len") = 0,
         nb::arg("gqa_disabled") = false,
         "Paged attention primitive (read-only). Cache writes are handled "
         "by MLX-native scatter upstream.  window_seqlen_q must equal the "
@@ -2224,14 +2321,14 @@ NB_MODULE(_paged_ops, m) {
       []() {
         static constexpr const char* names[] = {
             "", "gqa_decode", "per_token_ps0", "per_token_ps512", "window_ps0",
-            "window_ps512", "nax_prefill", "tiled_prefill"};
+            "window_ps512", "nax_prefill", "tiled_prefill", "mixed_prefill_decode"};
         return names[static_cast<size_t>(
             g_last_dispatch.load(std::memory_order_relaxed))];
       },
       "Dispatch family chosen by the most recent paged_attention_primitive "
       "eval (\"gqa_decode\", \"per_token_ps0\", \"per_token_ps512\", "
       "\"window_ps0\", \"window_ps512\", \"nax_prefill\", "
-      "\"tiled_prefill\").  Diagnostic surface for routing tests; empty "
+      "\"tiled_prefill\", \"mixed_prefill_decode\"). Diagnostic surface for routing tests; empty "
       "before the first eval.");
 
   m.def("gdn_linear_attention",

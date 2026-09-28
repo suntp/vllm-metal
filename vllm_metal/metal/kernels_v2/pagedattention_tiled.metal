@@ -134,6 +134,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     const constant int &sliding_window [[buffer(21)]],
     device const int32_t *mm_prefix_ranges
     [[buffer(22), function_constant(use_mm_prefix)]],
+    const constant int &q_block_offset [[buffer(30)]],
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 tgp [[threadgroup_position_in_grid]],
     uint3 tgpg [[threadgroups_per_grid]],
@@ -154,7 +155,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
 
   const int thread_idx = tpt.x;
   const int head_idx = tgp.x;
-  const int q_block_global_idx = tgp.y;
+  const int q_block_global_idx = int(tgp.y) + q_block_offset;
   const int num_heads = tgpg.x;
   const int num_queries_per_kv = num_heads / num_kv_heads;
   const int kv_head_idx = head_idx / num_queries_per_kv;
@@ -605,6 +606,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
       const constant int &sliding_window [[buffer(21)]],                       \
       device const int32_t *mm_prefix_ranges                                   \
       [[buffer(22), function_constant(use_mm_prefix)]],                        \
+      const constant int &q_block_offset [[buffer(30)]],                       \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
       uint3 tgp [[threadgroup_position_in_grid]],                              \
       uint3 tgpg [[threadgroups_per_grid]],                                    \

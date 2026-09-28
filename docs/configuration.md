@@ -6,9 +6,9 @@
 |----------|---------|-------------|
 | `VLLM_MLX_DEVICE` | `gpu` | MLX device (`gpu` or `cpu`) |
 | `VLLM_METAL_DISABLE_NAX` | `0` | Emergency override for automatic M5 NAX prefill attention. Set to `1` to force the non-NAX fallback. |
-| `VLLM_METAL_DISABLE_GQA_DECODE` | `0` | Set to `1` to keep eligible single-request decode on the established per-token / split-KV kernels. Automatic GQA routing is limited to the [measured geometries, kernel page sizes and context minima](gqa-decode.md), starting at 32K or 64K. This switch only disables the optimization. |
+| `VLLM_METAL_DISABLE_GQA_DECODE` | `0` | Set to `1` to keep eligible single-request decode on the established per-token / split-KV kernels. Automatic GQA routing is limited to the [measured geometries, kernel page sizes and context minima](gqa-decode.md), using the largest of 64/128/256/512-token partitions whose complete-partition SIMD count reaches 33 per detected GPU core. This switch only disables the optimization. |
 | `VLLM_METAL_MULTIMODAL_MODE` | `auto` | Multimodal serve mode: `auto` uses the compatibility allowlist (Gemma 4 gets the vision sidecar when its checkpoint allows); `multimodal-native` disables overrides; `text-only` forces the text-only path for every multimodal checkpoint |
-| `VLLM_METAL_MM_PREFIX_PATH` | `kernel` | Gemma 4 image-block attention path: `kernel` hands each query row's image-block range to the tiled Metal prefill kernel; `recompute` keeps the MLX SDPA recompute of the block rows after the kernel (the reference path). Any other value is rejected at first use |
+| `VLLM_METAL_MM_PREFIX_PATH` | `kernel` | Gemma 4 image-block attention path: `kernel` hands each query row's image-block range to the tiled Metal prefill kernel; `recompute` keeps the MLX SDPA recompute of the block rows after the kernel (the reference path). A model with image blocks rejects any other value at startup |
 | `VLLM_USE_MODELSCOPE` | `False` | Set True to change model registry to <https://www.modelscope.cn/> |
 | `VLLM_METAL_MODELSCOPE_CACHE` | None | Specify the absolute path of the local model |
 | `VLLM_METAL_GDN_LAZY_KERNELS` | `1` | Enable lazy GDN kernels for eligible hybrid batches. Set to `0` to force the eager conv / C++ recurrent fallback path. |

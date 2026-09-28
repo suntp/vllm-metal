@@ -67,6 +67,26 @@ Its committed KV and speculative lookahead share the Metal KV memory budget
 with the target. The scheduler allocates both; no separate draft scratch pool
 is reserved. Drafting stops when its write span would exceed the smaller of
 the draft model's context limit and the engine's final target context limit.
+When no configured positive draft width can fit, the engine logs the request
+and effective context limit once and continues with target-only decoding.
+Temporary dynamic-width skips and K=0 steps do not trigger this message.
+
+For benchmark diagnostics, read one statistics snapshot per worker. The RPC
+returns a list with one entry per worker (`None` for non-draft-model workers):
+
+```python
+stats_per_worker = llm.collective_rpc("get_draft_model_stats")
+stats = stats_per_worker[0]  # single-worker setups
+```
+
+Each ordinary draft-model worker returns `num_context_limit_fallback_requests`,
+`min_draft_tokens`, and `max_model_len`. The counter counts affected request
+lifetimes once, survives preemption and completion, and resets when the drafter
+is recreated. Reading it does not reset it. `min_draft_tokens` is the smallest
+positive width reachable in the configured batch-size schedule (zero if all
+widths are zero); `max_model_len` is the effective target/draft limit.
+Other decoding methods return `None`. These worker diagnostics are not exported
+as Prometheus metrics or added to vLLM's scheduler statistics.
 
 ### Example
 

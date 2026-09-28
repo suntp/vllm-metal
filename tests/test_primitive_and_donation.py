@@ -108,6 +108,7 @@ def test_primitive_vs_reference_decode(
     mx.random.seed(0)
     num_query_heads, num_kv_heads = num_heads
     d = _make_cache_and_inputs(num_blocks, num_kv_heads, num_query_heads, seq_lens)
+    num_decode_requests = len(seq_lens)
 
     ops = get_ops()
     out = mx.array(0)
@@ -125,6 +126,9 @@ def test_primitive_vs_reference_decode(
         d["max_kv_len"],
         sliding_window,
         out,
+        num_decode_requests=num_decode_requests,
+        num_decode_tokens=num_decode_requests,
+        max_decode_context_len=max(kv_len for _, kv_len in seq_lens),
     )
     mx.eval(out)
 
@@ -153,6 +157,8 @@ def test_primitive_vs_reference_decode(
     [
         [(1, 1328), (5, 18), (129, 463)],
         [(1, 523), (1, 37), (1, 2011)],
+        # Decode prefix crosses the tiled kernel's 32-row block boundary.
+        [(1, 4096)] + [(1, 64)] * 32 + [(32, 64)],
         # Prefill-only: all q_len > 1, guarantees tiled kernel dispatch
         # (total_q_tokens > num_seqs).
         [(8, 128), (16, 256)],
@@ -176,6 +182,14 @@ def test_primitive_vs_reference_varlen(
     mx.random.seed(0)
     num_query_heads, num_kv_heads = num_heads
     d = _make_cache_and_inputs(num_blocks, num_kv_heads, num_query_heads, seq_lens)
+    num_decode_requests = 0
+    for query_len, _ in seq_lens:
+        if query_len != 1:
+            break
+        num_decode_requests += 1
+    max_decode_context_len = max(
+        (seq_lens[i][1] for i in range(num_decode_requests)), default=0
+    )
 
     ops = get_ops()
     out = mx.array(0)
@@ -193,6 +207,9 @@ def test_primitive_vs_reference_varlen(
         d["max_kv_len"],
         sliding_window,
         out,
+        num_decode_requests=num_decode_requests,
+        num_decode_tokens=num_decode_requests,
+        max_decode_context_len=max_decode_context_len,
     )
     mx.eval(out)
 
@@ -214,6 +231,84 @@ def test_primitive_vs_reference_varlen(
         atol=1.5e-2,
         rtol=1e-2,
     )
+
+
+@pytest.mark.parametrize(
+    "decode_context,head_size,split_decode",
+    [
+        (512, 128, False),
+        (4095, 128, False),
+        (4096, 128, True),
+        (4096, 256, True),
+        (4096, 512, True),
+    ],
+)
+def test_mixed_batch_dispatches_decode_by_context(
+    decode_context: int,
+    head_size: int,
+    split_decode: bool,
+    force_tiled_prefill,
+) -> None:
+    """Only long decode contexts pay for a separate kernel dispatch."""
+    decode_rows = 33
+    seq_lens = [(1, decode_context)] + [(1, 64)] * (decode_rows - 1) + [(32, 64)]
+    mx.random.seed(0)
+    d = _make_cache_and_inputs(512, 2, 8, seq_lens, head_size=head_size)
+    ops = get_ops()
+
+    def run_attention(
+        query: mx.array,
+        block_tables: mx.array,
+        kv_lens: mx.array,
+        cu_seqlens: mx.array,
+        decode_count: int = 0,
+        max_context: int = 0,
+    ) -> np.ndarray:
+        out = mx.array(0)
+        ops.paged_attention_primitive(
+            query,
+            d["key_cache"],
+            d["value_cache"],
+            d["num_kv_heads"],
+            d["scale"],
+            0.0,
+            block_tables,
+            kv_lens,
+            cu_seqlens,
+            BLOCK_SIZE,
+            d["max_kv_len"],
+            -1,
+            out,
+            num_decode_requests=decode_count,
+            num_decode_tokens=decode_count,
+            max_decode_context_len=max_context,
+        )
+        mx.eval(out)
+        return np.array(out)
+
+    mixed = run_attention(
+        d["query"],
+        d["block_tables"],
+        d["kv_lens_arr"],
+        d["cu_seqlens_q"],
+        decode_rows,
+        decode_context,
+    )
+    whole_tiled = run_attention(
+        d["query"], d["block_tables"], d["kv_lens_arr"], d["cu_seqlens_q"]
+    )
+    pure_decode = run_attention(
+        d["query"][:decode_rows],
+        d["block_tables"][:decode_rows],
+        d["kv_lens_arr"][:decode_rows],
+        mx.arange(decode_rows + 1, dtype=mx.int32),
+        decode_rows,
+        decode_context,
+    )
+
+    expected_decode = pure_decode if split_decode else whole_tiled[:decode_rows]
+    np.testing.assert_array_equal(mixed[:decode_rows], expected_decode)
+    np.testing.assert_array_equal(mixed[decode_rows:], whole_tiled[decode_rows:])
 
 
 @pytest.mark.slow

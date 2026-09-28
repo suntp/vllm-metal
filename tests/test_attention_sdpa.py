@@ -647,6 +647,9 @@ class _PagedRoutingOpsSpy:
     def supports_mm_prefix(self) -> bool:
         return self._supports_mm_prefix
 
+    def supports_decode_routing_metadata(self) -> bool:
+        return True
+
     def reshape_and_cache(
         self,
         _key,
@@ -682,6 +685,8 @@ class _PagedRoutingOpsSpy:
         sinks: mx.array | None = None,
         mm_prefix_ranges: mx.array | None = None,
         num_decode_requests: int = -1,
+        num_decode_tokens: int = 0,
+        max_decode_context_len: int = 0,
         gqa_disabled: bool = False,
     ) -> None:
         del window_seqlen_q, sinks
@@ -690,6 +695,8 @@ class _PagedRoutingOpsSpy:
         self.calls[-1].num_decode_requests = num_decode_requests
         self.calls[-1].gqa_disabled = gqa_disabled
         self.calls[-1].mm_prefix_ranges = mm_prefix_ranges
+        self.calls[-1].num_decode_tokens = num_decode_tokens
+        self.calls[-1].max_decode_context_len = max_decode_context_len
 
 
 class _PreMmPrefixOps:
@@ -893,10 +900,16 @@ class TestSDPAForward:
         assert full_call.block_tables == [[6, 7], [8, 9]]
         assert full_call.cache_block_size == 64
         assert full_call.block_size == 32
+        assert full_call.num_decode_requests == 1
+        assert full_call.num_decode_tokens == 1
+        assert full_call.max_decode_context_len == 18
         assert sliding_call.slot_mapping == [9 * 16 + 1, 10 * 16, 10 * 16 + 1]
         assert sliding_call.block_tables == [[8, 9], [10, 0]]
         assert sliding_call.cache_block_size == 16
         assert sliding_call.block_size == 16
+        assert sliding_call.num_decode_requests == 1
+        assert sliding_call.num_decode_tokens == 1
+        assert sliding_call.max_decode_context_len == 18
 
     def test_kernel_uses_layer_heads_and_registered_default_scale(self) -> None:
         """Kernel metadata comes from the layer, not padded cache allocation.

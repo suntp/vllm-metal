@@ -54,11 +54,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+from weakref import WeakValueDictionary
 
 import mlx.core as mx
 from mlx_lm import load as mlx_lm_load
 from vllm.logger import init_logger
 from vllm.v1.outputs import DraftTokenIds
+from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 
 from vllm_metal import envs
 from vllm_metal.attention.context import (
@@ -81,6 +83,7 @@ if TYPE_CHECKING:
     from vllm.config import ParallelConfig
     from vllm.config.speculative import SpeculativeConfig
 
+    from vllm_metal.v1.model_adapter import ModelAdapter
     from vllm_metal.v1.model_runner import PrefillRequest, RequestState
     from vllm_metal.v1.proposer import ProposeContext
     from vllm_metal.v1.spec_decode import SpeculativeDecodeController
@@ -111,6 +114,13 @@ class _DraftPlan:
     is_drafting: bool
 
 
+# Splitting the backbone and output head has no measurable advantage for tiny
+# projections; the gather and extra dispatch can cost as much as the rows it
+# removes. Start selecting once the packed ingest reaches one full decode
+# window, where the avoided vocabulary projection is material.
+_SELECTIVE_LOGITS_MIN_ROWS = 16
+
+
 class DraftModelProposer:
     """:class:`vllm_metal.v1.proposer.MetalProposer` backed by a separate model."""
 
@@ -123,14 +133,27 @@ class DraftModelProposer:
         num_layers: int,
         controller: SpeculativeDecodeController,
         extract_logits: Callable[[Any], mx.array],
+        min_speculative_tokens: int = 1,
+        model_adapter: ModelAdapter | None = None,
+        selective_logits_supported: bool = False,
         merge_ingest_windows: bool = False,
         allow_deferred_zero_k_ingest: bool = False,
     ) -> None:
         self._model = model
         self._block_size = block_size
         self._max_model_len = max_model_len
+        self._min_speculative_tokens = min_speculative_tokens
+        # RequestState survives preemption, but a reused ID gets a new state.
+        # Weak references also release completed requests when a cleanup-only
+        # scheduler step finishes them without calling propose().
+        self._context_limit_logged: WeakValueDictionary[str, RequestState] = (
+            WeakValueDictionary()
+        )
+        self._num_context_limit_fallback_requests = 0
         self._controller = controller
         self._extract_logits = extract_logits
+        self._model_adapter = model_adapter
+        self._selective_logits_supported = selective_logits_supported
         self._allow_deferred_zero_k_ingest = allow_deferred_zero_k_ingest
         # Structural half of the ingest window gate (see `build`); the
         # operator half (VLLM_METAL_SPEC_VERIFY_WINDOW) is read per call
@@ -175,14 +198,19 @@ class DraftModelProposer:
         speculative_config: SpeculativeConfig,
         parallel_config: ParallelConfig,
         controller: SpeculativeDecodeController,
-        extract_logits: Callable[[Any], mx.array],
+        model_adapter: ModelAdapter,
         num_blocks: int,
         max_model_len: int,
+        max_num_seqs: int,
         block_size: int,
         dtype: mx.Dtype,
         allow_deferred_zero_k_ingest: bool,
     ) -> DraftModelProposer:
         model, dims = _load_draft_model(speculative_config, parallel_config)
+        # The capability probe uses a cacheless forward and must run before
+        # patch_model() installs attention wrappers that require a paged
+        # context. Unsupported model heads retain the full-logits fallback.
+        selective_logits_supported = model_adapter.supports_selective_logits(model)
         backend = SDPAPagedAttentionRuntime(
             num_layers=dims.num_layers,
             num_kv_heads=dims.num_kv_heads,
@@ -195,21 +223,32 @@ class DraftModelProposer:
         logger.info(
             "Draft model loaded for speculative decoding: %s "
             "(layers=%d, kv_heads=%d, head_dim=%d, patched=%d, "
-            "num_blocks=%d)",
+            "num_blocks=%d, selective_logits=%s)",
             speculative_config.draft_model_config.model,
             dims.num_layers,
             dims.num_kv_heads,
             dims.head_dim,
             n_patched,
             num_blocks,
+            selective_logits_supported,
         )
+        min_speculative_tokens = speculative_config.num_speculative_tokens
+        schedule = speculative_config.num_speculative_tokens_per_batch_size
+        if schedule:
+            widths = build_dynamic_sd_schedule_lookup(
+                schedule, max_num_seqs, speculative_config.num_speculative_tokens
+            )
+            min_speculative_tokens = min((k for k in widths[1:] if k > 0), default=0)
         return cls(
             model=model,
             block_size=block_size,
             max_model_len=max_model_len,
             num_layers=dims.num_layers,
             controller=controller,
-            extract_logits=extract_logits,
+            min_speculative_tokens=min_speculative_tokens,
+            extract_logits=model_adapter.extract_logits,
+            model_adapter=model_adapter,
+            selective_logits_supported=selective_logits_supported,
             # Mirror of the runner's `merge_verify_windows` structural
             # conditions, reduced to what can arise here: this proposer
             # patches drafts through `SDPAPagedAttentionRuntime`, so the
@@ -234,6 +273,16 @@ class DraftModelProposer:
         # The engine may auto-fit the target limit after memory profiling.
         self._max_model_len = min(self._max_model_len, target_max_model_len)
 
+    def get_stats(self) -> dict[str, int]:
+        """Snapshot cumulative request fallbacks and the effective draft limits."""
+        return {
+            "num_context_limit_fallback_requests": (
+                self._num_context_limit_fallback_requests
+            ),
+            "min_draft_tokens": self._min_speculative_tokens,
+            "max_model_len": self._max_model_len,
+        }
+
     # -- MetalProposer protocol ---------------------------------------------
 
     def needs_target_hidden_states(
@@ -255,6 +304,8 @@ class DraftModelProposer:
                 "before the first speculative decode step"
             )
 
+        for req_id in ctx.finished_req_ids:
+            self._context_limit_logged.pop(req_id, None)
         self._prune_finished(ctx.request_states)
         if num_speculative_tokens <= 0 and self._allow_deferred_zero_k_ingest:
             # Remember where lazy K=0 catch-up must start without running MLX.
@@ -331,7 +382,8 @@ class DraftModelProposer:
         )
 
     def release_requests(self, req_ids: set[str]) -> None:
-        # Physical blocks belong to the scheduler; only validity tracking is local.
+        # Invalidate KV for recompute without repeating the context-cap log.
+        # Finished IDs and pruning reset that diagnostic separately.
         for req_id in req_ids:
             self._draft_seq_lens.pop(req_id, None)
             self._spec_kv_writes.pop(req_id, None)
@@ -339,6 +391,8 @@ class DraftModelProposer:
     # -- internals -----------------------------------------------------------
 
     def _prune_finished(self, request_states: Mapping[str, RequestState]) -> None:
+        for req_id in set(self._context_limit_logged).difference(request_states):
+            self._context_limit_logged.pop(req_id, None)
         for req_id in list(self._draft_seq_lens.keys()):
             if req_id not in request_states:
                 del self._draft_seq_lens[req_id]
@@ -353,20 +407,39 @@ class DraftModelProposer:
         # eligibility only here (greedy + non-intermediate prefill +
         # greedy-only sampling); ingest itself runs for every active row
         # regardless -- see module docstring.
-        drafting_req_ids = {
-            req_id
-            for req_id, state in self._controller.draft_eligible_requests(
-                ctx.decode_reqs,
-                ctx.decode_token_ids,
-                ctx.prefill_reqs,
-                ctx.prefill_result_modes,
-                ctx.request_states,
-            )
+        drafting_req_ids: set[str] = set()
+        for req_id, state in self._controller.draft_eligible_requests(
+            ctx.decode_reqs,
+            ctx.decode_token_ids,
+            ctx.prefill_reqs,
+            ctx.prefill_result_modes,
+            ctx.request_states,
+        ):
+            if num_speculative_tokens <= 0:
+                continue
             # Apply upstream's input-fit bound per request: K positions beyond
             # the target's computed suffix (the final token was just sampled).
-            if num_speculative_tokens > 0
-            and len(state.token_ids) - 1 + num_speculative_tokens <= self._max_model_len
-        }
+            input_len = len(state.token_ids) - 1
+            if input_len + num_speculative_tokens <= self._max_model_len:
+                drafting_req_ids.add(req_id)
+            elif (
+                self._min_speculative_tokens > 0
+                and input_len + self._min_speculative_tokens > self._max_model_len
+                and self._context_limit_logged.get(req_id) is not state
+            ):
+                # A smaller dynamic K may still fit after a temporary skip.
+                # Report only when no configured positive width can fit again.
+                logger.info(
+                    "Draft-model context limit reached for request %r: "
+                    "input_tokens=%d, min_draft_tokens=%d, max_model_len=%d. "
+                    "Continuing with target-only decoding.",
+                    req_id,
+                    input_len,
+                    self._min_speculative_tokens,
+                    self._max_model_len,
+                )
+                self._context_limit_logged[req_id] = state
+                self._num_context_limit_fallback_requests += 1
         plans: list[_DraftPlan] = []
         for req_id, state in ctx.decode_reqs:
             plan = self._make_decode_plan(
@@ -613,13 +686,14 @@ class DraftModelProposer:
                 and envs.VLLM_METAL_SPEC_VERIFY_WINDOW,
             )
             try:
-                logits = self._extract_logits(
-                    self._model(input_ids, cache=offset_caches)
+                last = self._project_ingest_rows(
+                    input_ids,
+                    offset_caches,
+                    last_rows,
                 )
             finally:
                 clear_context()
 
-            last = mx.take(logits[0], mx.array(last_rows, dtype=mx.int32), axis=0)
             return mx.argmax(last, axis=-1)
 
         # Cold ingest: a fresh prefix re-ingests the whole prompt into the
@@ -653,18 +727,45 @@ class DraftModelProposer:
             input_ids = mx.array([round_packed], dtype=mx.int32)
             prepare_unified([], prefill_specs, self._block_size)
             try:
-                logits = self._extract_logits(
-                    self._model(input_ids, cache=offset_caches)
+                selected = self._project_ingest_rows(
+                    input_ids,
+                    offset_caches,
+                    [row for _, row in final_row_indices],
                 )
             finally:
                 clear_context()
-            for plan_index, row in final_row_indices:
-                final_rows[plan_index] = logits[0][row]
+            for selected_index, (plan_index, _) in enumerate(final_row_indices):
+                final_rows[plan_index] = selected[selected_index]
 
         last = mx.stack(
             [final_rows[plan_index] for plan_index in range(len(plans))], axis=0
         )
         return mx.argmax(last, axis=-1)
+
+    def _project_ingest_rows(
+        self,
+        input_ids: mx.array,
+        offset_caches: list[OffsetCache],
+        row_indices: list[int],
+    ) -> mx.array:
+        """Return logits only for ingest rows that predict draft tokens."""
+        indices = mx.array(row_indices, dtype=mx.int32)
+        if (
+            self._selective_logits_supported
+            and input_ids.shape[1] >= _SELECTIVE_LOGITS_MIN_ROWS
+            and len(row_indices) < input_ids.shape[1]
+        ):
+            assert self._model_adapter is not None
+            output = self._model_adapter.target_forward(
+                self._model,
+                input_ids,
+                cache=offset_caches,
+                logits_indices=indices,
+            )
+            return output.logits[0]
+
+        logits = self._extract_logits(self._model(input_ids, cache=offset_caches))
+        return mx.take(logits[0], indices, axis=0)
 
     def _draft_step(
         self,

@@ -93,10 +93,12 @@ def test_dequantize_matches_oracle_bit_exact():
     assert np.array_equal(np.array(out), oracle)
 
 
-def test_matmul_qmv_path_matches_dense_oracle_f32(monkeypatch):
-    qt, oracle = _make_q6k_tensor()
+@pytest.mark.parametrize("batch", [1, 3, 8])
+def test_matmul_qmv_path_matches_dense_oracle_f32(monkeypatch, batch):
+    # 17 superblocks give every thread a group and some threads a second one.
+    qt, oracle = _make_q6k_tensor(cols=17 * 256)
     calls = _spy_matmul_paths(monkeypatch)
-    x = mx.random.normal((2, qt.in_features)).astype(mx.float32)
+    x = mx.random.normal((batch, qt.in_features)).astype(mx.float32)
 
     out = qt.matmul(x)
     # M5 GPU matmul may use TF32; keep the reference at full FP32 precision on CPU.
@@ -128,11 +130,32 @@ def test_matmul_gemm_path_matches_dense_oracle_f32(monkeypatch):
     )
 
 
-# B=4 is the last qmv batch and B=5 the first GEMM batch, so the low-precision
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_matmul_gemm_path_dequantizes_in_activation_dtype(monkeypatch, dtype):
+    qt, _ = _make_q6k_tensor()
+    real_dequantize = GGUFRawBlockTensor._dequantize_rows
+    dense_dtypes = []
+
+    def spy_dequantize(self, packed_rows, output_dtype):
+        dense_dtypes.append(output_dtype)
+        return real_dequantize(self, packed_rows, output_dtype)
+
+    monkeypatch.setattr(GGUFRawBlockTensor, "_dequantize_rows", spy_dequantize)
+    x = mx.random.normal((32, qt.in_features)).astype(dtype)
+
+    out = qt.matmul(x)
+    mx.eval(out)
+
+    assert dense_dtypes == [dtype]
+
+
+# B=8 is the last qmv batch and B=9 the first GEMM batch, so the low-precision
 # oracle comparison covers both matmul paths.
-@pytest.mark.parametrize("batch", [4, 5])
-@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-def test_matmul_low_precision_matches_dense_oracle(dtype, batch):
+@pytest.mark.parametrize("batch", [8, 9])
+@pytest.mark.parametrize(
+    ("dtype", "rel_tol"), [(mx.float16, 4e-3), (mx.bfloat16, 8e-3)]
+)
+def test_matmul_low_precision_matches_dense_oracle(dtype, rel_tol, batch):
     qt, oracle = _make_q6k_tensor()
     x = mx.random.normal((batch, qt.in_features)).astype(dtype)
 
@@ -142,14 +165,14 @@ def test_matmul_low_precision_matches_dense_oracle(dtype, batch):
 
     assert out.dtype == dtype
     assert out.shape == (batch, qt.out_features)
-    # The comparison is bounded by the input precision (bf16 measured ~2e-3
-    # vs the f32 CPU reference, f16 ~3e-4).
+    # The GEMM path rounds weight and output to the input dtype (worst of 1000
+    # draws vs the f32 CPU reference: bf16 5.7e-3, f16 6.3e-4).
     ref_max = float(mx.max(mx.abs(expected)))
     np.testing.assert_allclose(
         np.array(out.astype(mx.float32)),
         np.array(expected),
         rtol=0,
-        atol=ref_max * 4e-3,
+        atol=ref_max * rel_tol,
     )
 
 

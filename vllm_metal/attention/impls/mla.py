@@ -85,6 +85,45 @@ def _kernel_inputs(ctx: PagedAttentionContext) -> MLAKernelMetadata:
     return meta.kernel
 
 
+# Measured crossovers sit above the FLOP break-even (MLX kernel efficiency
+# differs between the paths); 1.25x rounded up to a multiple of 64 matches the
+# wrapper benchmark on DeepSeek-V2-Lite and GLM-4.7-Flash dims, fp16-4bit and
+# bf16, 2k/8k cached context.
+_MATERIALIZED_CROSSOVER_MARGIN = 1.25
+_MATERIALIZED_THRESHOLD_ROUNDING = 64
+
+
+def materialized_min_new_tokens_with_past(
+    *,
+    kv_lora_rank: int,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    v_head_dim: int,
+) -> int | None:
+    """Smallest chunk (new tokens) over cached context for which materialized
+    prefill beats the absorbed loop, or ``None`` if it never does.
+
+    Per head and cached token, the absorbed loop spends ``num_new *
+    (2 * kv_lora_rank + qk_rope_head_dim)`` MACs (QK over the latent + rope,
+    PV over the latent); the materialized path spends ``kv_lora_rank *
+    (qk_nope_head_dim + v_head_dim)`` to materialize K/V once plus ``num_new *
+    (qk_nope_head_dim + qk_rope_head_dim + v_head_dim)`` for attention. They
+    break even at ``num_new = kv_lora * (nope + v) / (absorbed - materialized
+    per-query dims)``: ~171 for DeepSeek-V2/V3 dims, ~398 for GLM-4.7-Flash.
+    """
+    absorbed_dims = 2 * kv_lora_rank + qk_rope_head_dim
+    materialized_dims = qk_nope_head_dim + qk_rope_head_dim + v_head_dim
+    if materialized_dims >= absorbed_dims:
+        return None
+    break_even = (
+        kv_lora_rank
+        * (qk_nope_head_dim + v_head_dim)
+        / (absorbed_dims - materialized_dims)
+    )
+    step = _MATERIALIZED_THRESHOLD_ROUNDING
+    return math.ceil(_MATERIALIZED_CROSSOVER_MARGIN * break_even / step) * step
+
+
 class MLAPagedAttentionWrapper(nn.Module):
     """Wraps an MLA attention module to use a paged latent cache.
 
@@ -110,13 +149,6 @@ class MLAPagedAttentionWrapper(nn.Module):
     _KERNEL_QK_ROPE_HEAD_DIM = 64
     _KERNEL_BLOCK_SIZES = frozenset({16, 32})
 
-    # Materialized prefill over cached context pays a per-layer K/V
-    # materialization of the whole past, so it only beats the absorbed loop
-    # once the chunk is large enough to amortize it (wrapper benchmark on
-    # DeepSeek-V2-Lite / GLM-4.7-Flash attention dims: crossover ~256-512
-    # new tokens). Pure-prefill segments (past=0) are not gated by this.
-    _MATERIALIZED_MIN_NEW_TOKENS_WITH_PAST = 512
-
     def __init__(
         self,
         inner: nn.Module,
@@ -129,6 +161,25 @@ class MLAPagedAttentionWrapper(nn.Module):
         object.__setattr__(self, "_mla_latent_cache", latent_cache)
         is_absorbed = hasattr(inner, "embed_q") and hasattr(inner, "unembed_out")
         object.__setattr__(self, "_is_absorbed", is_absorbed)
+        # Smallest chunk (new tokens) over cached context that the
+        # materialized-prefill path takes; derived from this layer's attention
+        # dims (see ``materialized_min_new_tokens_with_past``).
+        dims = {
+            name: getattr(inner, name, None)
+            for name in (
+                "kv_lora_rank",
+                "qk_nope_head_dim",
+                "qk_rope_head_dim",
+                "v_head_dim",
+            )
+        }
+        object.__setattr__(
+            self,
+            "_materialized_min_new_with_past",
+            materialized_min_new_tokens_with_past(**dims)
+            if is_absorbed and all(isinstance(d, int) for d in dims.values())
+            else None,
+        )
         if is_absorbed:
             object.__setattr__(
                 self, "_apply_mla_attention", self._apply_absorbed_mla_attention
@@ -271,9 +322,9 @@ class MLAPagedAttentionWrapper(nn.Module):
         segment packed next to decode rows (the common continuous-batching
         shape) still materializes. Segments with past context (chunked-prefill
         continuations, prefix-cache hits) materialize their cached K/V too, but
-        only once the chunk has >= ``_MATERIALIZED_MIN_NEW_TOKENS_WITH_PAST``
-        new tokens; decode-shaped rows and small continuation chunks take the
-        absorbed path."""
+        only once the chunk has >= ``_materialized_min_new_with_past`` new
+        tokens (derived from the attention dims); decode-shaped rows and small
+        continuation chunks take the absorbed path."""
         if not self._is_absorbed:
             return None
         # Materialization reverses embed_q/unembed_out via MultiLinear's transpose
@@ -281,6 +332,7 @@ class MLAPagedAttentionWrapper(nn.Module):
         if type(inner.embed_q).__name__ not in ("MultiLinear", "QuantizedMultiLinear"):
             return None
         cu = ctx.cu_seqlens
+        min_new = self._materialized_min_new_with_past
         routed: list[bool] = []
         has_prefill = False
         for i, ctx_len in enumerate(ctx.context_lens):
@@ -288,7 +340,7 @@ class MLAPagedAttentionWrapper(nn.Module):
             # Decode-shaped rows and small continuation chunks: materializing a
             # whole context for a few queries loses to the absorbed path.
             ok = ctx_len == num_new or (
-                num_new > 1 and num_new >= self._MATERIALIZED_MIN_NEW_TOKENS_WITH_PAST
+                min_new is not None and num_new > 1 and num_new >= min_new
             )
             routed.append(ok)
             has_prefill = has_prefill or (ok and num_new > 1)

@@ -13,7 +13,10 @@ import pytest
 
 from vllm_metal.attention import context as pac
 from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
-from vllm_metal.attention.impls.mla import MLAPagedAttentionWrapper
+from vllm_metal.attention.impls.mla import (
+    MLAPagedAttentionWrapper,
+    materialized_min_new_tokens_with_past,
+)
 
 MultiLinear = pytest.importorskip("mlx_lm.models.mla").MultiLinear
 
@@ -134,18 +137,21 @@ def _ctx(context_lens: list[int], cu_seqlens: list[int]) -> pac.PagedAttentionCo
 
 def test_materialized_segments_routing(monkeypatch: pytest.MonkeyPatch) -> None:
     """Segments route independently: pure prefill and continuation chunks with
-    >= ``_MATERIALIZED_MIN_NEW_TOKENS_WITH_PAST`` new tokens materialize; small
+    >= ``_materialized_min_new_with_past`` new tokens materialize; small
     chunks with cached context and decode-shaped rows stay absorbed. With no
     routed multi-token segment the batch keeps the absorbed/kernel paths."""
     inner, _, wrapper = _make()
     route = wrapper._materialized_segments
+    # Fixture attention dims (nope/rope/v = 128/64/128, kv_lora 512) are the
+    # DeepSeek-V2/V3 family's → threshold 256.
+    assert wrapper._materialized_min_new_with_past == 256
     # pure prefill (past=0): ctx_len == num_new → routed even when small
     assert route(inner, _ctx([2], [0, 2])) == [True]
     # chunked prefill below the new-token threshold → nothing routed
-    for num_new in (2, 511):
+    for num_new in (2, 255):
         assert route(inner, _ctx([4 + num_new], [0, num_new])) is None
-    # chunked prefill at the threshold: past>0, num_new==512 → routed
-    assert route(inner, _ctx([4 + 512], [0, 512])) == [True]
+    # chunked prefill at the threshold: past>0, num_new==256 → routed
+    assert route(inner, _ctx([4 + 256], [0, 256])) == [True]
     # decode row packed ahead of a prefill: only the prefill is routed
     assert route(inner, _ctx([4, 2], [0, 1, 3])) == [False, True]
     # decode rows + small continuation + large continuation + fresh prefill
@@ -159,9 +165,7 @@ def test_materialized_segments_routing(monkeypatch: pytest.MonkeyPatch) -> None:
     # pure decode → nothing routed
     assert route(inner, _ctx([4, 5], [0, 1, 2])) is None
     # decode rows never route, even with the threshold at 1
-    monkeypatch.setattr(
-        MLAPagedAttentionWrapper, "_MATERIALIZED_MIN_NEW_TOKENS_WITH_PAST", 1
-    )
+    monkeypatch.setattr(wrapper, "_materialized_min_new_with_past", 1)
     assert route(inner, _ctx([4, 3], [0, 1, 3])) == [False, True]
 
 
@@ -176,12 +180,10 @@ def test_chunked_prefill_matches_absorbed_loop(
     """Mixed batch: one fresh prefill plus two continuation chunks (past
     non-block-aligned and block-aligned). Materialized output must match the
     absorbed kv_lora-space loop."""
-    # The continuation chunks below are smaller than the real 512-token
-    # threshold; drop it so they exercise the materialized path.
-    monkeypatch.setattr(
-        MLAPagedAttentionWrapper, "_MATERIALIZED_MIN_NEW_TOKENS_WITH_PAST", 1
-    )
     inner, cache, wrapper = _make(quantize=quantize, num_blocks=12)
+    # The continuation chunks below are smaller than the dims-derived
+    # threshold; drop it so they exercise the materialized path.
+    monkeypatch.setattr(wrapper, "_materialized_min_new_with_past", 1)
 
     def slots(block_ids: list[int], start: int, num: int) -> list[int]:
         return [
@@ -236,9 +238,7 @@ def test_chunked_prefill_matches_absorbed_loop(
     )
     ref = run()
     monkeypatch.undo()  # restores gate AND threshold — re-patch the threshold
-    monkeypatch.setattr(
-        MLAPagedAttentionWrapper, "_MATERIALIZED_MIN_NEW_TOKENS_WITH_PAST", 1
-    )
+    monkeypatch.setattr(wrapper, "_materialized_min_new_with_past", 1)
     mat = run()
 
     assert mat.shape == (1, 48, _HID)
@@ -258,12 +258,10 @@ def test_mixed_decode_prefill_batch_routes_per_segment(
     segments above the threshold materialize; decode rows and the small chunk
     take the absorbed attention, and the combined output matches the
     all-absorbed loop."""
+    inner, cache, wrapper = _make(quantize=quantize, num_blocks=16)
     # Scaled-down threshold: the 24-token continuation clears it, the
     # 8-token one does not.
-    monkeypatch.setattr(
-        MLAPagedAttentionWrapper, "_MATERIALIZED_MIN_NEW_TOKENS_WITH_PAST", 16
-    )
-    inner, cache, wrapper = _make(quantize=quantize, num_blocks=16)
+    monkeypatch.setattr(wrapper, "_materialized_min_new_with_past", 16)
 
     def slots(block_ids: list[int], start: int, num: int) -> list[int]:
         return [
@@ -345,3 +343,38 @@ def test_mixed_decode_prefill_batch_routes_per_segment(
 
     assert mat.shape == (1, 50, _HID)
     np.testing.assert_allclose(np.array(mat), np.array(ref), atol=atol, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    ("nope", "rope", "v", "expected"),
+    [
+        (128, 64, 128, 256),  # DeepSeek-V2 / V2-Lite / V3, Kimi-K2
+        (192, 64, 256, 512),  # GLM-4.7-Flash
+        (512, 64, 512, None),  # materialized attention wider than absorbed
+    ],
+    ids=["deepseek", "glm-4.7-flash", "never"],
+)
+def test_materialized_threshold_from_attention_dims(
+    nope: int, rope: int, v: int, expected: int | None
+) -> None:
+    """The continuation threshold follows the attention dims: the FLOP
+    break-even times the measured margin, rounded up to 64 tokens."""
+    assert (
+        materialized_min_new_tokens_with_past(
+            kv_lora_rank=512, qk_nope_head_dim=nope, qk_rope_head_dim=rope, v_head_dim=v
+        )
+        == expected
+    )
+
+
+def test_threshold_none_blocks_only_cached_context_segments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no profitable threshold, continuation chunks stay absorbed while
+    pure-prefill segments still materialize."""
+    inner, _, wrapper = _make()
+    monkeypatch.setattr(wrapper, "_materialized_min_new_with_past", None)
+    assert wrapper._materialized_segments(inner, _ctx([4 + 1024], [0, 1024])) is None
+    assert wrapper._materialized_segments(
+        inner, _ctx([4 + 1024, 32], [0, 1024, 1056])
+    ) == [False, True]

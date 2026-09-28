@@ -32,13 +32,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
 from vllm.logger import init_logger
 
-import vllm_metal.envs as envs
+from vllm_metal import envs
 from vllm_metal.attention.attention_contracts import (
     DEFAULT_ATTENTION_CONTRACT,
     AttentionContract,
@@ -49,7 +48,7 @@ from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.bidi_prefill import apply_bidirectional_segments
 from vllm_metal.attention.impls.mm_prefix import (
     build_mm_prefix_rows,
-    resolve_mm_prefix_path,
+    mm_prefix_path,
 )
 from vllm_metal.attention.impls.varlen_rope_compat import (
     apply_attention_rope,
@@ -228,18 +227,6 @@ def _kernel_metadata(
         )
         ctx.kernel_metadata_cache[key] = meta
     return meta
-
-
-def _mm_prefix_path(ops: Any) -> str:
-    """The configured image-block attention path for this forward.
-
-    The native ops always advertise ``supports_mm_prefix``, so the probe only
-    fails for a build that predates it (or a test fake).  Such ops serve image
-    blocks through the recompute: ``mm_prefix_ranges=`` is passed only on the
-    kernel path, and ``resolve_mm_prefix_path`` warns once about the fallback.
-    """
-    supported = bool(getattr(ops, "supports_mm_prefix", lambda: False)())
-    return resolve_mm_prefix_path(envs.VLLM_METAL_MM_PREFIX_PATH, supported)
 
 
 def _mm_prefix_rows(ctx: PagedAttentionContext) -> mx.array | None:
@@ -816,7 +803,7 @@ def sdpa_forward(
             # The tiled kernel has no float32 instantiation, so float32
             # caches keep the recompute instead of reaching the
             # primitive's eager ValueError mid-request.
-            if _mm_prefix_path(ops) == "kernel" and kernel_k_cache.dtype != mx.float32:
+            if mm_prefix_path(ops) == "kernel" and kernel_k_cache.dtype != mx.float32:
                 mm_prefix_ranges = _mm_prefix_rows(ctx)
                 if mm_prefix_ranges is not None and not ctx.bidi_logged:
                     ctx.bidi_logged = True
@@ -826,11 +813,16 @@ def sdpa_forward(
                     )
             else:
                 recompute_after_kernel = True
-    # Only the kernel path passes the ranges, so ops that predate the keyword
-    # still run the kernel for text rows and leave image rows to the recompute.
-    mm_kwargs = (
-        {} if mm_prefix_ranges is None else {"mm_prefix_ranges": mm_prefix_ranges}
-    )
+    # Older native builds keep the existing whole-batch route.
+    paged_kwargs: dict[str, int | mx.array] = {}
+    if bool(getattr(ops, "supports_decode_routing_metadata", lambda: False)()):
+        paged_kwargs.update(
+            num_decode_requests=ctx.num_decode_requests,
+            num_decode_tokens=ctx.num_decode_tokens,
+            max_decode_context_len=ctx.max_decode_context_len,
+        )
+    if mm_prefix_ranges is not None:
+        paged_kwargs["mm_prefix_ranges"] = mm_prefix_ranges
     out = mx.array(0)
     if kv_cache.turboquant:
         # Reshape scale/zero caches for kernel block size
@@ -880,9 +872,8 @@ def sdpa_forward(
             quant_type=kv_cache.k_quant,
             v_bits=kv_cache.v_bits,
             window_seqlen_q=ctx.verify_window_q,
-            num_decode_requests=ctx.num_decode_requests,
             gqa_disabled=envs.VLLM_METAL_DISABLE_GQA_DECODE,
-            **mm_kwargs,
+            **paged_kwargs,
         )
     else:
         ops.paged_attention_primitive(
@@ -901,9 +892,8 @@ def sdpa_forward(
             out,
             window_seqlen_q=ctx.verify_window_q,
             sinks=sinks,
-            num_decode_requests=ctx.num_decode_requests,
             gqa_disabled=envs.VLLM_METAL_DISABLE_GQA_DECODE,
-            **mm_kwargs,
+            **paged_kwargs,
         )
 
     if recompute_after_kernel:

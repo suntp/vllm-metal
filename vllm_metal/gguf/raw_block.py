@@ -42,7 +42,7 @@ RAW_KERNEL_GGUF_TYPES = frozenset(_RAW_KERNEL_BITS)
 
 # Above this flattened batch the per-row qmv kernel loses to a transient
 # dequantize + dense GEMM (measured; numbers in the PR).
-_QMV_MAX_BATCH = 4
+_QMV_MAX_BATCH = 8
 
 _DEQUANT_SOURCE = """
     uint elem = thread_position_in_grid.x;
@@ -60,21 +60,21 @@ _DEQUANT_SOURCE = """
     uint low4 = (e < 64) ? (lowbyte & 0x0F) : (lowbyte >> 4);
     uint high2 = (qh[e & 31] >> (2 * (e / 32))) & 3;
     int q = int(low4 | (high2 << 4)) - 32;
-    out[elem] = d * float(sc[within / 16]) * float(q);
+    out[elem] = static_cast<T>(d * float(sc[within / 16]) * float(q));
 """
 
 _QMV_SOURCE = """
-    // One 256-thread threadgroup per (row, batch) pair; thread t strides the
-    // row's 16-element groups, then two-stage reduction into y[batch, row].
+    // One 256-thread threadgroup per row; thread t strides the row's
+    // 16-element groups, decoding each once for all NB batch rows, then a
+    // two-stage reduction per batch row into y[batch, row].
     uint row = threadgroup_position_in_grid.x;
-    uint batch = threadgroup_position_in_grid.y;
     uint t = thread_position_in_threadgroup.x;
     uint blocks_per_row = dims[0];
     uint out_features = dims[1];
     uint total_groups = blocks_per_row * 16;
     device const uint8_t* rowblocks = blocks + (size_t)row * blocks_per_row * 210;
-    device const float* xb = x + (size_t)batch * blocks_per_row * 256;
-    float acc = 0.0f;
+    float acc[NB];
+    for (uint batch = 0; batch < NB; ++batch) acc[batch] = 0.0f;
     for (uint g = t; g < total_groups; g += 256) {
         uint blk = g / 16;
         uint grp = g % 16;
@@ -86,28 +86,37 @@ _QMV_SOURCE = """
         float d = float(as_type<half>(((device const uint16_t*)(b + 208))[0]));
         float s = d * float(((device const int8_t*)(b + 192))[grp]);
         uint shift = 2 * (e0 / 32);
-        device const float* xg = xb + blk * 256 + half_idx * 128 + e0;
         bool lowside = e0 < 64;
         device const uint8_t* qlb = ql + (e0 & 63);
         device const uint8_t* qhb = qh + (e0 & 31);
-        float part = 0.0f;
+        float w[16];
         #pragma unroll
         for (uint i = 0; i < 16; ++i) {
             uint low4 = lowside ? (qlb[i] & 0x0F) : (qlb[i] >> 4);
             uint high2 = (qhb[i] >> shift) & 3;
-            part += xg[i] * float(int(low4 | (high2 << 4)) - 32);
+            w[i] = float(int(low4 | (high2 << 4)) - 32);
         }
-        acc += s * part;
+        uint x_offset = blk * 256 + half_idx * 128 + e0;
+        for (uint batch = 0; batch < NB; ++batch) {
+            device const float* xg =
+                x + (size_t)batch * blocks_per_row * 256 + x_offset;
+            float part = 0.0f;
+            #pragma unroll
+            for (uint i = 0; i < 16; ++i) part += xg[i] * w[i];
+            acc[batch] += s * part;
+        }
     }
-    threadgroup float shared[8];
-    float ssum = simd_sum(acc);
+    threadgroup float shared[8 * NB];
     uint sg = t / 32;
-    if ((t & 31) == 0) shared[sg] = ssum;
+    for (uint batch = 0; batch < NB; ++batch) {
+        float ssum = simd_sum(acc[batch]);
+        if ((t & 31) == 0) shared[sg * NB + batch] = ssum;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (t == 0) {
+    if (t < NB) {
         float total = 0.0f;
-        for (uint i = 0; i < 8; ++i) total += shared[i];
-        y[(size_t)batch * out_features + row] = total;
+        for (uint i = 0; i < 8; ++i) total += shared[i * NB + t];
+        y[(size_t)t * out_features + row] = total;
     }
 """
 
@@ -126,7 +135,7 @@ _QMV_KERNEL: Any = mx.fast.metal_kernel(
     source=_QMV_SOURCE,
 )
 
-# Must match the literal 256 stride and shared[8] reduction in _QMV_SOURCE.
+# Must match the literal 256 stride and 8-simdgroup reduction in _QMV_SOURCE.
 _KERNEL_THREADGROUP = 256
 
 
@@ -276,10 +285,9 @@ class GGUFRawBlockTensor:
         if rows <= _QMV_MAX_BATCH:
             out = self._qmv(flat.astype(mx.float32))
         else:
-            # The kernel emits the GEMM dtype directly (bit-identical to a
-            # float32 round trip), so only one transient copy ever lives.
-            dense_dtype = mx.float32 if x.dtype == mx.float32 else mx.float16
-            dense = self._dequantize_rows(self.qweight, dense_dtype)
+            # Dequantizing straight into x's dtype keeps the GEMM there; a
+            # float16 copy would promote bfloat16 activations to float32.
+            dense = self._dequantize_rows(self.qweight, x.dtype)
             out = mx.matmul(flat, dense.T)
         return out.reshape(*lead, self.out_features).astype(x.dtype)
 
@@ -329,9 +337,10 @@ class GGUFRawBlockTensor:
         dims = mx.array([self.in_features // 256, self.out_features], dtype=mx.uint32)
         (y,) = _QMV_KERNEL(
             inputs=[self.qweight, x_f32, dims],
+            template=[("NB", batch)],
             output_shapes=[(batch, self.out_features)],
             output_dtypes=[mx.float32],
-            grid=(self.out_features * _KERNEL_THREADGROUP, batch, 1),
+            grid=(self.out_features * _KERNEL_THREADGROUP, 1, 1),
             threadgroup=(_KERNEL_THREADGROUP, 1, 1),
         )
         return y
@@ -345,6 +354,7 @@ class GGUFRawBlockTensor:
         n = mx.array([n_elements], dtype=mx.uint32)
         (out,) = _DEQUANT_KERNEL(
             inputs=[packed_rows, n],
+            template=[("T", output_dtype)],
             output_shapes=[(n_elements,)],
             output_dtypes=[output_dtype],
             grid=(n_elements, 1, 1),

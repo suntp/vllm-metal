@@ -1,62 +1,66 @@
 # GQA decode routing
 
-The paged attention primitive can use `paged_attention_gqa_decode` for a
-limited set of single-request, long-context decode calls. Six shader
-specializations cover head dimensions 128/256 with kernel block size 16,
-plus head dimension 256 with block size 32, in FP16/BF16. The geometry and
-performance checks below further restrict routing.
+The default paged attention path selects among 64-, 128-, 256-, and
+512-token GQA partitions for the measured single-request geometries below.
+Each partition has FP16/BF16 specializations for head dimensions 128/256
+with kernel block16, plus head256 with kernel block32. These form 24 active
+shader specializations.
 
-## Automatic eligibility
+## Automatic eligibility and partition selection
 
-The following geometries and inclusive minimum KV lengths are eligible:
+The supported `(query heads, KV heads, head dimension)` geometries are
+`(32,8,128)`, `(24,4,256)`, `(16,2,128)`, and `(16,2,256)`.
+Kernel block16 is supported for each; block32 is additionally supported for
+`(16,2,256)`. The existing scope is not inferred from a model-name list.
 
-| Query heads | KV heads | Head dimension | Kernel block size | Minimum KV tokens |
-|---:|---:|---:|---:|---:|
-| 32 | 8 | 128 | 16 | 32,768 |
-| 24 | 4 | 256 | 16 | 32,768 |
-| 16 | 2 | 128 | 16 | 65,536 |
-| 16 | 2 | 256 | 16 or 32 | 32,768 |
+Let `C` be the detected GPU core count and `Q` the query-head count. All four
+partitions use the same empirical budget of 33 SIMD groups per core.
+Select the largest P satisfying `floor(KV_length / P) * Q >= 33 * C`;
+otherwise use the established path. Equivalently, each partition starts at
+`P * ceil(33 * C / Q)`. Admission and promotion share one rule, with no
+head-ratio correction or separate admission budget. This is an empirical
+policy, not a hardware identity or a prediction of the fastest partition at
+every position.
 
-Kernel block size is the view passed to the primitive after hybrid-cache
-translation. For example, a 1056-token scheduler block selects the largest
-supported divisor, 32, whereas a 528-token block selects 16. Merely adding a
-head geometry would not enable GQA for the former view without its block32
-specializations. Other geometries with block32 continue to use the
-established path.
+On a 40-core GPU this gives:
 
-There is no additional GQA-specific maximum context length. The model's
-context limit, cache capacity and the primitive's resource limits still apply.
-An eligible request stays on GQA as its KV length grows beyond 131,072;
-crossing that former policy boundary does not change kernel families.
+| Q/KV/head dimension | Start P64 | Start P128 | Start P256 | Start P512 |
+|---|---:|---:|---:|---:|
+| 32/8/128 | 2,688 | 5,376 | 10,752 | 21,504 |
+| 24/4/256 | 3,520 | 7,040 | 14,080 | 28,160 |
+| 16/2/128 or 256 | 5,312 | 10,624 | 21,248 | 42,496 |
 
-Every row additionally requires:
+These values scale with the detected core count; they are not per-device or
+per-model context tables in the implementation. Core-count scaling does not
+establish cross-device performance or guarantee a speedup at every boundary.
+The budget is shared by all four partitions; it has no per-model exceptions.
+
+Only complete partitions count toward selection. The producer, temporary
+buffers and reducer still use `ceil(KV_length / P)` so the final partial
+partition is processed. Selection is stateless, uses at most four integer
+comparisons, and adds no startup benchmark or per-request performance probe.
+`gqa_decode_partition_size` exposes the default decision for tests;
+`gqa_decode_shape_eligible` is true when it selects a nonzero partition.
+
+Kernel block size is the view after hybrid-cache translation: a 1056-token
+scheduler page selects block32, while a 784- or 528-token page selects
+block16. Translated page IDs address their kernel-sized subpages even when
+upstream K/V storage remains unreshaped.
+
+Every eligible call additionally requires:
 
 - One pure-decode request, with `num_decode_requests` equal to 1 or omitted.
 - A verification window of at most 1.
-- Matching FP16 or BF16 query, key-cache, and value-cache types.
-- A kernel block size allowed by the geometry table.
-- No TurboQuant, attention sinks, logit soft-capping, or sliding-window
-  attention.
-- Enough partition threadgroups for the conservative occupancy guard:
-  `ceil(KV tokens / 512) * KV heads >= 3 * detected GPU cores`.
-  An unknown GPU core count falls back.
+- Matching FP16/BF16 query, key-cache and value-cache types.
+- A kernel page size allowed above and sufficient reducer shared memory.
+- No TurboQuant, attention sinks, logit soft-capping or sliding window.
+- A known, positive GPU core count.
 
-Calls outside these conditions use the established attention family. That
-includes multi-request batches, even if each request individually matches a
-row, and lengths below the corresponding minimum. The 16/2/128 geometry starts
-at 64K; small measured gains at 32K were not used to widen automatic routing.
-
-The 16/4/256 geometry remains excluded. A MiMo-V2.6-Distill-Qwen-9B-OptiQ
-trial showed operator and serving gains, but a repeatable enabled/disabled
-32K generation comparison failed the strict top-5 rule. Continuous decode
-logits confirmed the divergence on the same token history. Both paths also
-differed from a native MLX continuation on that history, so this does not
-establish a GQA kernel correctness defect. Further full-model numerical
-validation is needed before widening this default scope.
-
-The gate checks geometry rather than model names and does not contain a
-device-name allowlist. Its bounds and occupancy guard are empirical choices,
-not a claim that GQA wins for every device or competing GPU workload.
+Other calls, including multi-request batches and unknown core counts, use the
+established attention family. Model context limits, cache capacity and
+primitive resource limits still apply; there is no extra 128K ceiling.
+The 16/4/256 geometry remains excluded because its previous full-model
+numerical validation did not support expanding the default scope.
 
 ## Disable switch
 
@@ -72,12 +76,15 @@ APIs are no longer used.
 
 `tests/test_gqa_paged_decode.py` evaluates the primitive and checks
 `last_paged_dispatch()` alongside the numerical reference. Positive cases
-must actually report `gqa_decode`; boundary, multi-request, verification,
-feature, and disabled cases must report the appropriate established family.
+must actually report `gqa_decode`; partition tests additionally check
+the executed 64/128/256/512 specialization through
+`last_gqa_partition_size()`. Boundary, multi-request, verification, feature,
+and disabled cases must report the appropriate established family, including
+upstream mixed prefill/decode.
 References include independent grouped CPU FP32 attention and native MLX SDPA.
 All four geometries and both cache dtypes are checked across the former
 128K boundary, at 192K, and at 256K including a partial final partition.
-Shared-storage tests cover all six specializations using upstream-allocated
+Shared-storage tests use upstream-allocated
 K/V views, non-contiguous page tables, native writes, prefix-page copying,
 source-page clearing and a subsequent decode write. Dominant attention rows
 make missing writes observable even in a long context.
@@ -91,8 +98,8 @@ Positive route tests need a reported GPU core count and sufficient partition
 grid. They skip on hosts that cannot enable GQA, including some virtual CI
 GPUs; the unknown-core fallback test runs there instead. Unconditional
 feature/dtype/page-size fallback tests do not require core-count detection.
-The library-availability check loads all six specializations even when the
-reported core count is unavailable.
+The library-availability check loads all 24 active GQA specializations and
+their matching reducers even when the reported core count is unavailable.
 Validate the positive path on a capable GPU before reporting GQA coverage.
 
 `last_paged_dispatch()` records the last family selected in the process. It
