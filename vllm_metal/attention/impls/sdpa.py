@@ -816,7 +816,23 @@ def sdpa_forward(
     paged_kwargs: dict[str, int | mx.array] = {}
     # Omit the new keyword on the default path for older native builds.
     if ctx.gqa_disabled:
-        paged_kwargs["gqa_disabled"] = True
+        control_probe = getattr(ops, "supports_gqa_decode_control", None)
+        supports_control = (
+            bool(control_probe())
+            if control_probe is not None
+            else hasattr(ops, "gqa_decode_shape_eligible")
+        )
+        if supports_control:
+            paged_kwargs["gqa_disabled"] = True
+        elif hasattr(ops, "has_gqa_decode_kernel") or hasattr(
+            ops, "_has_gqa_decode_kernel"
+        ):
+            # Never silently ignore a kill switch on an unrecognized GQA build.
+            raise RuntimeError(
+                "Loaded native GQA build does not advertise disable support; "
+                "rebuild the vllm-metal native extension."
+            )
+        # Pre-GQA native builds already use the established attention path.
     if bool(getattr(ops, "supports_decode_routing_metadata", lambda: False)()):
         paged_kwargs.update(
             num_decode_requests=ctx.num_decode_requests,

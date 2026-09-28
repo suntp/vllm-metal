@@ -14,6 +14,9 @@
 
 using namespace metal;
 
+// Shared normalization contract for split-KV producers and their reducer.
+constant constexpr float kPagedAttentionSoftmaxEpsilon = 1e-6f;
+
 // ========================================== Generic vector types
 // NOTE: Vec<T, VEC_SIZE> is declared in utils.metal.
 // Specializations for char are in turboquant.metal.
@@ -1276,7 +1279,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
     }
 
     // Final normalization: O = O / l
-    const float inv_l = 1.f / (warp_l + 1e-6f);
+    const float inv_l = 1.f / (warp_l + kPagedAttentionSoftmaxEpsilon);
 
     device T *out_ptr =
         out + q_token_idx * num_heads * max_num_partitions * HEAD_SIZE +
@@ -1788,7 +1791,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
       }
 
       // Final normalization: O = O / l
-      const float inv_l = 1.f / (warp_l[r] + 1e-6f);
+      const float inv_l = 1.f / (warp_l[r] + kPagedAttentionSoftmaxEpsilon);
 
       device T *out_ptr =
           out + out_row * num_heads * max_num_partitions * HEAD_SIZE +
@@ -1967,7 +1970,8 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
     global_exp_sum += exp2(sinks[head_idx] * M_LOG2E_F - max_logit);
   }
 
-  const float inv_global_exp_sum = 1.0f / (global_exp_sum + 1e-6f);
+  const float inv_global_exp_sum =
+      1.0f / (global_exp_sum + kPagedAttentionSoftmaxEpsilon);
 
   // ========================================================================
   // Aggregate tmp_out to out.
@@ -2149,7 +2153,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
     exp_sums[pidx] = l;
   }
   device T *out_ptr = tmp_out + pidx * HEAD_SIZE + lane * SLICE;
-  const float inv_l = 1.f / (l + 1e-6f);
+  const float inv_l = 1.f / (l + kPagedAttentionSoftmaxEpsilon);
 #pragma unroll
   for (int i = 0; i < SLICE; i++) {
     out_ptr[i] = T(acc[i] * inv_l);

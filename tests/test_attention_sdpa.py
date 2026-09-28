@@ -650,6 +650,9 @@ class _PagedRoutingOpsSpy:
     def supports_decode_routing_metadata(self) -> bool:
         return True
 
+    def supports_gqa_decode_control(self) -> bool:
+        return True
+
     def reshape_and_cache(
         self,
         _key,
@@ -800,8 +803,9 @@ class TestSDPAForward:
         assert captured["scale"] == 0.5
 
     @pytest.mark.parametrize("disabled", [False, True])
+    @pytest.mark.parametrize("legacy_control", [False, True])
     def test_gqa_policy_reaches_primitive(
-        self, monkeypatch: pytest.MonkeyPatch, disabled: bool
+        self, monkeypatch: pytest.MonkeyPatch, disabled: bool, legacy_control: bool
     ) -> None:
         """The environment escape hatch and scheduler decode count reach native code."""
         from vllm_metal import envs
@@ -814,6 +818,11 @@ class TestSDPAForward:
             envs.environment_variables, "VLLM_METAL_DISABLE_GQA_DECODE", read_env
         )
         spy = _PagedRoutingOpsSpy()
+        if legacy_control:
+            monkeypatch.setattr(spy, "supports_gqa_decode_control", None)
+            monkeypatch.setattr(
+                spy, "gqa_decode_shape_eligible", MagicMock(), raising=False
+            )
         inner = _make_inner()
         inner.o_proj = lambda out: out
         cache = MetalPagedKVCache(
@@ -1445,7 +1454,7 @@ class TestBidirectionalDispatch:
         assert bidi.call_count == 1
         assert spy.calls[-1].mm_prefix_ranges is None
 
-    @pytest.mark.parametrize("disable_env", [None, "0"])
+    @pytest.mark.parametrize("disable_env", [None, "0", "1"])
     def test_ops_predating_mm_prefix_serve_the_recompute(
         self, monkeypatch, disable_env
     ) -> None:
@@ -1454,10 +1463,22 @@ class TestBidirectionalDispatch:
             monkeypatch.delenv("VLLM_METAL_DISABLE_GQA_DECODE", raising=False)
         else:
             monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", disable_env)
-        bidi, _, _ = self._run(
+        bidi, spy, _ = self._run(
             frozenset({"sliding"}), [None, [(0, 2)]], 1, ops=_PreMmPrefixOps()
         )
         assert bidi.call_count == 1
+        assert spy.calls[-1].gqa_disabled is False
+
+    def test_unknown_gqa_native_cannot_silently_ignore_disable(self, monkeypatch):
+        monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", "1")
+        ops = _PreMmPrefixOps()
+        pipeline_probe = MagicMock(
+            side_effect=AssertionError("must not load pipelines")
+        )
+        monkeypatch.setattr(ops, "has_gqa_decode_kernel", pipeline_probe, raising=False)
+        with pytest.raises(RuntimeError, match="rebuild.*native extension"):
+            self._run(frozenset({"sliding"}), [None, [(0, 2)]], 1, ops=ops)
+        pipeline_probe.assert_not_called()
 
     def test_unknown_path_value_raises(self) -> None:
         with pytest.raises(ValueError, match="VLLM_METAL_MM_PREFIX_PATH"):

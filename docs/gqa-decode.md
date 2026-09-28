@@ -81,12 +81,12 @@ Set `VLLM_METAL_DISABLE_GQA_DECODE=1` before starting the server to keep
 eligible requests on the established path. This switch provides an A/B and
 operational fallback; it cannot enable an otherwise ineligible call.
 
-There is no startup calibration or disk-cached performance threshold for
-this gate. `VLLM_METAL_GQA_AUTOTUNE` and the former mutable gate-parameter
-APIs are no longer used.
 The switch is captured once when each forward's `PagedAttentionContext` is
-created and shared by its layers. Only an enabled disable switch adds the
-`gqa_disabled` keyword, preserving the default call to older native builds.
+created and shared by its layers. The `gqa_disabled` keyword is sent only
+when disabling GQA on a native build that supports it. Pre-GQA native builds
+already use the established path and receive no new keyword. An unrecognized
+GQA build without disable support requires a rebuild rather than silently
+ignoring the switch.
 
 ## Validation
 
@@ -140,28 +140,6 @@ and keep noisy measurements visible. The
 explains why in-process engine measurements and short probes are not
 interchangeable with serving results.
 
-## Why the broader gate was removed
-
-An earlier design combined a partition-occupancy floor with a scalar
-potential-KV-reread proxy and fitted a threshold at startup. Additional
-geometry, submission-mode, and load tests did not justify extending that
-single threshold to all shader-supported cases. The proxy is not measured
-DRAM traffic: each simdgroup still issues its own K/V loads, and the actual
-traffic depends on cache residency. Grouping related heads can improve
-locality without an explicit cross-simdgroup KV broadcast.
-
-A separate experiment added paired timing, confirmation runs, numerical
-checks, telemetry, and invocation-bound permits with expiry, revocation,
-and native validation before encoding. It rejected known invalidation but
-did not establish performance for later requests after resource conditions
-changed. Tests in which requests always fell back did not validate positive
-GQA performance. That experimental machinery is not part of this routing
-implementation.
-
-These limitations motivate the explicit scope above; they do not establish
-that a more general optimization is impossible. Expanding automatic routing
-requires its own dispatch, numerical, and real-serving benchmark evidence.
-
 ## Follow-up work (separate PRs)
 
 These are directions for evaluation after this scoped change, not additional
@@ -195,7 +173,3 @@ enablement or performance claims in #715:
    Compare latency savings against barriers, extra registers/shared memory
    and occupancy changes; repeat numerical and serving validation before
    adopting either algorithmic change.
-
-[#714](https://github.com/vllm-project/vllm-metal/pull/714) is closed and is
-not a pending dependency. The disable switch is included in #715; the
-benchmarking pitfalls remain documented in issue #713.

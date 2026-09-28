@@ -30,7 +30,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tools.attention_bench_utils import ref_paged_attn
+from tools.attention_bench_utils import attention_tolerances, ref_paged_attn
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.turboquant import (
     get_v_centroids,
@@ -44,14 +44,6 @@ NUM_KV_HEADS = 8
 HEAD_SIZE = 128
 BLOCK_SIZE = 16
 NUM_BLOCKS = 256
-
-# atol/rtol per dtype.  float32: both paths compute in fp32, only
-# kernel-order error is left.
-_TOLERANCES = {
-    mx.bfloat16: (3e-2, 2e-2),
-    mx.float16: (1.5e-2, 2e-2),
-    mx.float32: (1e-3, 1e-3),
-}
 
 
 def _run_paged_decode(
@@ -111,7 +103,7 @@ def _run_paged_decode(
 
 
 def _assert_close(out: mx.array, ref: mx.array, dtype: mx.Dtype) -> None:
-    atol, rtol = _TOLERANCES[dtype]
+    atol, rtol = attention_tolerances(dtype)
     np.testing.assert_allclose(
         np.array(out.astype(mx.float32)),
         np.array(ref.astype(mx.float32)),
@@ -424,7 +416,7 @@ def test_split_decode_gemma4_full_attention(kv_lens: list[int]) -> None:
     k_all = np.array(key_cache.astype(mx.float32))
     v_all = np.array(value_cache.astype(mx.float32))
     tables = np.array(block_tables)
-    atol, rtol = _TOLERANCES[mx.bfloat16]
+    atol, rtol = attention_tolerances(mx.bfloat16)
     for i, kv_len in enumerate(kv_lens):
         blocks = tables[i, : -(-kv_len // GEMMA4_BLOCK_SIZE)]
         rows = (-1, GEMMA4_NUM_KV_HEADS, GEMMA4_HEAD_SIZE)

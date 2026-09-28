@@ -14,19 +14,13 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tools.attention_bench_utils import ref_paged_attn
+from tools.attention_bench_utils import attention_tolerances, ref_paged_attn
 from vllm_metal.metal import get_ops
 
 NUM_QUERY_HEADS = 32
 NUM_KV_HEADS = 8
 HEAD_SIZE = 128
 BLOCK_SIZE = 16
-
-_TOLERANCES = {
-    mx.bfloat16: (3e-2, 2e-2),
-    mx.float16: (1.5e-2, 2e-2),
-    mx.float32: (2e-4, 2e-4),
-}
 
 
 def _interleaved_table(n_blocks: int) -> list[int]:
@@ -40,7 +34,7 @@ def _interleaved_table(n_blocks: int) -> list[int]:
 
 
 def _assert_close(out: mx.array, ref: mx.array, dtype: mx.Dtype) -> None:
-    atol, rtol = _TOLERANCES[dtype]
+    atol, rtol = attention_tolerances(dtype, float32_tolerance=2e-4)
     np.testing.assert_allclose(
         np.array(out.astype(mx.float32)),
         np.array(ref.astype(mx.float32)),
@@ -357,7 +351,7 @@ def _run_primitive(
 
 def test_gqa_decode_kernel_is_in_default_library() -> None:
     ops = get_ops()
-    assert ops.has_gqa_decode_kernel(), (
+    assert ops._has_gqa_decode_kernel(), (
         "default shader library is missing paged_attention_gqa_decode; "
         "rebuild with `python -m vllm_metal.metal.build`"
     )

@@ -35,7 +35,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tools.attention_bench_utils import ref_paged_attn
+from tools.attention_bench_utils import attention_tolerances, ref_paged_attn
 from vllm_metal.attention.caches.turboquant import (
     get_v_centroids,
     turbo_quant_encode,
@@ -45,13 +45,6 @@ from vllm_metal.metal import get_ops
 HEAD_SIZE = 128
 BLOCK_SIZE = 16
 V_BITS = 3
-
-# atol/rtol per dtype vs the pure-MLX reference (same as test_split_kv_decode).
-_TOLERANCES = {
-    mx.bfloat16: (3e-2, 2e-2),
-    mx.float16: (1.5e-2, 2e-2),
-    mx.float32: (1e-3, 1e-3),
-}
 
 
 def _cache(
@@ -233,7 +226,7 @@ def test_windowed_matches_reference(
         scale=HEAD_SIZE**-0.5,
     )
     mx.eval(ref)
-    atol, rtol = _TOLERANCES[dtype]
+    atol, rtol = attention_tolerances(dtype)
     np.testing.assert_allclose(
         np.array(windowed.astype(mx.float32)),
         np.array(ref.astype(mx.float32)),
