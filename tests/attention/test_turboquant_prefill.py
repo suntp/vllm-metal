@@ -10,6 +10,14 @@ from vllm_metal.attention.impls import sdpa
 from vllm_metal.metal import get_ops
 
 
+@pytest.fixture(autouse=True)
+def enable_prefill(monkeypatch):
+    # Exercise tiled correctness on older CI machines as well as NAX on M5.
+    # Automatic rollout is tested separately below.
+    monkeypatch.setenv("VLLM_METAL_TQ_PREFILL", "1")
+    monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "256")
+
+
 @pytest.fixture
 def recorded_ops(monkeypatch):
     native = get_ops()
@@ -134,22 +142,20 @@ def test_short_suffix_crossover(recorded_ops, qlen):
 
 
 @pytest.mark.parametrize("past", [0, 2048])
-def test_cold_prefills_batch_but_unrelated_histories_keep_compressed(
+def test_independent_histories_batch_when_they_fit_workspace(
     recorded_ops, prefill_backend, past
 ):
     case = build_case(
         qlens=(128,) * 4, context_lens=(past + 128,) * 4, page_padding=512
     )
     assert_parity(case)
-    assert len(recorded_ops) == (1 if past == 0 else 2)
+    assert len(recorded_ops) == 1
     assert not recorded_ops[0][1].get("use_turboquant", False)
-    assert recorded_ops[0][0][1].shape[0] == (32 if past == 0 else 136)
-    if past:
-        assert recorded_ops[1][1]["use_turboquant"]
-        assert recorded_ops[1][0][0].shape[0] == 384
+    assert recorded_ops[0][0][1].shape[0] == (32 if past == 0 else 544)
 
 
-def test_capacity_fallback_restores_interleaved_rows(recorded_ops):
+def test_capacity_fallback_restores_interleaved_rows(recorded_ops, monkeypatch):
+    monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "16")
     case = build_case(
         qlens=(128, 1, 129, 5, 128), context_lens=(2049, 4097, 2063, 515, 2177)
     )
@@ -188,6 +194,50 @@ def test_prefill_scratch_does_not_scale_with_unrelated_histories():
     # Output/query rows grow, but four independent histories must not retain
     # four full dequantizations. Generous margin avoids allocator-size noise.
     assert peaks[1] < 2 * peaks[0] + 32 * 2**20, peaks
+
+
+@pytest.mark.parametrize("k_quant,v_quant", [("q8_0", "q3_0"), ("q5_0", "q5_0")])
+def test_peak_materialization_fits_reserved_allowance(k_quant, v_quant):
+    import gc
+
+    case = build_case(
+        qlens=(128,),
+        context_lens=(10880,),
+        head_dim=256,
+        n_heads=24,
+        n_kv_heads=4,
+        k_quant=k_quant,
+        v_quant=v_quant,
+    )
+    mx.eval(case.forward())
+    mx.eval(case.reference())
+    gc.collect()
+    mx.synchronize()
+    mx.clear_cache()
+    before = mx.get_active_memory()
+    mx.reset_peak_memory()
+    result = case.forward()
+    mx.eval(result)
+    mx.synchronize()
+    extra = mx.get_peak_memory() - before
+    assert extra < sdpa.prefill_workspace_bytes(), extra
+
+
+@pytest.mark.parametrize("mib", [0, 1, 16])
+def test_admission_uses_rounded_blocks_at_budget_boundary(monkeypatch, mib):
+    monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", str(mib))
+    case = build_case()
+    block_bytes = 16 * sdpa.prefill_bytes_per_token(2, 128) + 4
+    blocks = mib * 2**20 // block_bytes
+    for extra, selected in [(0, mib != 0), (1, False)]:
+        case.ctx.context_lens = [max(128, (blocks + extra) * 16)]
+        case.ctx.block_tables = [list(range(blocks + extra))]
+        meta = sdpa._kernel_metadata(case.ctx, None, [], case.ctx.block_tables, 16)
+        plan = sdpa._turboquant_prefill_plan(
+            case.ctx, meta, case.ctx.block_tables, 16, 8, 2, 128
+        )
+        assert (plan is not None) == selected
+        case.ctx.kernel_metadata_cache.clear()
 
 
 @pytest.mark.parametrize("qlen", [128, 255, 256])
@@ -254,18 +304,18 @@ def test_prefill_metadata_reused_only_within_forward(recorded_ops):
     first = case.forward()
     mx.eval(first)
     meta = next(iter(case.ctx.kernel_metadata_cache.values()))
-    plan = meta.tq_prefill_plans[(16, 128)]
+    plan = next(iter(meta.tq_prefill_plans.values()))
     second = case.forward()
     mx.eval(second)
     assert next(iter(case.ctx.kernel_metadata_cache.values())) is meta
-    assert meta.tq_prefill_plans[(16, 128)] is plan
+    assert next(iter(meta.tq_prefill_plans.values())) is plan
     assert mx.array_equal(first, second).item()
     case.ctx.kernel_metadata_cache.clear()
     third = case.forward()
     mx.eval(third)
     fresh = next(iter(case.ctx.kernel_metadata_cache.values()))
     assert fresh is not meta
-    assert fresh.tq_prefill_plans[(16, 128)] is not plan
+    assert next(iter(fresh.tq_prefill_plans.values())) is not plan
 
 
 def test_read_existing_cache_stays_read_only(recorded_ops):
@@ -286,15 +336,85 @@ def test_read_existing_cache_stays_read_only(recorded_ops):
     np.testing.assert_array_equal(before, np.array(case.cache._storage.buffers[0]))
 
 
-def test_prefill_addressing_preserves_large_physical_page_ids():
-    case = build_case()
-    # Planner-only test: legal int32 page IDs whose absolute token indices
-    # exceed int32, without allocating a multi-terabyte cache for the test.
-    case.ctx.block_tables = [[2**27 + i for i in range(17)]]
-    meta = sdpa._kernel_metadata(case.ctx, None, [], case.ctx.block_tables, 16)
+@pytest.mark.parametrize("block_size", [16, 544])
+def test_prefill_addressing_preserves_large_physical_page_ids(block_size):
+    case = build_case(block_size=block_size, context_lens=(1153,))
+    # After translation kernel IDs still fit int32, while absolute token
+    # offsets do not. No multi-terabyte physical allocation is required.
+    page_count = (1153 + block_size - 1) // block_size
+    first_page = 2**27 if block_size == 16 else 2**26
+    assert first_page * block_size >= 2**31
+    case.ctx.block_tables = [[first_page + i for i in range(page_count)]]
+    meta = sdpa._kernel_metadata(case.ctx, None, [], case.ctx.block_tables, block_size)
     plan = sdpa._turboquant_prefill_plan(
-        case.ctx, meta, case.ctx.block_tables, 16, 8, 2, 128
+        case.ctx, meta, case.ctx.block_tables, block_size, 8, 2, 128
     )
     assert plan is not None
-    assert plan.pool_pages[::16].tolist() == case.ctx.block_tables[0]
-    assert plan.pool_offsets[:16].tolist() == list(range(16))
+    size = plan.pool_pages.shape[0]
+    assert plan.pool_pages.tolist() == [
+        case.ctx.block_tables[0][t // block_size] for t in range(size)
+    ]
+    assert plan.pool_offsets.tolist() == [t % block_size for t in range(size)]
+
+
+def test_over_budget_history_falls_back_before_dequantization(
+    recorded_ops, monkeypatch
+):
+    monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "1")
+    case = build_case(qlens=(128,), context_lens=(1153,))
+
+    def no_dequant(*args):
+        pytest.fail("over-budget history must not allocate dequantization buffers")
+
+    monkeypatch.setattr(sdpa, "prefill_dequantizers", no_dequant)
+    output, reference = assert_parity(case)
+    assert len(recorded_ops) == 1
+    assert recorded_ops[0][1]["use_turboquant"]
+    assert mx.array_equal(output, reference).item()
+
+
+def test_128k_history_does_not_block_smaller_candidate(recorded_ops):
+    # Admission only: reject the large row without allocating its cache.
+    case = build_case(qlens=(128, 128), context_lens=(257, 257))
+    case.ctx.context_lens[0] = 131072
+    meta = sdpa._kernel_metadata(case.ctx, None, [], case.ctx.block_tables, 16)
+    plan = sdpa._turboquant_prefill_plan(
+        case.ctx, meta, case.ctx.block_tables, 16, 24, 4, 256
+    )
+    assert plan is not None
+    assert plan.prefill.seq_lens.tolist() == [257]
+    assert plan.fallback.seq_lens.tolist() == [131072]
+    assert plan.workspace_bytes <= 256 * 2**20
+
+
+@pytest.mark.parametrize(
+    "mode,ready,selected",
+    [
+        ("auto", False, False),
+        ("auto", True, True),
+        ("0", True, False),
+        ("1", False, True),
+    ],
+)
+def test_rollout_requires_nax_or_explicit_opt_in(
+    recorded_ops, monkeypatch, mode, ready, selected
+):
+    monkeypatch.setenv("VLLM_METAL_TQ_PREFILL", mode)
+    monkeypatch.setattr(get_ops(), "nax_ready", lambda: ready)
+    case = build_case()
+    assert_parity(case)
+    assert recorded_ops[0][1].get("use_turboquant", False) == (not selected)
+
+
+def test_workspace_plan_key_includes_kv_geometry():
+    case = build_case()
+    meta = sdpa._kernel_metadata(case.ctx, None, [], case.ctx.block_tables, 16)
+    plans = [
+        sdpa._turboquant_prefill_plan(
+            case.ctx, meta, case.ctx.block_tables, 16, 8, heads, dim
+        )
+        for heads, dim in [(2, 128), (4, 256)]
+    ]
+    assert all(plan is not None for plan in plans)
+    assert plans[0] is not plans[1]
+    assert plans[1].workspace_bytes > 3 * plans[0].workspace_bytes

@@ -16,6 +16,7 @@ import argparse
 import gc
 import importlib.metadata
 import json
+import os
 import statistics
 import time
 from contextlib import nullcontext
@@ -80,6 +81,12 @@ def measure(label, kwargs, reps, warmup):
         ) / 2**20
         del output
     median = {k: statistics.median(v) for k, v in samples.items()}
+    plans = [
+        plan
+        for meta in case.ctx.kernel_metadata_cache.values()
+        for plan in meta.tq_prefill_plans.values()
+        if plan is not None
+    ]
     print(
         json.dumps(
             {
@@ -90,6 +97,9 @@ def measure(label, kwargs, reps, warmup):
                 "speedup": median["compressed"] / median["prefill"],
                 "peak_extra_mib": memory,
                 "samples_ms": samples,
+                "lane_selected": bool(plans),
+                "lane_requests": sum(plan.prefill.seq_lens.shape[0] for plan in plans),
+                "workspace_estimate_bytes": sum(plan.workspace_bytes for plan in plans),
             },
             default=str,
         ),
@@ -109,6 +119,8 @@ def cases(suite):
             (2, 32768),
             (8, 32768),
             (32, 32768),
+            (128, 8192),
+            (512, 8192),
             (128, 32768),
             (512, 32768),
             (1153, 1153),
@@ -132,6 +144,29 @@ def cases(suite):
                             "context_lens": (8192,),
                         },
                     )
+    elif suite == "limits":
+        for context in [8192, 10880, 10912, 10928, 16384, 131072]:
+            yield (
+                f"cap-kv{context}",
+                dict(common, qlens=(128,), context_lens=(context,)),
+            )
+        for count in [2, 4]:
+            yield (
+                f"independent4k-{count}",
+                dict(common, qlens=(128,) * count, context_lens=(4096,) * count),
+            )
+        for kq, vq in [
+            ("q4_0", "q4_0"),
+            ("q5_0", "q5_0"),
+            ("int2", "q2_0"),
+            ("uint8", "q8_0"),
+        ]:
+            yield (
+                f"cap-formats-{kq}-{vq}",
+                dict(
+                    common, qlens=(128,), context_lens=(10880,), k_quant=kq, v_quant=vq
+                ),
+            )
     else:
         for padding in [0, 512]:
             for pool in [1024, 16384]:
@@ -173,7 +208,9 @@ def cases(suite):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
-        "--suite", choices=["crossover", "geometry", "memory"], default="crossover"
+        "--suite",
+        choices=["crossover", "geometry", "memory", "limits"],
+        default="crossover",
     )
     ap.add_argument("--reps", type=int, default=7)
     ap.add_argument("--warmup", type=int, default=2)
@@ -182,12 +219,15 @@ def main():
     if args.reps < 1 or args.warmup < 0:
         ap.error("reps must be positive and warmup must be nonnegative")
     ops = get_ops()
+    if args.tiled:
+        os.environ["VLLM_METAL_TQ_PREFILL"] = "1"
     ops.set_nax_enabled(not args.tiled)
     print(
         json.dumps(
             {
                 "device": mx.device_info()["device_name"],
                 "nax_ready": ops.nax_ready(),
+                "workspace_limit_bytes": sdpa.prefill_workspace_bytes(),
                 "versions": {
                     n: importlib.metadata.version(n) for n in ["vllm", "mlx", "mlx-lm"]
                 },

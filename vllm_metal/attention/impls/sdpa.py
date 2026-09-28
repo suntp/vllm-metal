@@ -45,6 +45,11 @@ from vllm_metal.attention.attention_contracts import (
     QKNormPlacement,
 )
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+from vllm_metal.attention.caches.turboquant import (
+    prefill_bytes_per_token,
+    prefill_dequantizers,
+    prefill_workspace_bytes,
+)
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.bidi_prefill import apply_bidirectional_segments
 from vllm_metal.attention.impls.mm_prefix import (
@@ -203,6 +208,7 @@ class _TurboQuantPrefillPlan:
     restore_indices: mx.array | None
     pool_pages: mx.array
     pool_offsets: mx.array
+    workspace_bytes: int
 
 
 @dataclass(frozen=True, eq=False)
@@ -221,7 +227,7 @@ class _KernelMetadata:
     max_seq_len: int
     # Same forward/group lifetime as the existing kernel metadata. Only CPU
     # routing and gather indices are cached, never materialized K/V buffers.
-    tq_prefill_plans: dict[tuple[int, int], _TurboQuantPrefillPlan | None] = field(
+    tq_prefill_plans: dict[tuple[int, ...], _TurboQuantPrefillPlan | None] = field(
         default_factory=dict
     )
 
@@ -272,10 +278,13 @@ def _turboquant_prefill_plan(
     """Plan bounded materialization using the existing CPU scheduler metadata.
 
     Only referenced kernel blocks are gathered; shared prefixes are deduplicated.
-    Limit the gather to the longest cached prefix plus this step's new tokens.
-    Cold prefills stay batched, while unrelated long histories exceeding that
-    bound keep the compressed path. No GPU reads, new allocator or cache IDs.
+    Admit independent histories as well as shared prefixes while the combined
+    gather fits the absolute workspace reserved before KV allocation. An
+    oversized candidate is skipped before building its gather indices.
     """
+    workspace_limit = prefill_workspace_bytes()
+    if not workspace_limit:
+        return None
     min_tokens = max(
         _TQ_MIN_PREFILL_TOKENS,
         # Wide-head tiled prefill needs more rows to amortize materialization.
@@ -283,7 +292,7 @@ def _turboquant_prefill_plan(
         (_TQ_MIN_QUERIES_PER_KV_HEAD * num_kv_heads + num_query_heads - 1)
         // num_query_heads,
     )
-    key = (cache_block_size, min_tokens)
+    key = (cache_block_size, min_tokens, num_kv_heads, head_dim, workspace_limit)
     if key in meta.tq_prefill_plans:
         return meta.tq_prefill_plans[key]
     assert ctx.cu_seqlens is not None
@@ -296,19 +305,29 @@ def _turboquant_prefill_plan(
 
     kernel_bs = meta.block_size
     ratio = cache_block_size // kernel_bs
-    block_limit = max(
-        (ctx.context_lens[i] - lengths[i] + kernel_bs - 1) // kernel_bs
-        for i in candidates
-    ) + sum((lengths[i] + kernel_bs - 1) // kernel_bs for i in candidates)
+    bytes_per_block = kernel_bs * prefill_bytes_per_token(num_kv_heads, head_dim)
+    block_limit = workspace_limit // bytes_per_block
     source_blocks: dict[int, int] = {}
     prefill_ids: list[int] = []
     rows: list[list[int]] = []
+    table_width = 0
     for i in candidates:
+        num_blocks = (ctx.context_lens[i] + kernel_bs - 1) // kernel_bs
+        if num_blocks > block_limit:
+            continue
         sources = [
             raw_block_tables[i][j // ratio] * ratio + j % ratio
-            for j in range((ctx.context_lens[i] + kernel_bs - 1) // kernel_bs)
+            for j in range(num_blocks)
         ]
-        if len(source_blocks.keys() | set(sources)) > block_limit:
+        # Only inspect this candidate's new blocks; do not copy the union of
+        # every previously admitted history for every candidate.
+        additions = dict.fromkeys(
+            source for source in sources if source not in source_blocks
+        )
+        next_width = max(table_width, num_blocks)
+        next_bytes = (len(source_blocks) + len(additions)) * bytes_per_block
+        next_bytes += (len(rows) + 1) * next_width * 4
+        if next_bytes > workspace_limit:
             continue
         row = []
         for source in sources:
@@ -317,6 +336,15 @@ def _turboquant_prefill_plan(
             row.append(source_blocks[source])
         prefill_ids.append(i)
         rows.append(row)
+        table_width = next_width
+    if len(prefill_ids) < len(candidates):
+        logger.info_once(
+            "Metal: TurboQuant prefill workspace limit reached; "
+            "overflow histories use compressed attention."
+        )
+    if not prefill_ids:
+        meta.tq_prefill_plans[key] = None
+        return None
     selected = set(prefill_ids)
     fallback_ids = [i for i in range(len(lengths)) if i not in selected]
     query_order: list[int] = []
@@ -350,8 +378,9 @@ def _turboquant_prefill_plan(
             inverse[original] = packed
         restore = mx.array(inverse, dtype=mx.int32)
     blocks = mx.array(list(source_blocks), dtype=mx.int32)
-    # Keep addressing in page/token coordinates: a valid int32 page ID can
-    # still overflow if multiplied into an absolute int32 token offset.
+    # Kernel block IDs, including translated IDs, must fit int32 as required
+    # by the primitive. Multiplying those IDs by kernel_bs may still overflow;
+    # gather instead with scheduler-page and within-page token coordinates.
     pages = mx.repeat(blocks // ratio, kernel_bs)
     offsets = (
         (blocks % ratio)[:, None] * kernel_bs + mx.arange(kernel_bs, dtype=mx.int32)
@@ -362,6 +391,7 @@ def _turboquant_prefill_plan(
         restore,
         pages,
         offsets,
+        len(source_blocks) * bytes_per_block + len(rows) * table_width * 4,
     )
     meta.tq_prefill_plans[key] = plan
     return plan
@@ -1051,7 +1081,15 @@ def sdpa_forward(
         if plan is None:
             out = quantized_attention(q_3d, meta)
         else:
-            from vllm_metal.attention.caches.turboquant import turbo_quant_decode
+            logger.info_once("Metal: bounded TurboQuant prefill lane active.")
+            logger.debug(
+                "TurboQuant prefill: %d requests, %d gathered tokens, "
+                "%d workspace bytes, %d compressed requests",
+                plan.prefill.seq_lens.shape[0],
+                plan.pool_pages.shape[0],
+                plan.workspace_bytes,
+                0 if plan.fallback is None else plan.fallback.seq_lens.shape[0],
+            )
 
             # Index fresh writer handles in the original strided pool. A
             # full-pool reshape would copy padded pages before the gather.
@@ -1060,17 +1098,15 @@ def sdpa_forward(
             def gather(cache: mx.array) -> mx.array:
                 return cache[plan.pool_pages, plan.pool_offsets]
 
-            k16, v16 = turbo_quant_decode(
-                (
-                    gather(new_k_cache),
-                    gather(new_key_scale_cache),
-                    gather(new_key_zero_cache),
-                ),
-                (gather(new_v_cache), gather(new_value_scale_cache)),
-                output_dtype=q_3d.dtype,
-                key_quant_type=kv_cache.k_quant,
-                value_bits=kv_cache.v_bits,
+            decode_key, decode_value = prefill_dequantizers(
+                kv_cache.k_quant, kv_cache.v_bits, q_3d.dtype
             )
+            k16 = decode_key(
+                gather(new_k_cache),
+                gather(new_key_scale_cache),
+                gather(new_key_zero_cache),
+            )
+            v16 = decode_value(gather(new_v_cache), gather(new_value_scale_cache))
             batch = plan.prefill
             query = q_3d if batch.query_indices is None else q_3d[batch.query_indices]
             ops.paged_attention_primitive(

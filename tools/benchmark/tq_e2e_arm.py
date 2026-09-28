@@ -1,21 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
-"""One e2e arm: real model + TurboQuant prefill lane end to end.
+"""Warm paired model TTFT or teacher-forced perplexity through real vLLM.
 
-Runs offline vLLM on a supplied model (originally Qwen3.8-27B-4bit),
-greedy-decodes the newspaper prompt, and reports actual prompt/token counts
-and generation wall time as JSON. TTFT is null when vLLM does not return it.
-This is an in-process benchmark, not serving throughput. The tq-reference
-arm disables only the prefill planner; both TQ arms use sdpa_forward.
+Both TQ arms share a loaded model and quantized cache settings; the reference
+disables only the prefill planner. Prefix caching is off. vLLM request metrics
+provide TTFT separately from total generation time. This is an in-process
+benchmark, excluding tokenization, HTTP and concurrent serving queues.
 
-    PYTHONPATH=. python tools/benchmark/tq_e2e_arm.py --model /path/to/model --arm tq
+    PYTHONPATH=. python tools/benchmark/tq_e2e_arm.py --model /path/to/model
+    PYTHONPATH=. python tools/benchmark/tq_e2e_arm.py --model /path/to/model \
+        --quality-text /path/to/wikitext-test.txt --output quality.json
 """
 
 import argparse
+import hashlib
 import importlib.metadata
 import json
+import math
 import os
+import statistics
 import sys
 import time
+from pathlib import Path
 
 PARA = (
     "The city library opened its doors at eight in the morning, and by nine "
@@ -35,73 +40,274 @@ PROMPT = (
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
-    ap.add_argument("--arm", choices=("bf16", "tq", "tq-reference"), required=True)
-    ap.add_argument("--max-tokens", type=int, default=32)
+    ap.add_argument(
+        "--arm", choices=("paired", "bf16", "tq", "tq-reference"), default="paired"
+    )
+    ap.add_argument("--prompt-tokens", type=int, nargs="+", default=[1153, 8192, 16384])
+    ap.add_argument("--max-tokens", type=int, default=1)
+    ap.add_argument("--batch-tokens", type=int, default=2048)
+    ap.add_argument("--reps", type=int, default=3)
+    ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--k-quant", default="q8_0")
     ap.add_argument("--v-quant", default="q3_0")
+    ap.add_argument("--quality-text", type=Path)
+    ap.add_argument("--quality-windows", type=int, default=16)
+    ap.add_argument("--quality-window", type=int, default=1024)
+    ap.add_argument("--output", type=Path)
     args = ap.parse_args()
+    if (
+        min(
+            *args.prompt_tokens,
+            args.max_tokens,
+            args.batch_tokens,
+            args.reps,
+            args.quality_windows,
+            args.quality_window,
+        )
+        < 1
+        or args.warmup < 0
+    ):
+        ap.error("lengths/repetitions must be positive and warmup nonnegative")
+    if args.quality_text and (args.arm != "paired" or args.quality_window < 256):
+        ap.error("quality comparison requires --arm paired and window >= 256")
 
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
+    import mlx.core as mx
+    import numpy as np
     from vllm import LLM, SamplingParams
 
-    kwargs = {}
-    if args.arm == "tq-reference":
-        from vllm_metal.attention.impls import sdpa
+    from vllm_metal.attention.caches.turboquant import prefill_workspace_bytes
+    from vllm_metal.attention.impls import sdpa
+    from vllm_metal.metal import get_ops
 
-        sdpa._turboquant_prefill_plan = lambda *args, **kwargs: None
+    original_planner = sdpa._turboquant_prefill_plan
+    dispatch = {}
+    active_arm = args.arm
+
+    def counted_planner(*planner_args, **kwargs):
+        dispatch["prefill_layer_calls"] += 1
+        if active_arm == "tq-reference":
+            return None
+        plan = original_planner(*planner_args, **kwargs)
+        if plan is not None:
+            dispatch["lane_layer_calls"] += 1
+            dispatch["lane_segments"] += plan.prefill.seq_lens.shape[0]
+            dispatch["max_gathered_tokens"] = max(
+                dispatch["max_gathered_tokens"], plan.pool_pages.shape[0]
+            )
+            dispatch["max_workspace_bytes"] = max(
+                dispatch["max_workspace_bytes"], plan.workspace_bytes
+            )
+        return plan
+
+    sdpa._turboquant_prefill_plan = counted_planner
+
+    def reset_dispatch():
+        dispatch.update(
+            prefill_layer_calls=0,
+            lane_layer_calls=0,
+            lane_segments=0,
+            max_gathered_tokens=0,
+            max_workspace_bytes=0,
+        )
+
+    reset_dispatch()
+
+    kwargs = {}
     if args.arm != "bf16":
         kwargs["additional_config"] = {
             "turboquant": True,
             "k_quant": args.k_quant,
             "v_quant": args.v_quant,
         }
+    max_prompt = args.quality_window if args.quality_text else max(args.prompt_tokens)
     t0 = time.perf_counter()
     llm = LLM(
         model=os.path.expanduser(args.model),
-        max_model_len=2048,
+        max_model_len=max_prompt + args.max_tokens,
+        max_num_batched_tokens=args.batch_tokens,
         max_num_seqs=1,
         gpu_memory_utilization=0.7,
+        enable_prefix_caching=False,
+        disable_log_stats=False,
         **kwargs,
     )
     load_s = time.perf_counter() - t0
+    tokenizer = llm.get_tokenizer()
+    arms = ["tq-reference", "tq"] if args.arm == "paired" else [args.arm]
+    metadata = {
+        "model": args.model,
+        "device": mx.device_info()["device_name"],
+        "nax_ready": get_ops().nax_ready(),
+        "workspace_limit_bytes": prefill_workspace_bytes(),
+        "versions": {
+            n: importlib.metadata.version(n)
+            for n in ("vllm", "mlx", "mlx-lm", "mlx-vlm", "torch", "numpy")
+        },
+        "mlx_enable_tf32": os.getenv("MLX_ENABLE_TF32"),
+        "prefix_caching": False,
+        "arguments": vars(args),
+        "load_s": load_s,
+    }
+    records = []
+    summaries = []
+    print(json.dumps({"metadata": metadata}, default=str), flush=True)
 
-    sp = SamplingParams(temperature=0, max_tokens=args.max_tokens, ignore_eos=True)
-    t1 = time.perf_counter()
-    outs = llm.generate([PROMPT], sp)
-    gen_s = time.perf_counter() - t1
+    def run(ids, arm, phase, trial, *, quality=False):
+        nonlocal active_arm
+        active_arm = arm
+        reset_dispatch()
+        mx.synchronize()
+        start = time.perf_counter()
+        result = llm.generate(
+            [{"prompt_token_ids": ids}],
+            SamplingParams(
+                temperature=0,
+                max_tokens=1 if quality else args.max_tokens,
+                ignore_eos=True,
+                prompt_logprobs=1 if quality else None,
+            ),
+            use_tqdm=False,
+        )[0]
+        elapsed = time.perf_counter() - start
+        metrics = result.metrics
+        ttft = getattr(metrics, "first_token_latency", None)
+        if ttft is None or ttft <= 0:
+            raise RuntimeError("vLLM did not report a valid first_token_latency")
+        row = {
+            "phase": phase,
+            "trial": trial,
+            "arm": arm,
+            "prompt_tokens": len(ids),
+            "tokens": list(result.outputs[0].token_ids),
+            "ttft_s": ttft,
+            "gen_wall_s": elapsed,
+            "dispatch": dict(dispatch),
+        }
+        if arm == "tq" and not dispatch["lane_layer_calls"]:
+            raise RuntimeError(
+                "No prefill lane calls: check hardware opt-in, lengths and workspace budget"
+            )
+        if quality:
+            if result.prompt_logprobs is None or len(result.prompt_logprobs) != len(
+                ids
+            ):
+                raise RuntimeError("Missing teacher-forced prompt logprobs")
+            logprobs, top1 = [], []
+            for target, probs in zip(ids[1:], result.prompt_logprobs[1:], strict=True):
+                if not probs or target not in probs:
+                    raise RuntimeError("Missing ground-truth prompt token logprob")
+                logprobs.append(probs[target].logprob)
+                top1.append(min(probs, key=lambda token: probs[token].rank))
+            if not all(math.isfinite(p) for p in logprobs):
+                raise RuntimeError("Nonfinite prompt logprobs")
+            row.update(
+                scored_tokens=len(logprobs),
+                nll_sum=-sum(logprobs),
+                logprobs=logprobs,
+                top1=top1,
+            )
+        records.append(row)
+        print(
+            json.dumps({k: v for k, v in row.items() if k not in ("logprobs", "top1")}),
+            flush=True,
+        )
+        return row
 
-    o = outs[0]
-    toks = list(o.outputs[0].token_ids)
-    m = o.metrics
-    ttft = None
     try:
-        ttft = m.first_token_time - m.arrival_time
-    except (AttributeError, TypeError):
-        ttft = None
-    text = o.outputs[0].text
-    print(
-        json.dumps(
-            {
-                "arm": args.arm,
-                "model": args.model,
-                "k_quant": args.k_quant,
-                "v_quant": args.v_quant,
-                "versions": {
-                    package: importlib.metadata.version(package)
-                    for package in ("vllm", "mlx", "mlx-lm")
-                },
-                "mlx_enable_tf32": os.getenv("MLX_ENABLE_TF32"),
-                "prompt_tokens": len(o.prompt_token_ids),
-                "tokens": toks,
-                "ttft_s": round(ttft, 3) if ttft else None,
-                "gen_wall_s": round(gen_s, 3),
-                "load_s": round(load_s, 1),
-                "text_head": text[:60],
+        if args.quality_text:
+            text = args.quality_text.read_text()
+            token_ids = tokenizer.encode(text, add_special_tokens=False)
+            needed = args.quality_windows * args.quality_window
+            if len(token_ids) < needed:
+                raise ValueError(
+                    f"Quality corpus has {len(token_ids)} tokens; need {needed}"
+                )
+            metadata["corpus_sha256"] = hashlib.sha256(text.encode()).hexdigest()
+            metadata["scored_token_ids_sha256"] = hashlib.sha256(
+                json.dumps(token_ids[:needed]).encode()
+            ).hexdigest()
+            nll = {arm: [] for arm in arms}
+            agrees = 0
+            for window in range(args.quality_windows):
+                ids = token_ids[
+                    window * args.quality_window : (window + 1) * args.quality_window
+                ]
+                pair = {}
+                for arm in arms if window % 2 == 0 else arms[::-1]:
+                    pair[arm] = run(ids, arm, "quality", window, quality=True)
+                    nll[arm].append(pair[arm]["nll_sum"])
+                agrees += sum(
+                    a == b
+                    for a, b in zip(
+                        pair[arms[0]]["top1"], pair[arms[1]]["top1"], strict=True
+                    )
+                )
+            count = args.quality_windows * (args.quality_window - 1)
+            ppl = {arm: math.exp(sum(values) / count) for arm, values in nll.items()}
+            # Resample paired windows, preserving token alignment and context.
+            deltas = (np.array(nll["tq"]) - np.array(nll["tq-reference"])) / (
+                args.quality_window - 1
+            )
+            bootstrap = (
+                np.random.default_rng(0)
+                .choice(deltas, (10000, len(deltas)))
+                .mean(axis=1)
+            )
+            summary = {
+                "kind": "quality",
+                "scored_tokens": count,
+                "perplexity": ppl,
+                "relative_ppl_change_percent": (ppl["tq"] / ppl["tq-reference"] - 1)
+                * 100,
+                "mean_delta_nll": float(deltas.mean()),
+                "delta_nll_bootstrap_95ci": np.quantile(
+                    bootstrap, [0.025, 0.975]
+                ).tolist(),
+                "teacher_forced_top1_agreement": agrees / count,
             }
-        ),
-        flush=True,
-    )
+            summaries.append(summary)
+            print(json.dumps(summary), flush=True)
+        else:
+            for length in args.prompt_tokens:
+                ids = tokenizer.encode(
+                    PARA * (length // 32 + 2), add_special_tokens=False
+                )[:length]
+                assert len(ids) == length
+                measured = []
+                for trial in range(-args.warmup, args.reps):
+                    for arm in arms if trial % 2 == 0 else arms[::-1]:
+                        row = run(
+                            ids, arm, "warmup" if trial < 0 else "measured", trial
+                        )
+                        if trial >= 0:
+                            measured.append(row)
+                summary = {
+                    "kind": "latency",
+                    "prompt_tokens": length,
+                    "output_tokens": args.max_tokens,
+                    "median_ttft_s": {},
+                    "median_gen_wall_s": {},
+                }
+                for arm in arms:
+                    for field in ("ttft_s", "gen_wall_s"):
+                        summary[f"median_{field}"][arm] = statistics.median(
+                            row[field] for row in measured if row["arm"] == arm
+                        )
+                summaries.append(summary)
+                print(json.dumps(summary), flush=True)
+        if args.output:
+            args.output.write_text(
+                json.dumps(
+                    {"metadata": metadata, "summaries": summaries, "records": records},
+                    indent=2,
+                    default=str,
+                )
+                + "\n"
+            )
+    finally:
+        sdpa._turboquant_prefill_plan = original_planner
 
 
 if __name__ == "__main__":

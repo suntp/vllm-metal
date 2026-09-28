@@ -6,12 +6,48 @@ including key/value quantization metadata, bit packing helpers, and the FWHT
 rotation/sign tables used by the Metal dequantization kernels.
 """
 
+from collections.abc import Callable
+from functools import lru_cache
 from typing import cast
 
 import mlx.core as mx
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def prefill_workspace_bytes() -> int:
+    """Resolve the same allowance for cache sizing and prefill admission."""
+    from vllm_metal import envs
+    from vllm_metal.metal import get_ops
+
+    mode = envs.VLLM_METAL_TQ_PREFILL
+    if mode not in ("auto", "0", "1"):
+        raise ValueError("VLLM_METAL_TQ_PREFILL must be auto, 0 or 1")
+    mib = envs.VLLM_METAL_TQ_PREFILL_MAX_MIB
+    if mib < 0:
+        raise ValueError("VLLM_METAL_TQ_PREFILL_MAX_MIB must be nonnegative")
+    if mode == "0" or mib == 0:
+        return 0
+    if mode == "auto" and not get_ops().nax_ready():
+        logger.info_once(
+            "Metal: TurboQuant prefill stays compressed without NAX; "
+            "VLLM_METAL_TQ_PREFILL=1 opts into uncalibrated tiled prefill."
+        )
+        return 0
+    return mib * 2**20
+
+
+def prefill_bytes_per_token(num_kv_heads: int, head_dim: int) -> int:
+    """Conservative allowance for both compiled decoders and gather indices.
+
+    Per KV element: 4 bytes for the final K/V pair, 8 for FP32 value
+    reconstruction/FWHT, and 12 for packed gathers, unpacking and conversion.
+    The FP32 math is retained; only each decoder's final store is FP16/BF16.
+    Query/projection/attention buffers remain in the existing profile budget.
+    """
+    return 24 * num_kv_heads * head_dim + 16
+
 
 _RNG_KEY = mx.random.key(42)
 
@@ -278,15 +314,7 @@ def _pack_3bit(vals: mx.array) -> mx.array:
 
 
 def _unpack_3bit(packed: mx.array, orig_dim: int) -> mx.array:
-    shape = packed.shape
-    g = packed.reshape(*shape[:-1], -1, 3).astype(mx.uint32)
-    b0, b1, b2 = g[..., 0], g[..., 1], g[..., 2]
-    combined = b0 | (b1 << 8) | (b2 << 16)
-    vals = []
-    for i in range(8):
-        vals.append((combined >> (i * 3)) & 0x7)
-    unpacked = mx.stack(vals, axis=-1).astype(mx.uint8)
-    return unpacked.reshape(*shape[:-1], orig_dim)
+    return _unpack_byte_pairs(packed, orig_dim, 3)
 
 
 def _pack_4bit(vals: mx.array) -> mx.array:
@@ -318,19 +346,23 @@ def _pack_5bit(vals: mx.array) -> mx.array:
 
 
 def _unpack_5bit(packed: mx.array, orig_dim: int) -> mx.array:
+    return _unpack_byte_pairs(packed, orig_dim, 5)
+
+
+def _unpack_byte_pairs(packed: mx.array, orig_dim: int, bits: int) -> mx.array:
+    """Extract eight sub-byte values without widening a full tensor to u32/u64."""
     shape = packed.shape
-    g = packed.reshape(*shape[:-1], -1, 5).astype(mx.uint64)
-    combined = (
-        g[..., 0]
-        | (g[..., 1] << 8)
-        | (g[..., 2] << 16)
-        | (g[..., 3] << 24)
-        | (g[..., 4] << 32)
-    )
+    g = packed.reshape(*shape[:-1], -1, bits)
     vals = []
     for i in range(8):
-        vals.append((combined >> (i * 5)) & 0x1F)
-    unpacked = mx.stack(vals, axis=-1).astype(mx.uint8)
+        byte, shift = divmod(i * bits, 8)
+        value = g[..., byte] >> shift
+        if shift + bits > 8:
+            # Only the low `bits` bits survive; any uint8 overflow discards
+            # bits outside this value, never bits we need to reconstruct.
+            value = value | (g[..., byte + 1] << (8 - shift))
+        vals.append(value & ((1 << bits) - 1))
+    unpacked = mx.stack(vals, axis=-1)
     return unpacked.reshape(*shape[:-1], orig_dim)
 
 
@@ -554,3 +586,29 @@ def turbo_quant_decode(
         v_indices, v_scale, output_dtype, block_size, bits=value_bits
     )
     return k, v
+
+
+@lru_cache(maxsize=64)
+def prefill_dequantizers(
+    key_quant_type: str, value_bits: int, output_dtype: mx.Dtype
+) -> tuple[Callable[..., mx.array], Callable[..., mx.array]]:
+    """Separate fused K/V graphs, casting before each graph returns.
+
+    Compiling unpack/elementwise operations avoids their full-sized eager
+    intermediates. Keep the FP32 FWHT and scale arithmetic used by the
+    reference decoder; lowering those operations to BF16 changes accuracy.
+    Only functions are cached, never a request's materialized K/V arrays.
+    """
+    k_bits: int = QUANT_PARAMS[key_quant_type]["bits"]
+
+    def decode_key(indices: mx.array, scale: mx.array, zero: mx.array) -> mx.array:
+        if k_bits < 8:
+            indices = unpack_bits(indices, k_bits, scale.shape[-1] * BLOCK_SIZE)
+        return turbo_quant_decode_key(indices, scale, zero, output_dtype)
+
+    def decode_value(indices: mx.array, scale: mx.array) -> mx.array:
+        if value_bits < 8:
+            indices = unpack_bits(indices, value_bits, scale.shape[-1] * BLOCK_SIZE)
+        return turbo_quant_decode_value(indices, scale, output_dtype, bits=value_bits)
+
+    return mx.compile(decode_key), mx.compile(decode_value)

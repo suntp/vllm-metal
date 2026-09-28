@@ -277,6 +277,32 @@ class TestWorkerRunnerBoundaryDelegation:
 
 
 class TestPagedAttentionPlanDiagnostics:
+    @pytest.mark.parametrize(
+        "turboquant,mode,expected_mib",
+        [(True, "1", 64), (True, "0", 0), (False, "1", 0)],
+    )
+    def test_tq_workspace_is_reserved_inside_memory_fraction(
+        self, monkeypatch, turboquant, mode, expected_mib
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_TQ_PREFILL", mode)
+        monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "64")
+        monkeypatch.setattr(
+            "vllm_metal.v1.cache_policy.get_config",
+            lambda: MetalConfig(mlx_device="gpu", turboquant=turboquant),
+        )
+        planner = self._make_planner(
+            SimpleNamespace(is_hybrid=False), gpu_memory_utilization=0.5
+        )
+        monkeypatch.setattr(
+            WorkerCachePlanner, "_metal_limit_bytes", lambda self: 10_000_000_000
+        )
+        monkeypatch.setattr(
+            WorkerCachePlanner, "get_model_memory_usage", lambda self: 2_000_000_000
+        )
+        plan = planner._paged_attention_plan(overhead=100_000_000)
+        assert plan.kv_budget == 2_900_000_000 - expected_mib * 2**20
+        assert plan.overhead == 100_000_000 + expected_mib * 2**20
+
     def _make_planner(
         self,
         model_runner: object,
