@@ -45,6 +45,7 @@ from vllm_metal.attention.attention_contracts import (
 )
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.turboquant import (
+    FWHT_SUPPORTED_HEAD_DIMS,
     prefill_bytes_per_token,
     prefill_workspace_bytes,
 )
@@ -1104,7 +1105,7 @@ def sdpa_forward(
             # materializing that history would undo the saving.
             and layer_sliding_window < 0
             and q_3d.dtype in (mx.bfloat16, mx.float16)
-            and q_3d.shape[2] in (64, 128, 256, 512)
+            and q_3d.shape[2] in FWHT_SUPPORTED_HEAD_DIMS
             and kernel_block_size in _KERNEL_BLOCK_SIZES
             and new_k_cache.shape[1] == cache_block_size
             and cache_block_size % kernel_block_size == 0

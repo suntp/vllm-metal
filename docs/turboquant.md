@@ -117,8 +117,8 @@ vllm serve meta-llama/Llama-3.2-1B-Instruct \
 
 Eligible TurboQuant prefills materialize the referenced KV pages and use the
 existing NAX or tiled attention kernel. `VLLM_METAL_TQ_PREFILL=auto` enables this
-when NAX is available (M5); `1` opts into tiled prefill on other GPUs, and `0`
-disables it. The crossover was calibrated on M5 Pro; broader hardware and shape
+when NAX is available (M5; `VLLM_METAL_DISABLE_NAX=1` makes it behave as `0`);
+`1` opts into tiled prefill on other GPUs, and `0` disables it. The crossover was calibrated on M5 Pro; broader hardware and shape
 calibration is required before enabling tiled prefill by default on M1–M4.
 
 Eligibility uses the **new query tokens in the current scheduler chunk**:

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exercise production routing, fused cache writes and native TQ attention."""
 
+import gc
+
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -186,8 +188,6 @@ def test_capacity_fallback_restores_interleaved_rows(recorded_ops, monkeypatch):
 
 
 def test_prefill_scratch_does_not_scale_with_unrelated_histories(monkeypatch):
-    import gc
-
     monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "64")
     peaks = []
     for count in [1, 4]:
@@ -220,8 +220,6 @@ def test_prefill_scratch_does_not_scale_with_unrelated_histories(monkeypatch):
 def test_peak_materialization_fits_reserved_allowance(
     materialized_lengths, monkeypatch, k_quant, v_quant
 ):
-    import gc
-
     monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "64")
     case = build_case(
         qlens=(128,),
