@@ -198,6 +198,45 @@ request counts, gathered tokens and estimated bytes. Larger histories still need
 more scratch space: this is bounded materialization, not constant-memory
 streaming attention.
 
+## Head-Dimension 128 Crossover
+
+M5 Pro 64 GB, K8/V3, head dimension 128, eight query heads, FP16/BF16,
+8K/32K KV histories and TF32 disabled. The table reports the range across both
+precisions and history lengths. Ratios are compressed time divided by
+materialized time; values below 1 mean materialization is slower. These are
+warmed single-layer production-wrapper timings, including projection, cache
+writes, planning, materialization and synchronization, not model TTFT.
+
+| Backend | Q/KV heads | 16 new tokens | 32 | 64 | 128 | 256 |
+|---|---|---:|---:|---:|---:|---:|
+| NAX | GQA 8/2 | 0.65–0.68× | 1.04–1.12× | 2.27–2.93× | 4.26–5.60× | 7.74–10.82× |
+| NAX | MHA 8/8 | 0.55–0.59× | 0.89–0.97× | 1.89–2.52× | 3.54–4.74× | 6.34–9.12× |
+| Tiled | GQA 8/2 | 0.52–0.60× | 0.90–0.94× | 1.60–1.72× | 2.92–3.54× | 4.35–5.35× |
+| Tiled | MHA 8/8 | 0.47–0.51× | 0.78–0.81× | 1.37–1.60× | 2.52–3.07× | 3.95–4.66× |
+
+On this device, the observed NAX GQA crossover is between 16 and 32 new tokens;
+the 8K advantage at 32 tokens is only 4–6%. NAX MHA and both tiled shapes
+cross between 32 and 64 tokens. The production policy remains conservative:
+128 new tokens for this GQA shape and 256 for MHA. These measurements do not
+establish thresholds for other GPUs or model shapes. Some configurations
+still show timing variation of several percent.
+
+The `crossover-hd128` suite forces only the query-count threshold in the
+benchmark to compare both algorithms below the production cutoff. It retains
+shape validation, the workspace limit and the normal synchronization boundary,
+and rejects a sample if materialization did not run or any output is nonfinite.
+Each record also reports `production_lane_selected`, separately from the
+forced measurement. The older `crossover` suite continues to measure ordinary
+routing, including fallbacks.
+
+```bash
+PYTHONPATH=. VLLM_METAL_BUILD_FROM_SOURCE=1 MLX_ENABLE_TF32=0 \
+  python tools/benchmark/tq_lane_verify.py --suite crossover-hd128 --reps 31 --warmup 5
+# The same matrix through tiled attention:
+PYTHONPATH=. VLLM_METAL_BUILD_FROM_SOURCE=1 MLX_ENABLE_TF32=0 \
+  python tools/benchmark/tq_lane_verify.py --suite crossover-hd128 --tiled --reps 31 --warmup 5
+```
+
 ## Validation and Reproduction
 
 `tests/attention/test_turboquant_prefill.py` checks the production wrapper using
@@ -208,7 +247,8 @@ bounds. Fused dequantization is compared with the independent Python decoder.
 
 The attention microbenchmark uses the same fixture, with interleaved timings,
 numerical error, actual dispatch and peak additional MLX memory. Suites are
-`crossover`, `geometry` and `long`; add `--tiled` to test the tiled backend:
+`crossover`, `crossover-hd128`, `geometry` and `long`; add `--tiled` to test
+the tiled backend:
 
 ```bash
 PYTHONPATH=. VLLM_METAL_BUILD_FROM_SOURCE=1 MLX_ENABLE_TF32=0 \

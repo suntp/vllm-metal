@@ -7,7 +7,13 @@ The fixture binds upstream storage and uses nonidentity tables, optional page
 padding, shared prefixes and extra unused pool capacity. Reported error is
 against the compressed native attention path on the same quantized cache.
 
+The crossover-hd128 suite overrides only the query-count threshold, retaining
+shape and workspace checks and reporting the normal production policy separately.
+Other suites retain normal routing, including fallbacks.
+
     PYTHONPATH=. python tools/benchmark/tq_lane_verify.py --suite crossover
+    PYTHONPATH=. python tools/benchmark/tq_lane_verify.py --suite crossover-hd128
+    PYTHONPATH=. python tools/benchmark/tq_lane_verify.py --suite crossover-hd128 --tiled
     PYTHONPATH=. python tools/benchmark/tq_lane_verify.py --suite long
     PYTHONPATH=. python tools/benchmark/tq_lane_verify.py --suite geometry --tiled
 """
@@ -18,7 +24,7 @@ import json
 import os
 import statistics
 import time
-from contextlib import nullcontext
+from contextlib import ExitStack
 from unittest.mock import patch
 
 import mlx.core as mx
@@ -28,28 +34,59 @@ from tools.attention_bench_utils import package_versions
 from tools.benchmark.tq_prefill_case import build_case
 from vllm_metal.attention.caches.turboquant import prefill_workspace_bytes
 from vllm_metal.attention.impls import sdpa
+from vllm_metal.attention.impls import turboquant_prefill as tq_prefill
 from vllm_metal.metal import get_ops
 
 
-def run(case, reference):
+def run(case, reference, *, force_materialization=False):
     # A fresh forward's metadata; normal multi-layer serving reuses it after
     # the first layer. Both arms pay the same projection and cache-write work.
     case.ctx.kernel_metadata_cache.clear()
-    context = (
-        patch.object(sdpa, "_turboquant_prefill_plan", return_value=None)
-        if reference
-        else nullcontext()
-    )
-    with context:
+    with ExitStack() as stack:
+        if reference:
+            stack.enter_context(
+                patch.object(sdpa, "_turboquant_prefill_plan", return_value=None)
+            )
+        elif force_materialization:
+            # Measure the algorithm below the production threshold, without
+            # bypassing shape, budget or memory-lifetime guards.
+            stack.enter_context(
+                patch.object(tq_prefill, "min_prefill_tokens", return_value=2)
+            )
         output = case.forward()
         mx.eval(output)
     return output
 
 
-def measure(label, kwargs, reps, warmup):
+def measure(label, kwargs, reps, warmup, *, force_materialization=False):
     case = build_case(**kwargs)
     reference = run(case, True)
-    lane = run(case, False)
+    production = run(case, False)
+    production_selected = any(
+        plan is not None
+        for meta in case.ctx.kernel_metadata_cache.values()
+        for plan in meta.tq_prefill_plans.values()
+    )
+    lane = run(case, False, force_materialization=force_materialization)
+    selected = any(
+        plan is not None
+        for meta in case.ctx.kernel_metadata_cache.values()
+        for plan in meta.tq_prefill_plans.values()
+    )
+    if force_materialization and not selected:
+        raise RuntimeError(f"{label}: materialization rejected; no crossover measured")
+    if not all(
+        mx.all(mx.isfinite(output)).item() for output in (reference, production, lane)
+    ):
+        raise RuntimeError(
+            f"{label}: nonfinite attention output; no crossover measured"
+        )
+    np.testing.assert_allclose(
+        np.array(production.astype(mx.float32)),
+        np.array(reference.astype(mx.float32)),
+        atol=0.02,
+        rtol=0.03,
+    )
     delta = mx.abs(lane.astype(mx.float32) - reference.astype(mx.float32)).max().item()
     np.testing.assert_allclose(
         np.array(lane.astype(mx.float32)),
@@ -57,13 +94,13 @@ def measure(label, kwargs, reps, warmup):
         atol=0.02,
         rtol=0.03,
     )
-    del lane, reference
+    del production, lane, reference
     samples = {"compressed": [], "prefill": []}
     for rep in range(warmup + reps):
         arms = [True, False] if rep % 2 == 0 else [False, True]
         for reference in arms:
             start = time.perf_counter()
-            output = run(case, reference)
+            output = run(case, reference, force_materialization=force_materialization)
             elapsed = (time.perf_counter() - start) * 1000
             if rep >= warmup:
                 samples["compressed" if reference else "prefill"].append(elapsed)
@@ -75,7 +112,7 @@ def measure(label, kwargs, reps, warmup):
         mx.clear_cache()
         mx.reset_peak_memory()
         before = mx.get_active_memory()
-        output = run(case, reference)
+        output = run(case, reference, force_materialization=force_materialization)
         mx.synchronize()
         memory["compressed" if reference else "prefill"] = (
             mx.get_peak_memory() - before
@@ -99,6 +136,8 @@ def measure(label, kwargs, reps, warmup):
                 "peak_extra_mib": memory,
                 "samples_ms": samples,
                 "lane_selected": bool(plans),
+                "production_lane_selected": production_selected,
+                "forced_materialization": force_materialization,
                 "lane_requests": sum(plan.prefill.seq_lens.shape[0] for plan in plans),
                 "workspace_estimate_bytes": sum(plan.workspace_bytes for plan in plans),
             },
@@ -130,6 +169,22 @@ def cases(suite):
                 f"q{qlen}-kv{context}",
                 dict(common, qlens=(qlen,), context_lens=(context,)),
             )
+    elif suite == "crossover-hd128":
+        for n_kv_heads in [2, 8]:
+            for dtype in [mx.float16, mx.bfloat16]:
+                for context in [8192, 32768]:
+                    for qlen in [16, 32, 64, 96, 128, 192, 256, 512]:
+                        yield (
+                            f"d128-q8-kv{n_kv_heads}-{dtype}-q{qlen}-ctx{context}",
+                            {
+                                "head_dim": 128,
+                                "n_heads": 8,
+                                "n_kv_heads": n_kv_heads,
+                                "dtype": dtype,
+                                "qlens": (qlen,),
+                                "context_lens": (context,),
+                            },
+                        )
     elif suite == "geometry":
         for hd, nq, nkv in [(64, 8, 8), (128, 8, 2), (256, 24, 4), (512, 8, 1)]:
             for dtype in [mx.float16, mx.bfloat16]:
@@ -167,7 +222,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--suite",
-        choices=["crossover", "geometry", "long"],
+        choices=["crossover", "crossover-hd128", "geometry", "long"],
         default="crossover",
     )
     ap.add_argument("--reps", type=int, default=7)
@@ -193,7 +248,13 @@ def main():
     )
     try:
         for label, kwargs in cases(args.suite):
-            measure(label, kwargs, args.reps, args.warmup)
+            measure(
+                label,
+                kwargs,
+                args.reps,
+                args.warmup,
+                force_materialization=args.suite == "crossover-hd128",
+            )
     finally:
         ops.set_nax_enabled(True)
 
