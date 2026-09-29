@@ -520,7 +520,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         captured: dict[str, object] = {}
 
         def capture_prepare_grouped(
-            decode_info, prefill_info, block_sizes, *, merge_verify_windows
+            decode_info, prefill_info, block_sizes, *, merge_verify_windows, **_kwargs
         ):
             captured["decode_info"] = decode_info
             captured["prefill_info"] = prefill_info
@@ -587,7 +587,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         captured: dict[str, object] = {}
 
         def capture_prepare_grouped(
-            decode_info, prefill_info, block_sizes, *, merge_verify_windows
+            decode_info, prefill_info, block_sizes, *, merge_verify_windows, **_kwargs
         ):
             del prefill_info, block_sizes, merge_verify_windows
             captured["decode_info"] = decode_info
@@ -635,7 +635,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         captured: dict[str, object] = {}
 
         def capture_prepare_grouped(
-            decode_info, prefill_info, block_sizes, *, merge_verify_windows
+            decode_info, prefill_info, block_sizes, *, merge_verify_windows, **_kwargs
         ):
             del merge_verify_windows
             captured["decode_info"] = decode_info
@@ -783,7 +783,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         captured: dict[str, object] = {}
 
         def capture_prepare_grouped(
-            decode_info, prefill_info, block_sizes, *, merge_verify_windows
+            decode_info, prefill_info, block_sizes, *, merge_verify_windows, **_kwargs
         ):
             del merge_verify_windows
             captured["decode_info"] = decode_info
@@ -839,7 +839,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         captured: dict[str, object] = {}
 
         def capture_prepare_grouped(
-            decode_info, prefill_info, block_sizes, *, merge_verify_windows
+            decode_info, prefill_info, block_sizes, *, merge_verify_windows, **_kwargs
         ):
             del merge_verify_windows
             captured["decode_info"] = decode_info
@@ -904,7 +904,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         captured: dict[str, object] = {}
 
         def capture_prepare_grouped(
-            decode_info, prefill_info, block_sizes, *, merge_verify_windows
+            decode_info, prefill_info, block_sizes, *, merge_verify_windows, **_kwargs
         ):
             del merge_verify_windows
             captured["decode_info"] = decode_info

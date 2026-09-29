@@ -31,6 +31,7 @@ All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass, field
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -52,12 +53,10 @@ from vllm_metal.attention.impls.mm_prefix import (
     image_block_path,
 )
 from vllm_metal.attention.impls.turboquant_prefill import (
-    KERNEL_BLOCK_SIZES as _KERNEL_BLOCK_SIZES,
-)
-from vllm_metal.attention.impls.turboquant_prefill import (
+    KERNEL_BLOCK_SIZES,
     _AttentionBatch,
-    _KernelMetadata,
     _turboquant_prefill_plan,
+    _TurboQuantPrefillPlan,
     unsupported_reason,
 )
 from vllm_metal.attention.impls.varlen_rope_compat import (
@@ -66,11 +65,6 @@ from vllm_metal.attention.impls.varlen_rope_compat import (
 from vllm_metal.metal import get_ops
 
 logger = init_logger(__name__)
-
-# === Metal kernel block-size support ===
-# The paged attention Metal kernel is template-instantiated for these block
-# sizes only.  Sorted descending so _pick_kernel_block_size selects the
-# largest valid divisor first, minimising the block-table expansion ratio.
 
 
 def _has_packed_qkv_sdpa_contract(module: nn.Module) -> bool:
@@ -139,12 +133,12 @@ def is_sdpa(module: nn.Module) -> bool:
 
 def _pick_kernel_block_size(cache_block_size: int) -> int:
     """Pick the largest kernel-supported block size that divides evenly."""
-    for kbs in _KERNEL_BLOCK_SIZES:
+    for kbs in KERNEL_BLOCK_SIZES:
         if cache_block_size % kbs == 0:
             return kbs
     raise ValueError(
         f"Cache block_size={cache_block_size} is not divisible by any "
-        f"supported kernel block size {_KERNEL_BLOCK_SIZES}. "
+        f"supported kernel block size {KERNEL_BLOCK_SIZES}. "
         "Adjust --block-size (must be a multiple of 8)."
     )
 
@@ -166,7 +160,7 @@ def _build_block_tables(
     if not raw_block_tables:
         return mx.zeros((0, 0), dtype=mx.int32), cache_block_size
 
-    if cache_block_size in _KERNEL_BLOCK_SIZES:
+    if cache_block_size in KERNEL_BLOCK_SIZES:
         # Fast path — no translation needed.
         max_blocks = max(len(bt) for bt in raw_block_tables)
         padded = [bt + [0] * (max_blocks - len(bt)) for bt in raw_block_tables]
@@ -186,6 +180,28 @@ def _build_block_tables(
         bt_arr.shape[0], -1
     )
     return expanded, kernel_bs
+
+
+@dataclass(eq=False)
+class _KernelMetadata:
+    """Kernel-format copies and mutable routing memo for one forward/group.
+
+    ``eq=False``: the generated ``__eq__`` would compare mx arrays, which
+    raises on ``bool()``; identity comparison is the only meaningful one.
+    """
+
+    slot_mapping: mx.array
+    seq_lens: mx.array
+    cu_seqlens_q: mx.array
+    block_tables: mx.array
+    block_size: int
+    max_seq_len: int
+    # Same forward/group lifetime as the existing kernel metadata. Only CPU
+    # routing and gather indices are cached, never materialized K/V buffers.
+    tq_prefill_plans: dict[tuple[int, ...], _TurboQuantPrefillPlan | None] = field(
+        default_factory=dict
+    )
+    tq_prefill_workspace_bytes: int = 0
 
 
 def _kernel_metadata(

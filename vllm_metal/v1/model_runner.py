@@ -1217,11 +1217,10 @@ class MetalModelRunner:
             prefill_info,
             self._paged_group_block_sizes,
             merge_verify_windows=self.merge_verify_windows,
+            tq_prefill_workspace_bytes=self.tq_prefill_workspace_bytes,
         )
         try:
             ctx = get_context()
-            if ctx is not None:
-                ctx.tq_prefill_workspace_bytes = self.tq_prefill_workspace_bytes
             runtime = self._paged_attention_runtime
             if runtime is not None and scheduler_output.new_block_ids_to_zero:
                 runtime.zero_blocks(scheduler_output.new_block_ids_to_zero)

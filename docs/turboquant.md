@@ -145,24 +145,29 @@ remain authoritative.
 
 The worker resolves the workspace allowance once, before KV allocation, and
 passes that same value to each forward. Routing plans remain cached in the
-existing per-forward, per-KV-group metadata. A fully selected batch reuses the original sequence
-metadata without constructing query-reordering indices.
+existing per-forward, per-KV-group metadata. A fully selected batch reuses the
+original sequence metadata without constructing query-reordering indices.
 
 `VLLM_METAL_TQ_PREFILL_MAX_MIB=auto` reserves 2% of the device's recommended
 working set, rounded up to 64 MiB, with a 256 MiB floor and 2 GiB ceiling before
-applying a model-specific cap. For non-speculative serving with a resolved
-context limit, the cap covers all eligible independent histories allowed by
-`max_model_len`, `max_num_seqs` and `max_num_batched_tokens`, including page
-padding and mixed-batch routing copies. It can reduce the reservation below
-256 MiB for small configurations. A scheduler chunk limits new queries, not
-the historical KV they can read. Layers reuse one allowance.
+applying a model-specific cap. For non-speculative serving, the cap covers all
+eligible independent histories allowed by `max_model_len`, `max_num_seqs` and
+`max_num_batched_tokens`, including page padding and mixed-batch routing
+copies. It can reduce the reservation below 256 MiB for small configurations.
+A scheduler chunk limits new queries, not the historical KV they can read.
+Layers reuse one allowance.
 
-Speculative configurations and unresolved automatic context limits retain the
-device-based allowance. A number explicitly overrides the allowance in MiB
-without applying the model cap; `0` disables materialization. Set these
-variables before worker startup. The existing cache planner subtracts the
-allowance **once, inside `gpu_memory_utilization`**, before allocating KV blocks.
-This is a fixed allowance, not permission to borrow currently free memory.
+The cap uses `max_model_len` when the worker plans the KV budget, before vLLM
+auto-fits the context to available memory. Later auto-fit reductions do not
+recompute or reclaim the reservation. Set an explicit `--max-model-len` to cap
+the reservation using a shorter context at planning time.
+
+Speculative configurations retain the device-based allowance. A number
+explicitly overrides the allowance in MiB without applying the model cap;
+`0` disables materialization. Set these variables before worker startup.
+The existing cache planner subtracts the allowance **once, inside
+`gpu_memory_utilization`**, before allocating KV blocks. This is a fixed
+allowance, not permission to borrow currently free memory.
 
 For example, on M5 Pro 64 GB with K8/V3, `max_model_len=4104`,
 `max_num_seqs=1` and `max_num_batched_tokens=2048`:
@@ -188,9 +193,10 @@ existing profiled execution budget.
 
 The worker logs the reserved allowance, first lane activation and first budget
 fallback. Unsupported activation dtypes, head dimensions and cache layouts
-also report their fallback reason once. Debug logs include selected/fallback request counts, gathered tokens
-and estimated bytes. Larger histories still need more scratch space: this is
-bounded materialization, not constant-memory streaming attention.
+also report their fallback reason once. Debug logs include selected/fallback
+request counts, gathered tokens and estimated bytes. Larger histories still need
+more scratch space: this is bounded materialization, not constant-memory
+streaming attention.
 
 ## Validation and Reproduction
 

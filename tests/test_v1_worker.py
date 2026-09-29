@@ -299,6 +299,8 @@ class TestPagedAttentionPlanDiagnostics:
                 max_num_seqs=sequences, max_num_batched_tokens=sequences * 128
             ),
         )
+        # vLLM resolves the model limit before planning even for --max-model-len=-1.
+        runner.model_config.original_max_model_len = -1
         runner.model_config.max_model_len = length
         runner.model_config.get_num_attention_heads = lambda _: 8
         allowance = runner.tq_prefill_workspace_bytes
@@ -310,6 +312,8 @@ class TestPagedAttentionPlanDiagnostics:
         planner = self._make_planner(runner, gpu_memory_utilization=0.5)
         monkeypatch.setattr(WorkerCachePlanner, "_metal_limit_bytes", lambda _: 10**10)
         monkeypatch.setattr(WorkerCachePlanner, "get_model_memory_usage", lambda _: 0)
+        # A later auto-fit shrinks the config, not the already reserved workspace.
+        runner.model_config.max_model_len = length // 2
         monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "0")
         assert runner.tq_prefill_workspace_bytes == allowance
         plan = planner._paged_attention_plan(overhead=0)

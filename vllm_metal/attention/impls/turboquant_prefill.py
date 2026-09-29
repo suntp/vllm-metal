@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import mlx.core as mx
 from vllm.logger import init_logger
@@ -14,17 +15,32 @@ from vllm_metal.attention.caches.turboquant import (
 )
 from vllm_metal.attention.context import PagedAttentionContext
 
+if TYPE_CHECKING:
+    from vllm_metal.attention.impls.sdpa import _KernelMetadata
+
 logger = init_logger(__name__)
 
+# The paged attention Metal kernel is template-instantiated for these block
+# sizes only.  Sorted descending so the kernel block size picker selects the
+# largest valid divisor first, minimising the block-table expansion ratio.
 KERNEL_BLOCK_SIZES = (32, 16, 8)
+
+# Dequantizing cached context must be amortized by enough query rows. Keep
+# short suffixes (including prefix hits) on the compressed kernel. MHA needs
+# more rows because it cannot amortize dequant across grouped query heads.
+# See tools/benchmark/tq_lane_verify.py's production-path crossover sweep.
+_TQ_MIN_PREFILL_TOKENS = 128
+_TQ_MIN_QUERIES_PER_KV_HEAD = 256
 
 
 def min_prefill_tokens(num_query_heads: int, num_kv_heads: int, head_dim: int) -> int:
     """Amortize materialization across query rows and grouped query heads."""
     return max(
-        128,
+        _TQ_MIN_PREFILL_TOKENS,
+        # Wide-head tiled prefill needs more rows to amortize materialization.
         head_dim // 2,
-        (256 * num_kv_heads + num_query_heads - 1) // num_query_heads,
+        (_TQ_MIN_QUERIES_PER_KV_HEAD * num_kv_heads + num_query_heads - 1)
+        // num_query_heads,
     )
 
 
@@ -105,29 +121,6 @@ class _TurboQuantPrefillPlan:
     pool_pages: mx.array
     pool_offsets: mx.array
     workspace_bytes: int
-
-
-@dataclass(eq=False)
-class _KernelMetadata:
-    """Kernel-format copies and mutable routing memo for one forward/group.
-
-    ``eq=False``: the generated ``__eq__`` would compare mx arrays, which
-    raises on ``bool()``; identity comparison is the only meaningful one.
-    """
-
-    slot_mapping: mx.array
-    seq_lens: mx.array
-    cu_seqlens_q: mx.array
-    block_tables: mx.array
-    block_size: int
-    max_seq_len: int
-    # Same forward/group lifetime as the existing kernel metadata. Only CPU
-    # routing and gather indices are cached, never materialized K/V buffers.
-    tq_prefill_plans: dict[tuple[int, ...], _TurboQuantPrefillPlan | None] = field(
-        default_factory=dict
-    )
-
-    tq_prefill_workspace_bytes: int = 0
 
 
 def _turboquant_prefill_plan(

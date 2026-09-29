@@ -224,10 +224,9 @@ class ModelCachePolicy:
         cap = None
         # Speculation expands segments/lookahead beyond the ordinary scheduler
         # bounds. Preserve its allowance until those bounds are accounted for.
-        if (
-            runner.vllm_config.speculative_config is None
-            and runner.model_config.max_model_len > 0
-        ):
+        # vLLM resolves max_model_len before workers start. Its later auto-fit
+        # may shorten the context, but does not reclaim this fixed reservation.
+        if runner.vllm_config.speculative_config is None:
             if (
                 runner.head_dim not in FWHT_SUPPORTED_HEAD_DIMS
                 or self._require_kv_cache_dtype() not in (mx.float16, mx.bfloat16)

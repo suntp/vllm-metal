@@ -22,7 +22,12 @@ from vllm_metal.attention.caches.turboquant import (
     prefill_workspace_bytes,
     turbo_quant_decode,
 )
-from vllm_metal.attention.context import clear_context, get_context, prepare_grouped
+from vllm_metal.attention.context import (
+    PagedAttentionContext,
+    clear_context,
+    get_context,
+    prepare_grouped,
+)
 from vllm_metal.attention.impls import sdpa
 from vllm_metal.attention.impls.turboquant_prefill import workspace_upper_bound
 from vllm_metal.metal import get_ops
@@ -428,10 +433,7 @@ def test_hybrid_groups_keep_separate_plans_and_reuse_them_within_group(
         for array, value in zip(arrays, updated, strict=True):
             array[layer] = value
         mx.eval(*updated)
-    prepare_grouped([], [(tables, 128, 129)], [block_size, block_size])
-    ctx = get_context()
-    assert ctx is not None
-    ctx.tq_prefill_workspace_bytes = workspace_upper_bound(
+    allowance = workspace_upper_bound(
         max_model_len=257,
         max_num_seqs=1,
         max_num_batched_tokens=128,
@@ -440,6 +442,14 @@ def test_hybrid_groups_keep_separate_plans_and_reuse_them_within_group(
         head_dim=128,
         block_size=block_size,
     )
+    prepare_grouped(
+        [],
+        [(tables, 128, 129)],
+        [block_size, block_size],
+        tq_prefill_workspace_bytes=allowance,
+    )
+    ctx = get_context()
+    assert ctx is not None
     try:
         reference = []
         with patch.object(sdpa, "_turboquant_prefill_plan", return_value=None):
@@ -736,8 +746,6 @@ def test_long_context_admission_with_fused_workspace(
 def test_auto_cap_covers_independent_histories_and_split_routing(block_size, length):
     # Admission only: the new-query budget is small, but both prefills must
     # still read their entire independent histories, alongside a decode row.
-    from vllm_metal.attention.context import PagedAttentionContext
-
     pages = (length + block_size - 1) // block_size
     tables = [list(range(i * pages, (i + 1) * pages)) for i in range(3)]
     allowance = workspace_upper_bound(

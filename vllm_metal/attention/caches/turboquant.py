@@ -16,7 +16,11 @@ logger = init_logger(__name__)
 
 
 def prefill_workspace_bytes(*, max_bytes: int | None = None) -> int:
-    """Resolve the same allowance for cache sizing and prefill admission."""
+    """Resolve the same allowance for cache sizing and prefill admission.
+
+    ``max_bytes`` caps only the automatic allowance; explicit MiB values and
+    mode ``0`` ignore it.
+    """
     from vllm_metal import envs
     from vllm_metal.metal import get_ops
 
