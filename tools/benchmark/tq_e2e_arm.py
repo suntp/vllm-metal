@@ -89,6 +89,7 @@ def main():
     def counted_planner(*planner_args, **kwargs):
         nonlocal last_progress
         dispatch["prefill_layer_calls"] += 1
+        dispatch["workspace_limit_bytes"] = planner_args[1].tq_prefill_workspace_bytes
         plan = (
             None
             if active_arm == "tq-reference"
@@ -133,6 +134,7 @@ def main():
             lane_segments=0,
             max_gathered_tokens=0,
             max_workspace_bytes=0,
+            workspace_limit_bytes=None,  # Unknown until a planner call is observed.
         )
 
     reset_dispatch()
@@ -163,7 +165,8 @@ def main():
         "model": args.model,
         "device": mx.device_info()["device_name"],
         "nax_ready": get_ops().nax_ready(),
-        "workspace_limit_bytes": prefill_workspace_bytes(),
+        # The worker may cap this ceiling by the model and scheduler geometry.
+        "workspace_ceiling_bytes": prefill_workspace_bytes(),
         "versions": package_versions(
             "vllm", "mlx", "mlx-lm", "mlx-vlm", "torch", "numpy"
         ),
