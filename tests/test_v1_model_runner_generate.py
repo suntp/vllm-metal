@@ -200,6 +200,30 @@ class TestV1MetalModelRunnerGenerate:
         with pytest.raises(NotImplementedError, match="custom logits processors"):
             mr.MetalModelRunner(vllm_config)
 
+    @pytest.mark.parametrize(
+        "logprobs_mode",
+        ["raw_logprobs", "raw_logits", "processed_logprobs", "processed_logits"],
+    )
+    def test_init_passes_logprobs_mode_to_sampler(
+        self, monkeypatch: pytest.MonkeyPatch, logprobs_mode: str
+    ) -> None:
+        # --logprobs-mode must reach the sample-logprobs path, not only prompt logprobs.
+        monkeypatch.setattr(mr, "entry_points", lambda **_: (), raising=False)
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                logits_processors=None,
+                runner_type="generate",
+                logprobs_mode=logprobs_mode,
+            ),
+            cache_config=SimpleNamespace(),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            speculative_config=None,
+        )
+
+        runner = mr.MetalModelRunner(vllm_config)
+
+        assert runner._sampler.logprobs_mode == logprobs_mode
+
     def test_warm_up_propagates_dummy_forward_failure(self) -> None:
         runner = self._make_runner()
         runner._dummy_forward_outputs = Mock(
@@ -209,14 +233,25 @@ class TestV1MetalModelRunnerGenerate:
         with pytest.raises(RuntimeError, match="dummy forward failed"):
             runner.warm_up()
 
-    def _warm_up(self, monkeypatch: pytest.MonkeyPatch, adapter, ops) -> None:
+    def _warm_up(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        adapter,
+        ops,
+        kv_dtype: mx.Dtype = mx.bfloat16,
+    ) -> list[str]:
+        """Warm up a stub runner; returns the runner's info log lines."""
         runner = self._make_runner()
         runner._dummy_forward_outputs = Mock(return_value=[])
         runner._paged_attention_runtime = Mock()
         runner._multimodal_adapter = adapter
+        runner.kv_cache_dtype = kv_dtype
+        info = Mock()
         monkeypatch.setattr(mr, "get_ops", lambda: ops)
+        monkeypatch.setattr(mr.logger, "info", info)
         runner.warm_up()
         runner._paged_attention_runtime.warm_up.assert_called_once_with()
+        return [call.args[0] % call.args[1:] for call in info.call_args_list]
 
     def test_warm_up_rejects_a_bad_mm_prefix_path_for_image_blocks(
         self, monkeypatch: pytest.MonkeyPatch
@@ -250,7 +285,60 @@ class TestV1MetalModelRunnerGenerate:
     ) -> None:
         monkeypatch.setenv("VLLM_METAL_MM_PREFIX_PATH", "kernle")
 
-        self._warm_up(monkeypatch, adapter, SimpleNamespace())
+        lines = self._warm_up(monkeypatch, adapter, SimpleNamespace())
+
+        assert not any("image blocks attend" in line for line in lines)
+
+    @pytest.mark.parametrize(
+        ("path", "kv_dtype", "supported", "expected"),
+        [
+            (
+                None,
+                mx.bfloat16,
+                True,
+                "tiled prefill kernel (VLLM_METAL_MM_PREFIX_PATH=kernel, "
+                "bfloat16 KV cache)",
+            ),
+            (
+                "recompute",
+                mx.bfloat16,
+                True,
+                "MLX recompute (VLLM_METAL_MM_PREFIX_PATH=recompute, "
+                "bfloat16 KV cache)",
+            ),
+            (
+                None,
+                mx.float32,
+                True,
+                "MLX recompute (VLLM_METAL_MM_PREFIX_PATH=kernel, float32 KV cache)",
+            ),
+            (
+                "kernel",
+                mx.float16,
+                False,
+                "MLX recompute (VLLM_METAL_MM_PREFIX_PATH=kernel, float16 KV cache)",
+            ),
+        ],
+        ids=["kernel", "recompute-chosen", "float32-cache", "ops-predate-mm-prefix"],
+    )
+    def test_warm_up_logs_the_path_image_blocks_take(
+        self, monkeypatch: pytest.MonkeyPatch, path, kv_dtype, supported, expected
+    ) -> None:
+        if path is None:
+            monkeypatch.delenv("VLLM_METAL_MM_PREFIX_PATH", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_METAL_MM_PREFIX_PATH", path)
+        monkeypatch.setattr(mm_prefix_module, "_warn_kernel_path_unavailable", Mock())
+        adapter = SimpleNamespace(bidirectional_layer_kinds=frozenset({"sliding"}))
+        ops = (
+            SimpleNamespace(supports_mm_prefix=lambda: True)
+            if supported
+            else SimpleNamespace()
+        )
+
+        lines = self._warm_up(monkeypatch, adapter, ops, kv_dtype)
+
+        assert f"Metal: image blocks attend through the {expected}" in lines
 
 
 class TestV1MetalModelRunnerSampleTokens:
@@ -2328,6 +2416,74 @@ class TestMergeVerifyWindows:
             )
         )
         assert runner.merge_verify_windows is False
+
+
+class TestVerifyLayoutLog:
+    """With speculative decoding on, warm-up names the verify layout the
+    forward will use (``merge_verify_windows``) and why it stays expanded."""
+
+    def _warm_up(self, monkeypatch, runner, *, speculative: bool = True) -> list[str]:
+        runner.vllm_config.speculative_config = (
+            SimpleNamespace(method="ngram") if speculative else None
+        )
+        runner._dummy_forward_outputs = Mock(return_value=[])
+        runner._paged_attention_runtime = Mock()
+        info = Mock()
+        monkeypatch.setattr(mr.logger, "info", info)
+        runner.warm_up()
+        return [call.args[0] % call.args[1:] for call in info.call_args_list]
+
+    def test_window_layout(self, monkeypatch) -> None:
+        monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", "1")
+
+        lines = self._warm_up(monkeypatch, make_stub_runner())
+
+        assert "Metal: spec-decode verify uses the window layout" in lines
+
+    @pytest.mark.parametrize(
+        ("window_env", "runner_kwargs", "reason"),
+        [
+            ("0", {}, "VLLM_METAL_SPEC_VERIFY_WINDOW is off"),
+            (
+                "1",
+                {"model_args": {"kv_lora_rank": 512}},
+                "MLA decode takes one-row segments",
+            ),
+            (
+                "1",
+                {"is_hybrid": True},
+                "the hybrid decode check takes one-row segments",
+            ),
+            (
+                "1",
+                {
+                    "model_config": SimpleNamespace(
+                        runner_type="generate",
+                        get_head_size=lambda: 512,
+                        is_hybrid=False,
+                    )
+                },
+                "head size 512 exceeds 256",
+            ),
+        ],
+        ids=["off", "mla", "hybrid", "head-size"],
+    )
+    def test_expanded_layout_names_the_reason(
+        self, monkeypatch, window_env, runner_kwargs, reason
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", window_env)
+
+        lines = self._warm_up(monkeypatch, make_stub_runner(**runner_kwargs))
+
+        assert (
+            f"Metal: spec-decode verify uses the expanded per-token layout ({reason})"
+            in lines
+        )
+
+    def test_no_line_without_speculative_decoding(self, monkeypatch) -> None:
+        lines = self._warm_up(monkeypatch, make_stub_runner(), speculative=False)
+
+        assert not any("spec-decode verify" in line for line in lines)
 
 
 class TestLoadModelPipelineSplitOrdering:

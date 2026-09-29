@@ -1534,11 +1534,17 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
 
       // Compute correction factor to rescale previous state.
       float new_m = max(warp_m[r], block_max);
-      // NaN-safe: if new_m is still -inf (all masked), clamp to 0.
-      if (new_m == -FLT_MAX) new_m = 0.f;
+      // A row with no unmasked key yet (this block lies wholly left of its
+      // window, and so did every earlier one) keeps the -FLT_MAX sentinel:
+      // clamping it to 0 would pin the running max at 0, so later in-window
+      // keys would be weighted by exp2(score) instead of exp2(score - max)
+      // (#875). warp_l[r] and v_accs[r] are still all zero, so skipping the
+      // rescale is a no-op; the weight loop below emits w == 0 while
+      // warp_m[r] == -FLT_MAX.
+      if (new_m == -FLT_MAX) continue;
 
       float old_correction = exp2(warp_m[r] - new_m);
-      // If warp_m was -FLT_MAX (first iteration), correction = 0, which
+      // If warp_m was -FLT_MAX (first unmasked key), correction = 0, which
       // correctly zeroes out the (already zero) previous O and l.
       if (warp_m[r] == -FLT_MAX) old_correction = 0.f;
 
@@ -1577,7 +1583,10 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
           continue;
         }
         const float score = warp_scores[r * BLOCK_SIZE + tok];
-        w[r] = exp2(score - warp_m[r]);
+        // warp_m[r] == -FLT_MAX means the row has no unmasked key yet, so
+        // this score is masked too: emit 0 rather than
+        // exp2(-FLT_MAX - -FLT_MAX) = 1.
+        w[r] = (warp_m[r] == -FLT_MAX) ? 0.f : exp2(score - warp_m[r]);
         warp_l[r] += w[r];
       }
 
@@ -1744,7 +1753,13 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
         device float *max_logits_ptr =
             max_logits + out_row * num_heads * max_num_partitions +
             head_idx * max_num_partitions + partition_idx;
-        *max_logits_ptr = warp_m[r];
+        // The block range starts at the window of the threadgroup's first
+        // row, so a later row can read a partition that lies wholly left of
+        // its own window.  Such a row sees no unmasked key: its sum stays 0
+        // and its running max stays -FLT_MAX (#875).  The guard keeps the
+        // stored max at -FLT_MAX, as the skipped-partition early return does,
+        // so the partial never pins the reduce's global max (#837).
+        *max_logits_ptr = warp_l[r] > 0.f ? warp_m[r] : -FLT_MAX;
         device float *exp_sums_ptr = exp_sums +
                                      out_row * num_heads * max_num_partitions +
                                      head_idx * max_num_partitions + partition_idx;

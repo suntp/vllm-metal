@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import importlib.metadata
+
 import mlx.core as mx
 import numpy as np
 
@@ -14,6 +16,17 @@ def attention_tolerances(
     if dtype == mx.float32:
         return float32_tolerance, float32_tolerance
     return {mx.bfloat16: (3e-2, 2e-2), mx.float16: (1.5e-2, 2e-2)}[dtype]
+
+
+def package_versions(*names: str) -> dict[str, str | None]:
+    """Record versions without requiring every distribution to be installed."""
+    versions: dict[str, str | None] = {}
+    for name in names:
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = None
+    return versions
 
 
 def ref_paged_attn(

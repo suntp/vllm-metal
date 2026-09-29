@@ -6,12 +6,65 @@ including key/value quantization metadata, bit packing helpers, and the FWHT
 rotation/sign tables used by the Metal dequantization kernels.
 """
 
+from functools import lru_cache
 from typing import cast
 
 import mlx.core as mx
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def prefill_workspace_bytes() -> int:
+    """Resolve the same allowance for cache sizing and prefill admission."""
+    from vllm_metal import envs
+    from vllm_metal.metal import get_ops
+
+    mode = envs.VLLM_METAL_TQ_PREFILL
+    if mode not in ("auto", "0", "1"):
+        raise ValueError(f"VLLM_METAL_TQ_PREFILL must be auto, 0 or 1; got {mode!r}")
+    setting = envs.VLLM_METAL_TQ_PREFILL_MAX_MIB
+    mib = None
+    if setting != "auto":
+        error = (
+            "VLLM_METAL_TQ_PREFILL_MAX_MIB must be auto or a nonnegative "
+            f"integer in MiB; got {setting!r}"
+        )
+        try:
+            mib = int(setting)
+        except ValueError as exc:
+            raise ValueError(error) from exc
+        if mib < 0:
+            raise ValueError(error)
+    if mode == "0" or mib == 0:
+        return 0
+    if mode == "auto" and not get_ops().nax_ready():
+        logger.info_once(
+            "Metal: TurboQuant prefill stays compressed without NAX; "
+            "VLLM_METAL_TQ_PREFILL=1 opts into uncalibrated tiled prefill."
+        )
+        return 0
+    if mib is None:
+        # Reserve this once before KV sizing; never borrow from a live cache.
+        # 2% of the device's stable recommended working set, rounded up to
+        # 64 MiB, with a 256 MiB floor and a 2 GiB ceiling.
+        recommended = int(mx.device_info().get("max_recommended_working_set_size", 0))
+        step = 64 * 2**20
+        rounded = (recommended + 50 * step - 1) // (50 * step) * step
+        return max(256 * 2**20, min(2 * 2**30, rounded))
+    return mib * 2**20
+
+
+def prefill_bytes_per_token(num_kv_heads: int, head_dim: int) -> int:
+    """Final K/V pair (4 bytes per element) and gather-index allowance.
+
+    The fused kernel reads the original strided pool directly and retains
+    unpacking, scale arithmetic and inverse FWHT in registers. There are no
+    context-sized packed gathers or FP32 dequantization intermediates.
+    Query/projection/attention buffers remain in the existing profile budget.
+    """
+    return 4 * num_kv_heads * head_dim + 16
+
 
 _RNG_KEY = mx.random.key(42)
 
@@ -86,15 +139,21 @@ V_QUANT_PARAMS = {
 FWHT_SUPPORTED_HEAD_DIMS = (64, 128, 256, 512)
 
 
-def fwht(x: mx.array, encode: bool) -> mx.array:
-    dim = x.shape[-1]
-    if dim not in FWHT_SUPPORTED_HEAD_DIMS:
+@lru_cache(maxsize=len(FWHT_SUPPORTED_HEAD_DIMS))
+def get_fwht_signs(head_dim: int) -> mx.array:
+    """Signs shared by Python FWHT and fused page materialization."""
+    if head_dim not in FWHT_SUPPORTED_HEAD_DIMS:
         raise ValueError(
-            f"FWHT only supports head_dim in {FWHT_SUPPORTED_HEAD_DIMS}, got {dim}. "
+            f"FWHT only supports head_dim in {FWHT_SUPPORTED_HEAD_DIMS}, "
+            f"got {head_dim}. "
             "The Metal kernel has hardcoded sign tables only for these sizes."
         )
-    sign01 = mx.random.randint(0, 2, shape=(dim,), key=_RNG_KEY)
-    signs = 1 - 2 * sign01
+    sign01 = mx.random.randint(0, 2, shape=(head_dim,), key=_RNG_KEY)
+    return 1 - 2 * sign01
+
+
+def fwht(x: mx.array, encode: bool) -> mx.array:
+    signs = get_fwht_signs(x.shape[-1])
     if encode:
         x = x * signs
         x = mx.hadamard_transform(x)

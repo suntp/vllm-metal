@@ -51,7 +51,7 @@ from vllm_metal.attention.context import (
     prepare_grouped,
 )
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
-from vllm_metal.attention.impls.mm_prefix import mm_prefix_path
+from vllm_metal.attention.impls.mm_prefix import image_block_path
 from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
 from vllm_metal.config import get_config
@@ -418,8 +418,9 @@ class MetalModelRunner:
         # one-step prefill has no RequestState during its forward.
         self._mm_bidi_states: dict[str, _MMBidiState] = {}
 
-        # vLLM Sampler for token sampling with temperature, top_k, top_p support
-        self._sampler = Sampler()
+        # vLLM Sampler for token sampling with temperature, top_k, top_p support.
+        # It takes the configured logprobs mode, as vLLM's GPU runner does.
+        self._sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
 
         self._draft_token_ids: DraftTokenIds | None = None
 
@@ -524,16 +525,23 @@ class MetalModelRunner:
         config head size (head_dim_per_layer), and every layer of the
         step shares one verify layout.
         """
+        return self._verify_window_mismatch() is None
+
+    def _verify_window_mismatch(self) -> str | None:
+        """Why spec-verify windows stay expanded, or ``None`` when they merge."""
+        if not envs.VLLM_METAL_SPEC_VERIFY_WINDOW:
+            return "VLLM_METAL_SPEC_VERIFY_WINDOW is off"
+        if self.is_mla:
+            return "MLA decode takes one-row segments"
+        if self.is_hybrid:
+            return "the hybrid decode check takes one-row segments"
         head_dims = self.head_dim_per_layer
         max_head_dim = (
             max(head_dims) if head_dims else self.model_config.get_head_size()
         )
-        return (
-            envs.VLLM_METAL_SPEC_VERIFY_WINDOW
-            and not self.is_mla
-            and not self.is_hybrid
-            and max_head_dim <= PA_WINDOW_MAX_HEAD_SIZE
-        )
+        if max_head_dim > PA_WINDOW_MAX_HEAD_SIZE:
+            return f"head size {max_head_dim} exceeds {PA_WINDOW_MAX_HEAD_SIZE}"
+        return None
 
     @property
     def _forward_model(self) -> Any:
@@ -1039,9 +1047,9 @@ class MetalModelRunner:
         """Warm up the model with a dummy forward pass, then load the kernels.
 
         For a model whose image blocks attend bidirectionally, also resolve
-        the image-block attention path, so a bad ``VLLM_METAL_MM_PREFIX_PATH``
-        or a build without mm_prefix support shows at startup rather than on
-        the first image request.
+        and log the image-block attention path (``_log_image_block_path``),
+        and with speculative decoding, log the verify layout
+        (``_log_verify_layout``).
         """
         if self.model is None:
             logger.warning("Model not loaded, skipping warm-up")
@@ -1056,7 +1064,37 @@ class MetalModelRunner:
         if self._paged_attention_runtime is not None:
             self._paged_attention_runtime.warm_up()
             if getattr(self._multimodal_adapter, "bidirectional_layer_kinds", None):
-                mm_prefix_path(get_ops())
+                self._log_image_block_path()
+            if self.vllm_config.speculative_config is not None:
+                self._log_verify_layout()
+
+    def _log_verify_layout(self) -> None:
+        """Say at startup which layout spec-verify windows take."""
+        mismatch = self._verify_window_mismatch()
+        if mismatch is None:
+            logger.info("Metal: spec-decode verify uses the window layout")
+        else:
+            logger.info(
+                "Metal: spec-decode verify uses the expanded per-token layout (%s)",
+                mismatch,
+            )
+
+    def _log_image_block_path(self) -> None:
+        """Say at startup which path image blocks take, as the forward will.
+
+        Resolving it here also fails a bad ``VLLM_METAL_MM_PREFIX_PATH`` and
+        warns about a build without mm_prefix support before the first image
+        request.
+        """
+        dtype = self.kv_cache_dtype
+        path = image_block_path(get_ops(), float32_cache=dtype == mx.float32)
+        logger.info(
+            "Metal: image blocks attend through the %s "
+            "(VLLM_METAL_MM_PREFIX_PATH=%s, %s KV cache)",
+            "tiled prefill kernel" if path == "kernel" else "MLX recompute",
+            envs.VLLM_METAL_MM_PREFIX_PATH or "kernel",
+            str(dtype).rsplit(".", 1)[-1],
+        )
 
     # ------------------------------------------------------------------
     # Unified prefill + decode (single forward pass)

@@ -26,6 +26,7 @@ from vllm_metal.attention.caches.turboquant import (
     QUANT_PARAMS,
     V_QUANT_PARAMS,
     packed_dim,
+    prefill_workspace_bytes,
 )
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
@@ -852,6 +853,17 @@ class WorkerCachePlanner:
         backend = self._worker.model_runner.build_paged_attention_runtime(
             block_size=plan.block_size
         )
+        # Hybrid models always size their cache from vLLM's KV cache config
+        # (``ModelCachePolicy._uses_upstream_storage``), so only the SDPA and
+        # MLA runtimes, which own ``initialize``, reach this path.
+        if not isinstance(
+            backend, (SDPAPagedAttentionRuntime, MLAPagedAttentionRuntime)
+        ):
+            raise RuntimeError(
+                "Paged attention: the capacity path initializes only the SDPA "
+                f"and MLA runtimes; {type(backend).__name__} sizes its cache "
+                "from vLLM's KV cache config"
+            )
         backend.initialize(plan.num_blocks)
         self._worker.model_runner.install_gemma4_mtp_kv_sharing(
             backend,
@@ -957,6 +969,18 @@ class WorkerCachePlanner:
         metal_limit = self._metal_limit_bytes()
         model_memory = self.get_model_memory_usage()
         per_block_bytes = self._worker.get_cache_block_size_bytes()
+        if get_config().turboquant:
+            # Profiling precedes paged-cache binding, so it cannot observe
+            # materialized TQ histories. Reserve the admission limit once,
+            # inside gpu_memory_utilization, before upstream allocates KV.
+            workspace = prefill_workspace_bytes()
+            overhead += workspace
+            if workspace:
+                logger.info_once(
+                    "TurboQuant prefill: reserving %d MiB within the Metal "
+                    "memory budget before KV sizing.",
+                    workspace // 2**20,
+                )
         usable_metal = int(metal_limit * fraction)
         kv_budget = self.base_kv_budget_bytes(
             metal_limit,

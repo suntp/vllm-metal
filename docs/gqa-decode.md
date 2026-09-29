@@ -157,9 +157,10 @@ enablement or performance claims in #715:
    and admission need their own tests.
 3. **TurboQuant decode:** evaluate consuming packed KV/scales in the GQA
    kernel. This could complement the prefill optimization in
-   [#853](https://github.com/vllm-project/vllm-metal/pull/853), which remains
-   a separate open PR. Avoid assuming that materializing the whole history
-   on every decode step is cheap; validate format, memory and quality effects.
+   [#853](https://github.com/vllm-project/vllm-metal/pull/853), which now handles
+   bounded TurboQuant prefill. Avoid assuming that materializing the whole
+   history on every decode step is cheap; validate format, memory and quality
+   effects.
 4. **Sliding windows:** bound loads and split selection by the actual visible
    KV window. This is relevant to Gemma/Mistral-style attention, but their
    geometries and other features such as sinks or soft-capping must also

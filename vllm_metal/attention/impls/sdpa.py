@@ -31,7 +31,8 @@ All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import cached_property
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -43,11 +44,19 @@ from vllm_metal.attention.attention_contracts import (
     QKNormPlacement,
 )
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+from vllm_metal.attention.caches.turboquant import (
+    FWHT_SUPPORTED_HEAD_DIMS,
+    prefill_bytes_per_token,
+    prefill_workspace_bytes,
+)
+from vllm_metal.attention.caches.turboquant_materialize import (
+    materialize_turboquant_pages,
+)
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.bidi_prefill import apply_bidirectional_segments
 from vllm_metal.attention.impls.mm_prefix import (
     build_mm_prefix_rows,
-    mm_prefix_path,
+    image_block_path,
 )
 from vllm_metal.attention.impls.varlen_rope_compat import (
     apply_attention_rope,
@@ -61,6 +70,13 @@ logger = init_logger(__name__)
 # sizes only.  Sorted descending so _pick_kernel_block_size selects the
 # largest valid divisor first, minimising the block-table expansion ratio.
 _KERNEL_BLOCK_SIZES = (32, 16, 8)
+
+# Dequantizing cached context must be amortized by enough query rows. Keep
+# short suffixes (including prefix hits) on the compressed kernel. MHA needs
+# more rows because it cannot amortize dequant across grouped query heads.
+# See tools/benchmark/tq_lane_verify.py's production-path crossover sweep.
+_TQ_MIN_PREFILL_TOKENS = 128
+_TQ_MIN_QUERIES_PER_KV_HEAD = 256
 
 
 def _has_packed_qkv_sdpa_contract(module: nn.Module) -> bool:
@@ -179,8 +195,27 @@ def _build_block_tables(
 
 
 @dataclass(frozen=True, eq=False)
+class _AttentionBatch:
+    query_indices: mx.array | None
+    block_tables: mx.array
+    seq_lens: mx.array
+    cu_seqlens_q: mx.array
+    max_seq_len: int
+
+
+@dataclass(frozen=True, eq=False)
+class _TurboQuantPrefillPlan:
+    prefill: _AttentionBatch
+    fallback: _AttentionBatch | None
+    restore_indices: mx.array | None
+    pool_pages: mx.array
+    pool_offsets: mx.array
+    workspace_bytes: int
+
+
+@dataclass(eq=False)
 class _KernelMetadata:
-    """Kernel-format copies of the per-forward paged metadata.
+    """Kernel-format copies and mutable routing memo for one forward/group.
 
     ``eq=False``: the generated ``__eq__`` would compare mx arrays, which
     raises on ``bool()``; identity comparison is the only meaningful one.
@@ -192,6 +227,17 @@ class _KernelMetadata:
     block_tables: mx.array
     block_size: int
     max_seq_len: int
+    # Same forward/group lifetime as the existing kernel metadata. Only CPU
+    # routing and gather indices are cached, never materialized K/V buffers.
+    tq_prefill_plans: dict[tuple[int, ...], _TurboQuantPrefillPlan | None] = field(
+        default_factory=dict
+    )
+
+    @cached_property
+    def tq_prefill_workspace_bytes(self) -> int:
+        # Configuration is fixed while a cache is allocated. Resolve it once
+        # per forward/group, alongside the routing metadata reused by its layers.
+        return prefill_workspace_bytes()
 
 
 def _kernel_metadata(
@@ -226,6 +272,185 @@ def _kernel_metadata(
         )
         ctx.kernel_metadata_cache[key] = meta
     return meta
+
+
+def _turboquant_prefill_plan(
+    ctx: PagedAttentionContext,
+    meta: _KernelMetadata,
+    raw_block_tables: list[list[int]],
+    cache_block_size: int,
+    num_query_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> _TurboQuantPrefillPlan | None:
+    """Plan bounded materialization using the existing CPU scheduler metadata.
+
+    Only referenced kernel blocks are gathered; shared prefixes are deduplicated.
+    Admit independent histories as well as shared prefixes while the combined
+    gather fits the absolute workspace reserved before KV allocation. An
+    oversized candidate is skipped before building its gather indices.
+    """
+    workspace_limit = meta.tq_prefill_workspace_bytes
+    if not workspace_limit:
+        return None
+    min_tokens = max(
+        _TQ_MIN_PREFILL_TOKENS,
+        # Wide-head tiled prefill needs more rows to amortize materialization.
+        head_dim // 2,
+        (_TQ_MIN_QUERIES_PER_KV_HEAD * num_kv_heads + num_query_heads - 1)
+        // num_query_heads,
+    )
+    key = (
+        cache_block_size,
+        min_tokens,
+        num_query_heads,
+        num_kv_heads,
+        head_dim,
+        workspace_limit,
+    )
+    if key in meta.tq_prefill_plans:
+        return meta.tq_prefill_plans[key]
+    if ctx.cu_seqlens is None:
+        raise ValueError("TurboQuant prefill requires cumulative query lengths")
+    cu_seqlens = ctx.cu_seqlens
+    lengths = [b - a for a, b in zip(cu_seqlens[:-1], cu_seqlens[1:], strict=True)]
+    candidates = [i for i, length in enumerate(lengths) if length >= min_tokens]
+    if not candidates:
+        meta.tq_prefill_plans[key] = None
+        return None
+
+    kernel_bs = meta.block_size
+    ratio = cache_block_size // kernel_bs
+    bytes_per_block = kernel_bs * prefill_bytes_per_token(num_kv_heads, head_dim)
+    # Splitting also gathers Q and concatenates/restores the outputs. Charge
+    # those three FP16/BF16 copies plus query-gather and output-restore indices.
+    query_row_bytes = num_query_heads * head_dim * 2  # FP16/BF16 element width.
+    routing_bytes = cu_seqlens[-1] * (3 * query_row_bytes + 2 * 4)
+
+    def split_metadata_bytes(fallback_count: int) -> int:
+        # Split seq_lens have N int32s; the two cu_seqlens_q have N + 2.
+        # Each fallback needs a padded table row and its int32 gather index.
+        sequence_bytes = (2 * len(lengths) + 2) * 4
+        table_bytes = fallback_count * (meta.block_tables.shape[1] + 1) * 4
+        return sequence_bytes + table_bytes
+
+    def select_rows(
+        limit: int,
+        *,
+        split: bool,
+    ) -> tuple[dict[int, int], list[int], list[list[int]], int]:
+        block_limit = max(0, limit) // bytes_per_block
+        source_blocks: dict[int, int] = {}
+        prefill_ids: list[int] = []
+        rows: list[list[int]] = []
+        table_width = 0
+        for i in candidates:
+            num_blocks = (ctx.context_lens[i] + kernel_bs - 1) // kernel_bs
+            if num_blocks > block_limit:
+                continue
+            sources = [
+                raw_block_tables[i][j // ratio] * ratio + j % ratio
+                for j in range(num_blocks)
+            ]
+            # Inspect only new blocks, without copying all admitted histories.
+            additions = dict.fromkeys(
+                source for source in sources if source not in source_blocks
+            )
+            next_width = max(table_width, num_blocks)
+            next_bytes = (len(source_blocks) + len(additions)) * bytes_per_block
+            next_bytes += (len(rows) + 1) * next_width * 4
+            if split:
+                next_bytes += split_metadata_bytes(len(lengths) - len(rows) - 1)
+            if next_bytes > limit:
+                continue
+            row = []
+            for source in sources:
+                if source not in source_blocks:
+                    source_blocks[source] = len(source_blocks)
+                row.append(source_blocks[source])
+            prefill_ids.append(i)
+            rows.append(row)
+            table_width = next_width
+        return source_blocks, prefill_ids, rows, table_width
+
+    # First allow the whole batch to fit without copies. If a split becomes
+    # necessary, repeat CPU-only admission with its routing cost reserved.
+    must_split = len(candidates) < len(lengths)
+    source_blocks, prefill_ids, rows, table_width = select_rows(
+        workspace_limit - (routing_bytes if must_split else 0), split=must_split
+    )
+    if not must_split and 0 < len(prefill_ids) < len(lengths):
+        source_blocks, prefill_ids, rows, table_width = select_rows(
+            workspace_limit - routing_bytes, split=True
+        )
+    if len(prefill_ids) < len(candidates):
+        logger.info_once(
+            "Metal: TurboQuant prefill workspace limit reached; "
+            "overflow histories use compressed attention."
+        )
+    if not prefill_ids:
+        meta.tq_prefill_plans[key] = None
+        return None
+    selected = set(prefill_ids)
+    fallback_ids = [i for i in range(len(lengths)) if i not in selected]
+    query_order: list[int] = []
+
+    def batch(ids: list[int], tables: mx.array) -> _AttentionBatch:
+        if not fallback_ids:
+            # The whole batch keeps its original query order and metadata.
+            return _AttentionBatch(
+                None, tables, meta.seq_lens, meta.cu_seqlens_q, meta.max_seq_len
+            )
+        indices = [q for i in ids for q in range(cu_seqlens[i], cu_seqlens[i + 1])]
+        query_order.extend(indices)
+        cu = [0]
+        for i in ids:
+            cu.append(cu[-1] + lengths[i])
+        return _AttentionBatch(
+            mx.array(indices, dtype=mx.int32),
+            tables,
+            mx.array([ctx.context_lens[i] for i in ids], dtype=mx.int32),
+            mx.array(cu, dtype=mx.int32),
+            max(ctx.context_lens[i] for i in ids),
+        )
+
+    tables = mx.array([row + [0] * (table_width - len(row)) for row in rows], mx.int32)
+    prefill = batch(prefill_ids, tables)
+    fallback = (
+        batch(fallback_ids, meta.block_tables[mx.array(fallback_ids, mx.int32)])
+        if fallback_ids
+        else None
+    )
+    restore = None
+    if fallback_ids:
+        inverse = [0] * len(query_order)
+        for packed, original in enumerate(query_order):
+            inverse[original] = packed
+        restore = mx.array(inverse, dtype=mx.int32)
+    blocks = mx.array(list(source_blocks), dtype=mx.int32)
+    # Kernel block IDs, including translated IDs, must fit int32 as required
+    # by the primitive. Multiplying those IDs by kernel_bs may still overflow;
+    # gather instead with scheduler-page and within-page token coordinates.
+    pages = mx.repeat(blocks // ratio, kernel_bs)
+    offsets = (
+        (blocks % ratio)[:, None] * kernel_bs + mx.arange(kernel_bs, dtype=mx.int32)
+    ).reshape(-1)
+    plan = _TurboQuantPrefillPlan(
+        prefill,
+        fallback,
+        restore,
+        pages,
+        offsets,
+        len(source_blocks) * bytes_per_block
+        + len(rows) * table_width * 4
+        + (
+            routing_bytes + split_metadata_bytes(len(fallback_ids))
+            if fallback_ids
+            else 0
+        ),
+    )
+    meta.tq_prefill_plans[key] = plan
+    return plan
 
 
 def _mm_prefix_rows(ctx: PagedAttentionContext) -> mx.array | None:
@@ -763,9 +988,9 @@ def sdpa_forward(
         # Rebind so next layer / decode step uses the updated cache
         kv_cache.replace_layer_cache(layer_idx, new_k_cache, new_v_cache)
 
-    # --- Attention: paged attention primitive (read-only, fully lazy) ---
-    # No per-layer eval or sync.  The primitive participates in MLX's lazy
-    # graph and is evaluated by the model runner at the end of the forward
+    # --- Attention: paged attention primitive (read-only) ---
+    # The primitive normally participates in MLX's lazy graph and is
+    # evaluated by the model runner at the end of the forward
     # pass.  Fence-based synchronisation across command buffer boundaries
     # works correctly because eval_gpu skips add_temporary (which would
     # remove buffers from the encoder's fence tracking).
@@ -799,10 +1024,8 @@ def sdpa_forward(
         kind = "sliding" if layer_sliding_window >= 0 else "full"
         if kind in ctx.bidi_layer_kinds:
             assert ctx.cu_seqlens is not None
-            # The tiled kernel has no float32 instantiation, so float32
-            # caches keep the recompute instead of reaching the
-            # primitive's eager ValueError mid-request.
-            if mm_prefix_path(ops) == "kernel" and kernel_k_cache.dtype != mx.float32:
+            float32_cache = kernel_k_cache.dtype == mx.float32
+            if image_block_path(ops, float32_cache=float32_cache) == "kernel":
                 mm_prefix_ranges = _mm_prefix_rows(ctx)
                 if mm_prefix_ranges is not None and not ctx.bidi_logged:
                     ctx.bidi_logged = True
@@ -812,38 +1035,15 @@ def sdpa_forward(
                     )
             else:
                 recompute_after_kernel = True
-    # Older native builds keep the existing whole-batch route.
-    paged_kwargs: dict[str, int | mx.array] = {}
-    # Omit the new keyword on the default path for older native builds.
-    if ctx.gqa_disabled:
-        control_probe = getattr(ops, "supports_gqa_decode_control", None)
-        supports_control = (
-            bool(control_probe())
-            if control_probe is not None
-            else hasattr(ops, "gqa_decode_shape_eligible")
-        )
-        if supports_control:
-            paged_kwargs["gqa_disabled"] = True
-        elif hasattr(ops, "has_gqa_decode_kernel") or hasattr(
-            ops, "_has_gqa_decode_kernel"
-        ):
-            # Never silently ignore a kill switch on an unrecognized GQA build.
-            raise RuntimeError(
-                "Loaded native GQA build does not advertise disable support; "
-                "rebuild the vllm-metal native extension."
-            )
-        # Pre-GQA native builds already use the established attention path.
-    if bool(getattr(ops, "supports_decode_routing_metadata", lambda: False)()):
-        paged_kwargs.update(
-            num_decode_requests=ctx.num_decode_requests,
-            num_decode_tokens=ctx.num_decode_tokens,
-            max_decode_context_len=ctx.max_decode_context_len,
-        )
-    if mm_prefix_ranges is not None:
-        paged_kwargs["mm_prefix_ranges"] = mm_prefix_ranges
+    # Only the kernel path passes the ranges, so ops that predate the keyword
+    # still run the kernel for text rows and leave image rows to the recompute.
+    mm_kwargs = (
+        {} if mm_prefix_ranges is None else {"mm_prefix_ranges": mm_prefix_ranges}
+    )
     out = mx.array(0)
     if kv_cache.turboquant:
-        # Reshape scale/zero caches for kernel block size
+        # Preserve the compressed primitive's layout and rejection contracts
+        # for decode, short continuations, verification, sinks and image rows.
         kernel_key_scale = new_key_scale_cache
         kernel_value_scale = new_value_scale_cache
         kernel_key_zero = new_key_zero_cache
@@ -858,41 +1058,158 @@ def sdpa_forward(
             kernel_key_zero = new_key_zero_cache.reshape(
                 -1, kernel_block_size, cache_kv_heads, sg
             )
-        # Get Lloyd-Max centroids for V quantization (lazily computed, cached).
-        # Resolved once per layer and shared by tq_encode + paged_attention.
         if v_centroids is None:
             from vllm_metal.attention.caches.turboquant import get_v_centroids
 
             v_centroids = get_v_centroids(kv_cache.v_bits)
-        ops.paged_attention_primitive(
-            q_3d,
-            kernel_k_cache,
-            kernel_v_cache,
-            cache_kv_heads,
-            attn_scale,
-            attn_softcap,
-            block_tables,
-            seq_lens,
-            cu_seqlens_q,
-            kernel_block_size,
-            max_seq_len,
-            layer_sliding_window,
-            out,
-            # Passed through rather than dropped: the primitive rejects
-            # sinks + TurboQuant outright, so a sink model on a quantized
-            # cache fails loudly instead of silently losing the sink term.
-            sinks=sinks,
-            key_scale_cache=kernel_key_scale,
-            value_scale_cache=kernel_value_scale,
-            key_zero_cache=kernel_key_zero,
-            v_centroids=v_centroids,
-            use_turboquant=True,
-            quant_type=kv_cache.k_quant,
-            v_bits=kv_cache.v_bits,
-            window_seqlen_q=ctx.verify_window_q,
-            **paged_kwargs,
-        )
+
+        def quantized_attention(
+            query: mx.array, batch: _AttentionBatch | _KernelMetadata
+        ) -> mx.array:
+            result = mx.array(0)
+            ops.paged_attention_primitive(
+                query,
+                kernel_k_cache,
+                kernel_v_cache,
+                cache_kv_heads,
+                attn_scale,
+                attn_softcap,
+                batch.block_tables,
+                batch.seq_lens,
+                batch.cu_seqlens_q,
+                kernel_block_size,
+                batch.max_seq_len,
+                layer_sliding_window,
+                result,
+                sinks=sinks,
+                key_scale_cache=kernel_key_scale,
+                value_scale_cache=kernel_value_scale,
+                key_zero_cache=kernel_key_zero,
+                v_centroids=v_centroids,
+                use_turboquant=True,
+                quant_type=kv_cache.k_quant,
+                v_bits=kv_cache.v_bits,
+                window_seqlen_q=ctx.verify_window_q,
+                **mm_kwargs,
+            )
+            return result
+
+        plan = None
+        if (
+            q_3d.shape[0] > len(ctx.context_lens)
+            and ctx.verify_window_q == 1
+            and sinks is None
+            and not mm_kwargs
+            and not recompute_after_kernel
+            # Windowed layers already skip old KV in the compressed path;
+            # materializing that history would undo the saving.
+            and layer_sliding_window < 0
+            and q_3d.dtype in (mx.bfloat16, mx.float16)
+            and q_3d.shape[2] in FWHT_SUPPORTED_HEAD_DIMS
+            and kernel_block_size in _KERNEL_BLOCK_SIZES
+            and new_k_cache.shape[1] == cache_block_size
+            and cache_block_size % kernel_block_size == 0
+        ):
+            plan = _turboquant_prefill_plan(
+                ctx,
+                meta,
+                raw_block_tables,
+                cache_block_size,
+                q_3d.shape[1],
+                cache_kv_heads,
+                q_3d.shape[2],
+            )
+
+        if plan is None:
+            out = quantized_attention(q_3d, meta)
+        else:
+            logger.info_once("Metal: bounded TurboQuant prefill lane active.")
+            logger.debug(
+                "TurboQuant prefill: %d requests, %d gathered tokens, "
+                "%d workspace bytes, %d compressed requests",
+                plan.prefill.seq_lens.shape[0],
+                plan.pool_pages.shape[0],
+                plan.workspace_bytes,
+                0 if plan.fallback is None else plan.fallback.seq_lens.shape[0],
+            )
+
+            # Fresh writer handles preserve encode -> gather dependencies.
+            # The fused read respects padded upstream views and writes only
+            # the final K/V pair, without packed or FP32 temporary arrays.
+            k16, v16 = materialize_turboquant_pages(
+                new_k_cache,
+                new_v_cache,
+                new_key_scale_cache,
+                new_key_zero_cache,
+                new_value_scale_cache,
+                plan.pool_pages,
+                plan.pool_offsets,
+                v_centroids,
+                head_dim=q_3d.shape[2],
+                key_quant_type=kv_cache.k_quant,
+                value_bits=kv_cache.v_bits,
+                output_dtype=q_3d.dtype,
+            )
+            batch = plan.prefill
+            query = q_3d if batch.query_indices is None else q_3d[batch.query_indices]
+            ops.paged_attention_primitive(
+                query,
+                k16.reshape(-1, kernel_block_size, cache_kv_heads, q_3d.shape[2]),
+                v16.reshape(-1, kernel_block_size, cache_kv_heads, q_3d.shape[2]),
+                cache_kv_heads,
+                attn_scale,
+                attn_softcap,
+                batch.block_tables,
+                batch.seq_lens,
+                batch.cu_seqlens_q,
+                kernel_block_size,
+                batch.max_seq_len,
+                layer_sliding_window,
+                out,
+                window_seqlen_q=ctx.verify_window_q,
+            )
+            if plan.fallback is not None:
+                fallback = plan.fallback
+                rest = quantized_attention(q_3d[fallback.query_indices], fallback)
+                out = mx.concatenate((out, rest), axis=0)[plan.restore_indices]
+            # Finish this lane before building the next layer. Otherwise MLX
+            # can keep several materialized K/V pairs in flight, multiplying
+            # the single workspace reserved by WorkerCachePlanner. Decode and
+            # the compressed fallback retain their fully lazy execution.
+            mx.eval(out)
+            # eval waits for the result event; Metal's completion handlers can
+            # still retain input buffers. Drain the stream before another layer
+            # allocates its K/V pair against the same workspace reservation.
+            mx.synchronize()
     else:
+        # Whole-batch decode routing belongs to the ordinary cache path. TQ
+        # uses its own sub-batch metadata and stays outside native decode split.
+        paged_kwargs: dict[str, int | mx.array] = dict(mm_kwargs)
+        # Omit the new keyword on the default path for older native builds.
+        if ctx.gqa_disabled:
+            control_probe = getattr(ops, "supports_gqa_decode_control", None)
+            supports_control = (
+                bool(control_probe())
+                if control_probe is not None
+                else hasattr(ops, "gqa_decode_shape_eligible")
+            )
+            if supports_control:
+                paged_kwargs["gqa_disabled"] = True
+            elif hasattr(ops, "has_gqa_decode_kernel") or hasattr(
+                ops, "_has_gqa_decode_kernel"
+            ):
+                # Never silently ignore a kill switch on an unrecognized GQA build.
+                raise RuntimeError(
+                    "Loaded native GQA build does not advertise disable support; "
+                    "rebuild the vllm-metal native extension."
+                )
+            # Pre-GQA native builds already use the established attention path.
+        if bool(getattr(ops, "supports_decode_routing_metadata", lambda: False)()):
+            paged_kwargs.update(
+                num_decode_requests=ctx.num_decode_requests,
+                num_decode_tokens=ctx.num_decode_tokens,
+                max_decode_context_len=ctx.max_decode_context_len,
+            )
         ops.paged_attention_primitive(
             q_3d,
             kernel_k_cache,

@@ -163,6 +163,18 @@ class DraftModelProposer:
         # ineligible target does not block an eligible draft (or vice
         # versa).
         self._merge_ingest_windows = merge_ingest_windows
+        # Resolve once during drafter construction so invalid values fail before serving.
+        try:
+            self._ingest_chunk = envs.VLLM_METAL_SPEC_INGEST_CHUNK
+        except ValueError as exc:
+            raise ValueError(
+                f"VLLM_METAL_SPEC_INGEST_CHUNK must be an integer: {exc}"
+            ) from exc
+        if self._ingest_chunk < 0:
+            raise ValueError(
+                "VLLM_METAL_SPEC_INGEST_CHUNK must be a positive chunk size, or 0 "
+                f"for single-forward ingest; got {self._ingest_chunk}"
+            )
         # Stateless RoPE/mask shims for the draft forward (one per layer). The
         # real per-request offsets come from the paged context, so these carry
         # no state — allocate once and reuse across steps, not per propose().
@@ -706,7 +718,7 @@ class DraftModelProposer:
         # chunk is the last ingested token, whose logits predict the plan's
         # first draft token — identical to the single-forward path.
         max_len = max(len(plan.ingest_tokens) for plan in plans)
-        chunk_size = envs.VLLM_METAL_SPEC_INGEST_CHUNK
+        chunk_size = self._ingest_chunk
         if chunk_size <= 0:
             chunk_size = max_len  # "0" restores the single-forward behavior
         final_rows: dict[int, mx.array] = {}

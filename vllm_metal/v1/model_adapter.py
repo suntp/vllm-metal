@@ -178,6 +178,12 @@ class MultimodalRuntimeAdapter(Protocol):
       encoder profiling): one feature of the largest encoder input, which
       ``MetalModelRunner.profile_run`` encodes so the measured allocator
       overhead covers the vision tower.
+    - ``bidirectional_layer_kinds: frozenset[str]`` (default empty): the layer
+      kinds (``"sliding"``, ``"full"``) on which the rows of an image block
+      attend to the whole block, not only causally.  Gemma 4 sets
+      ``{"sliding"}`` when its checkpoint asks for
+      ``use_bidirectional_attention == "vision"``; empty keeps image tokens
+      causal.
     """
 
     forward_ready: bool
@@ -249,9 +255,6 @@ class MultimodalRuntimeAdapter(Protocol):
 
 class ModelAdapter(Protocol):
     """Model-specific hooks used by runner and cache orchestration."""
-
-    def should_force_text_backbone(self, hf_config: Any) -> bool:
-        """Whether a multimodal config should run on the text-only path."""
 
     def multimodal_backbone_mode(
         self, model_config: ModelConfig, *, speculative_config: Any | None = None
