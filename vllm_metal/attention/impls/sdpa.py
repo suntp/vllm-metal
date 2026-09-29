@@ -322,11 +322,21 @@ def _turboquant_prefill_plan(
     ratio = cache_block_size // kernel_bs
     bytes_per_block = kernel_bs * prefill_bytes_per_token(num_kv_heads, head_dim)
     # Splitting also gathers Q and concatenates/restores the outputs. Charge
-    # those three FP16/BF16 copies and both index arrays when any row falls back.
-    routing_bytes = cu_seqlens[-1] * (6 * num_query_heads * head_dim + 8)
+    # those three FP16/BF16 copies plus query-gather and output-restore indices.
+    query_row_bytes = num_query_heads * head_dim * 2  # FP16/BF16 element width.
+    routing_bytes = cu_seqlens[-1] * (3 * query_row_bytes + 2 * 4)
+
+    def split_metadata_bytes(fallback_count: int) -> int:
+        # Split seq_lens have N int32s; the two cu_seqlens_q have N + 2.
+        # Each fallback needs a padded table row and its int32 gather index.
+        sequence_bytes = (2 * len(lengths) + 2) * 4
+        table_bytes = fallback_count * (meta.block_tables.shape[1] + 1) * 4
+        return sequence_bytes + table_bytes
 
     def select_rows(
         limit: int,
+        *,
+        split: bool,
     ) -> tuple[dict[int, int], list[int], list[list[int]], int]:
         block_limit = max(0, limit) // bytes_per_block
         source_blocks: dict[int, int] = {}
@@ -348,6 +358,8 @@ def _turboquant_prefill_plan(
             next_width = max(table_width, num_blocks)
             next_bytes = (len(source_blocks) + len(additions)) * bytes_per_block
             next_bytes += (len(rows) + 1) * next_width * 4
+            if split:
+                next_bytes += split_metadata_bytes(len(lengths) - len(rows) - 1)
             if next_bytes > limit:
                 continue
             row = []
@@ -364,11 +376,11 @@ def _turboquant_prefill_plan(
     # necessary, repeat CPU-only admission with its routing cost reserved.
     must_split = len(candidates) < len(lengths)
     source_blocks, prefill_ids, rows, table_width = select_rows(
-        workspace_limit - (routing_bytes if must_split else 0)
+        workspace_limit - (routing_bytes if must_split else 0), split=must_split
     )
     if not must_split and 0 < len(prefill_ids) < len(lengths):
         source_blocks, prefill_ids, rows, table_width = select_rows(
-            workspace_limit - routing_bytes
+            workspace_limit - routing_bytes, split=True
         )
     if len(prefill_ids) < len(candidates):
         logger.info_once(
@@ -430,7 +442,11 @@ def _turboquant_prefill_plan(
         offsets,
         len(source_blocks) * bytes_per_block
         + len(rows) * table_width * 4
-        + (routing_bytes if fallback_ids else 0),
+        + (
+            routing_bytes + split_metadata_bytes(len(fallback_ids))
+            if fallback_ids
+            else 0
+        ),
     )
     meta.tq_prefill_plans[key] = plan
     return plan

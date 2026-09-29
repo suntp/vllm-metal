@@ -398,20 +398,61 @@ def test_over_budget_history_falls_back_before_dequantization(
     assert mx.array_equal(output, reference).item()
 
 
-def test_split_budget_includes_query_and_output_copies(recorded_ops, monkeypatch):
-    monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "6")
-    # KV alone fits 6 MiB, but gathering Q and reassembling this many query
-    # heads would exceed the reservation when splitting off the decode row.
+@pytest.mark.parametrize("workspace_mib,selected", [(6, False), (8, True)])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_split_budget_includes_query_and_output_copies(
+    recorded_ops, monkeypatch, workspace_mib, selected, dtype
+):
+    monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", str(workspace_mib))
+    # KV alone fits 6 MiB. Three 2-byte routing copies push it above 6 MiB
+    # but below 8 MiB; counting the element width twice would reject both.
     case = build_case(
         qlens=(128, 1),
         context_lens=(1153, 32),
         n_heads=64,
         n_kv_heads=2,
+        dtype=dtype,
     )
     output, reference = assert_parity(case)
-    assert len(recorded_ops) == 1
-    assert recorded_ops[0][1]["use_turboquant"]
-    assert mx.array_equal(output, reference).item()
+    assert len(recorded_ops) == (2 if selected else 1)
+    assert recorded_ops[0][1].get("use_turboquant", False) == (not selected)
+    if not selected:
+        assert mx.array_equal(output, reference).item()
+
+
+@pytest.mark.parametrize("workspace_mib,selected", [(1, False), (2, True)])
+def test_split_budget_includes_long_fallback_block_table(
+    monkeypatch, workspace_mib, selected
+):
+    monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", str(workspace_mib))
+    case = build_case(qlens=(128, 1), context_lens=(216, 32))
+    # Admission only: a short prefill shares metadata with a long decode.
+    case.ctx.context_lens[1] = 131072
+    case.ctx.block_tables[1] = list(range(8192))
+    meta = sdpa._kernel_metadata(case.ctx, None, [], case.ctx.block_tables, 16)
+    plan = sdpa._turboquant_prefill_plan(
+        case.ctx, meta, case.ctx.block_tables, 16, 8, 2, 128
+    )
+    assert (plan is not None) == selected
+    if plan is None:
+        return
+    assert plan.fallback is not None
+    metadata = [plan.pool_pages, plan.pool_offsets, plan.restore_indices]
+    for batch in (plan.prefill, plan.fallback):
+        metadata.extend(
+            [
+                batch.query_indices,
+                batch.block_tables,
+                batch.seq_lens,
+                batch.cu_seqlens_q,
+            ]
+        )
+    # Size the actual retained metadata and data-copy shapes independently
+    # of the planner's estimate, including the copied fallback table.
+    query = mx.zeros((129, 8, 128), dtype=mx.bfloat16)
+    kv = mx.zeros((2, plan.pool_pages.size, 2, 128), dtype=mx.bfloat16)
+    required = kv.nbytes + 3 * query.nbytes + sum(a.nbytes for a in metadata)
+    assert required <= plan.workspace_bytes <= workspace_mib * 2**20
 
 
 @pytest.mark.parametrize("shared_prefix", [False, True])

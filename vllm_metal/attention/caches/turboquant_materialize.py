@@ -136,7 +136,8 @@ def materialize_turboquant_pages(
         mx.bfloat16,
     ):
         raise ValueError(
-            "TQ materialization requires FP16/BF16 and head_dim 64/128/256/512"
+            "TQ materialization requires FP16/BF16 and head_dim 64/128/256/512; "
+            f"got head_dim={head_dim}, output_dtype={output_dtype}"
         )
     shape = (pages.size, k_data.shape[2], head_dim)
     k, v = _kernel()(
