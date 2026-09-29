@@ -826,6 +826,10 @@ class MetalModelRunner:
         self._draft_token_ids = None
         return draft_token_ids
 
+    @property
+    def tq_prefill_workspace_bytes(self) -> int:
+        return self._cache_policy.tq_prefill_workspace_bytes
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get KV cache specification.
 
@@ -1216,6 +1220,8 @@ class MetalModelRunner:
         )
         try:
             ctx = get_context()
+            if ctx is not None:
+                ctx.tq_prefill_workspace_bytes = self.tq_prefill_workspace_bytes
             runtime = self._paged_attention_runtime
             if runtime is not None and scheduler_output.new_block_ids_to_zero:
                 runtime.zero_blocks(scheduler_output.new_block_ids_to_zero)

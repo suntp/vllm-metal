@@ -121,6 +121,8 @@ class PagedAttentionContext:
     # ``slot_mapping`` / ``block_tables`` above mirror group zero for the
     # legacy single-group path.
     kv_groups: tuple[PagedKVGroupContext, ...] | None = None
+    # Fixed at worker startup and deducted before scheduler KV allocation.
+    tq_prefill_workspace_bytes: int = 0
     # Kernel-format metadata memo, keyed by (KV group index, cache block
     # size).  The context lives for exactly one forward pass, so entries
     # never go stale; every layer of a group reuses the first layer's

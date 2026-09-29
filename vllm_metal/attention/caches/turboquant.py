@@ -15,7 +15,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
-def prefill_workspace_bytes() -> int:
+def prefill_workspace_bytes(*, max_bytes: int | None = None) -> int:
     """Resolve the same allowance for cache sizing and prefill admission."""
     from vllm_metal import envs
     from vllm_metal.metal import get_ops
@@ -51,7 +51,8 @@ def prefill_workspace_bytes() -> int:
         recommended = int(mx.device_info().get("max_recommended_working_set_size", 0))
         step = 64 * 2**20
         rounded = (recommended + 50 * step - 1) // (50 * step) * step
-        return max(256 * 2**20, min(2 * 2**30, rounded))
+        allowance = max(256 * 2**20, min(2 * 2**30, rounded))
+        return allowance if max_bytes is None else min(allowance, max_bytes)
     return mib * 2**20
 
 

@@ -143,16 +143,38 @@ per layer **per scheduler step**; each prefill chunk re-materializes its
 referenced history. Scheduler-owned storage, block tables and their lifetime
 remain authoritative.
 
-Workspace resolution and routing plans are cached in the existing per-forward,
-per-KV-group metadata. A fully selected batch reuses the original sequence
+The worker resolves the workspace allowance once, before KV allocation, and
+passes that same value to each forward. Routing plans remain cached in the
+existing per-forward, per-KV-group metadata. A fully selected batch reuses the original sequence
 metadata without constructing query-reordering indices.
 
 `VLLM_METAL_TQ_PREFILL_MAX_MIB=auto` reserves 2% of the device's recommended
-working set, rounded up to 64 MiB, with a 256 MiB floor and 2 GiB ceiling. A
-number overrides the allowance in MiB; `0` disables materialization. Set these
+working set, rounded up to 64 MiB, with a 256 MiB floor and 2 GiB ceiling before
+applying a model-specific cap. For non-speculative serving with a resolved
+context limit, the cap covers all eligible independent histories allowed by
+`max_model_len`, `max_num_seqs` and `max_num_batched_tokens`, including page
+padding and mixed-batch routing copies. It can reduce the reservation below
+256 MiB for small configurations. A scheduler chunk limits new queries, not
+the historical KV they can read. Layers reuse one allowance.
+
+Speculative configurations and unresolved automatic context limits retain the
+device-based allowance. A number explicitly overrides the allowance in MiB
+without applying the model cap; `0` disables materialization. Set these
 variables before worker startup. The existing cache planner subtracts the
 allowance **once, inside `gpu_memory_utilization`**, before allocating KV blocks.
 This is a fixed allowance, not permission to borrow currently free memory.
+
+For example, on M5 Pro 64 GB with K8/V3, `max_model_len=4104`,
+`max_num_seqs=1` and `max_num_batched_tokens=2048`:
+
+| Model | Device-only reservation | Model-capped reservation | Additional KV budget |
+|---|---:|---:|---:|
+| Qwen3-0.6B-4bit | 1,088 MiB | 16.13 MiB | 1,071.87 MiB |
+| Qwen3.5-0.8B BF16 | 1,088 MiB | 10.71 MiB | 1,077.29 MiB |
+
+Both retain the accelerated path for their eligible prefills. The released
+budget goes to the existing KV planner within the same memory-utilization
+limit; these capacity figures do not imply a further TTFT speedup.
 
 Admission counts final K/V, page indices, block tables and any mixed-batch
 query/output copies. Independent histories add their sizes; shared physical
@@ -165,7 +187,8 @@ successive layers cannot accumulate. Normal model buffers remain in the
 existing profiled execution budget.
 
 The worker logs the reserved allowance, first lane activation and first budget
-fallback. Debug logs include selected/fallback request counts, gathered tokens
+fallback. Unsupported activation dtypes, head dimensions and cache layouts
+also report their fallback reason once. Debug logs include selected/fallback request counts, gathered tokens
 and estimated bytes. Larger histories still need more scratch space: this is
 bounded materialization, not constant-memory streaming attention.
 

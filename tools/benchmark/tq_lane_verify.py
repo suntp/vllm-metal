@@ -26,6 +26,7 @@ import numpy as np
 
 from tools.attention_bench_utils import package_versions
 from tools.benchmark.tq_prefill_case import build_case
+from vllm_metal.attention.caches.turboquant import prefill_workspace_bytes
 from vllm_metal.attention.impls import sdpa
 from vllm_metal.metal import get_ops
 
@@ -184,7 +185,7 @@ def main():
             {
                 "device": mx.device_info()["device_name"],
                 "nax_ready": ops.nax_ready(),
-                "workspace_limit_bytes": sdpa.prefill_workspace_bytes(),
+                "workspace_limit_bytes": prefill_workspace_bytes(),
                 "versions": package_versions("vllm", "mlx", "mlx-lm"),
             }
         ),
