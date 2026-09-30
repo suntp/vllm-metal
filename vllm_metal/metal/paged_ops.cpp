@@ -615,9 +615,13 @@ static void dispatch_paged_attention_v2_reduce(
         std::to_string(head_size) + ")");
   }
   enc.set_compute_pipeline_state(rkernel);
-  // Partition stats stay in device memory. The fold uses a static
-  // NUM_WARPS x HEAD_SIZE row buffer, so this dynamic slot is unused.
-  enc.set_threadgroup_memory_length(0, 0);
+  // Metal requires setThreadgroupMemoryLength to be a multiple of 16 bytes
+  // (odd partition counts would yield 8 mod 16 and trip the API-validation
+  // layer).  The kernel reads exactly 2*num_partitions floats; the padding
+  // is never touched.
+  size_t reduce_shmem =
+      static_cast<size_t>(2 * max_num_partitions) * sizeof(float);
+  enc.set_threadgroup_memory_length((reduce_shmem + 15) & ~size_t(15), 0);
   enc.set_output_array(out, 0);
   enc.set_input_array(exp_sums, 1);
   enc.set_input_array(max_logits, 2);

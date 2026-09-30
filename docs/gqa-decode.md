@@ -71,10 +71,10 @@ memory only for P64/P128. Online softmax stays in registers.
 
 The producer writes the same log2-space `(max, exp-sum)` plus
 epsilon-normalized `tmp_out` contract as split-KV. The shared
-`paged_attention_v2_reduce` therefore merges GQA partials. That reduce
-walks partitions warp-strided, keeps stats in device memory, and folds
-eight `HEAD_SIZE` rows with one barrier. Changes to the reduce affect the
-established split-KV path as well as GQA.
+`paged_attention_v2_reduce` therefore merges GQA partials unchanged:
+this path never modifies the reduce, so the established split-KV decode
+paths (multi-request, TurboQuant, sinks, every head size) keep their
+existing behavior and numerics byte-for-byte.
 
 Every eligible call additionally requires:
 
