@@ -2077,6 +2077,16 @@ NB_MODULE(_paged_ops, m) {
   m.def("supports_gqa_decode_control", []() { return true; },
         "Whether paged_attention_primitive accepts the gqa_disabled keyword.");
 
+  m.def("tile_config",
+        [](int head_size) -> nb::object {
+          auto cfg = select_tile_config(head_size);
+          if (!cfg) return nb::none();
+          return nb::make_tuple(cfg->BQ, cfg->TILE_KV);
+        },
+        nb::arg("head_size"),
+        "The tiled-prefill kernel's (BQ, TILE_KV) tile config for a head "
+        "size, or None when that head size has no tiled instantiation.");
+
   m.def("init_v2_library", &init_v2_library,
         nb::arg("v2_src"),
         "JIT-compile the v2 online-softmax Metal shader.");

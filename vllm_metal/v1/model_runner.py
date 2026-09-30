@@ -454,6 +454,8 @@ class MetalModelRunner:
         # Async forward state: stashed by execute_model, consumed by
         # sample_tokens (mirrors upstream's execute_model_state pattern).
         self._execute_model_state: _PagedForwardState | None = None
+        # The exception a sample_tokens call raised; execute_model re-raises it.
+        self._sample_failure: Exception | None = None
 
         # Resolved in load_model by probing the output head; False until then so
         # a partially initialized runner keeps full logits.
@@ -532,15 +534,18 @@ class MetalModelRunner:
         if not envs.VLLM_METAL_SPEC_VERIFY_WINDOW:
             return "VLLM_METAL_SPEC_VERIFY_WINDOW is off"
         if self.is_mla:
-            return "MLA decode takes one-row segments"
+            return "window mode does not support MLA models"
         if self.is_hybrid:
-            return "the hybrid decode check takes one-row segments"
+            return "window mode does not support hybrid models"
         head_dims = self.head_dim_per_layer
         max_head_dim = (
             max(head_dims) if head_dims else self.model_config.get_head_size()
         )
         if max_head_dim > PA_WINDOW_MAX_HEAD_SIZE:
-            return f"head size {max_head_dim} exceeds {PA_WINDOW_MAX_HEAD_SIZE}"
+            return (
+                f"head size {max_head_dim} exceeds the window mode's "
+                f"{PA_WINDOW_MAX_HEAD_SIZE}"
+            )
         return None
 
     @property
@@ -825,6 +830,10 @@ class MetalModelRunner:
         draft_token_ids = self._draft_token_ids
         self._draft_token_ids = None
         return draft_token_ids
+
+    @property
+    def tq_prefill_workspace_bytes(self) -> int:
+        return self._cache_policy.tq_prefill_workspace_bytes
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get KV cache specification.
@@ -1213,6 +1222,7 @@ class MetalModelRunner:
             prefill_info,
             self._paged_group_block_sizes,
             merge_verify_windows=self.merge_verify_windows,
+            tq_prefill_workspace_bytes=self.tq_prefill_workspace_bytes,
         )
         try:
             ctx = get_context()
@@ -1819,9 +1829,13 @@ class MetalModelRunner:
                     f"{seg_end - seg_start} of {len(prefill.token_ids)} chunk "
                     "rows — the selective-logits gate desynced."
                 )
+            state = self._request_states.get(prefill.req_id)
+            prompt_token_ids = (
+                full_prompt if state is None else full_prompt[: state.prompt_len]
+            )
             tensors = self._prompt_logprobs_tracker.observe_chunk(
                 prefill.req_id,
-                prompt_token_ids=full_prompt,
+                prompt_token_ids=prompt_token_ids,
                 start_pos=prefill.start_pos,
                 num_tokens=len(prefill.token_ids),
                 chunk_logits=logits[0, seg_start:seg_end, :],
@@ -2528,7 +2542,7 @@ class MetalModelRunner:
             if needs_full_prompt:
                 state = self._request_states.get(prefill.req_id)
                 if state is not None:
-                    full_prompt = state.token_ids[: state.prompt_len]
+                    full_prompt = list(state.token_ids)
                 else:
                     new_req = batch.new_reqs_by_id.get(prefill.req_id)
                     if new_req is None:
@@ -2693,6 +2707,11 @@ class MetalModelRunner:
         asynchronously — sampling and postprocessing are deferred to
         ``sample_tokens`` so the scheduler can run while the GPU computes.
         """
+        if self._sample_failure is not None:
+            raise RuntimeError(
+                "sample_tokens failed on the previous step, so its requests "
+                "never received their sampled tokens; no further step can run"
+            ) from self._sample_failure
         if self.model is None:
             raise RuntimeError("Model not loaded")
         if self._uses_encoder_pooling_backend():
@@ -2815,6 +2834,18 @@ class MetalModelRunner:
         On pipeline-eligible steps the sync itself is deferred one step:
         a lazy greedy sample is submitted and an async output is returned.
         """
+        try:
+            return self._sample_tokens(grammar_output)
+        except Exception as exc:
+            # Under async scheduling the engine dispatches the next
+            # execute_model before it reads this failure; that step raises it
+            # instead of running on request state the sample never updated.
+            self._sample_failure = exc
+            raise
+
+    def _sample_tokens(
+        self, grammar_output: GrammarOutput | None
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         # Paged path: wait for MLX forward, apply grammar bitmask, sample tokens.
         if self._execute_model_state is not None:
             # Pipeline parallelism: only the last stage holds logits and samples.

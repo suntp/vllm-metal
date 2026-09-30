@@ -20,6 +20,7 @@ from vllm_metal.attention.caches.turboquant import (
     BLOCK_SIZE,
     FWHT_SUPPORTED_HEAD_DIMS,
     QUANT_PARAMS,
+    TQ_MIN_SCALE,
     V_QUANT_PARAMS,
     fwht,
     get_fwht_signs,
@@ -126,6 +127,54 @@ def _parse_metal_sign_table(head_size: int) -> np.ndarray:
             f"FWHT_SIGNS_{head_size} expected length {head_size}, got {signs.shape[0]}"
         )
     return signs
+
+
+@pytest.mark.parametrize("quant_type", ["q8_0", "uint8", "q4_0", "int2"])
+@pytest.mark.parametrize("value", [0.0, 0.5, -3.0, 40.0])
+def test_constant_block_quantizes_without_nan(quant_type: str, value: float) -> None:
+    """A block of identical values has zero range. The scale must stay a
+    normal float16, so the zero point stays finite and the block dequantizes
+    back to its value instead of NaN."""
+    from vllm_metal.attention.caches.turboquant import dequantize, quantize
+
+    x = mx.full((2, 64), value, dtype=mx.float16)
+    indices, scale, zero_point = quantize(x, quant_type)
+    out = dequantize(indices, scale, zero_point)
+    mx.eval(out, scale, zero_point)
+
+    assert not bool(mx.any(mx.isnan(out)))
+    assert not bool(mx.any(mx.isinf(zero_point)))
+    assert bool(mx.all(scale > 0))
+    np.testing.assert_allclose(
+        np.array(out, dtype=np.float32), np.full((2, 64), value), rtol=2e-3, atol=1e-3
+    )
+
+
+def test_metal_min_scale_matches_python() -> None:
+    match = re.search(
+        r"constant float TQ_MIN_SCALE = (0x[0-9a-fA-F.]+p[+-]?\d+)f;",
+        _METAL_SOURCE.read_text(),
+    )
+    assert match is not None, f"TQ_MIN_SCALE not found in {_METAL_SOURCE}"
+    assert float.fromhex(match.group(1)) == TQ_MIN_SCALE
+
+
+def test_tiny_range_block_quantizes_without_nan() -> None:
+    from vllm_metal.attention.caches.turboquant import dequantize, quantize
+
+    x = (
+        (40.0 + 1e-6 * mx.arange(32, dtype=mx.float32))
+        .reshape(1, 32)
+        .astype(mx.float16)
+    )
+    indices, scale, zero_point = quantize(x, "q8_0")
+    out = dequantize(indices, scale, zero_point)
+    mx.eval(out)
+
+    assert not bool(mx.any(mx.isnan(out)))
+    np.testing.assert_allclose(
+        np.array(out, dtype=np.float32), np.array(x, dtype=np.float32), rtol=2e-3
+    )
 
 
 @pytest.mark.parametrize("head_size", FWHT_SUPPORTED_HEAD_DIMS)

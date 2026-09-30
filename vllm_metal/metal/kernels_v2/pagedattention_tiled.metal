@@ -462,11 +462,11 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
                                         : fast::exp2(max_score - new_max);
     } else {
       factor = 1.0f;
-      // A fully window-masked tile (row_max -INFINITY, nothing unmasked
-      // seen yet) must not pin max_score at 0: later in-window keys would
-      // be weighted by exp2(s - 0) instead of exp2(s - s_max), collapsing
-      // rows whose real scores are all far below 0 (#876). Keeping
-      // -INFINITY is safe: every Sreg here is -INFINITY, so the
+      // A fully window-masked tile (new_max still -INFINITY, nothing
+      // unmasked seen yet) must not pin max_score at 0: later in-window
+      // keys would be weighted by exp2(s - 0) instead of exp2(s - s_max),
+      // collapsing rows whose real scores are all far below 0 (#876).
+      // Keeping -INFINITY is safe: every Sreg here is -INFINITY, so the
       // exponentiate below still emits p == 0, and the next unmasked tile
       // takes the factor == 0 rescale branch above.
     }

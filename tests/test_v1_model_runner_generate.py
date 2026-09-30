@@ -520,7 +520,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         captured: dict[str, object] = {}
 
         def capture_prepare_grouped(
-            decode_info, prefill_info, block_sizes, *, merge_verify_windows
+            decode_info, prefill_info, block_sizes, *, merge_verify_windows, **_kwargs
         ):
             captured["decode_info"] = decode_info
             captured["prefill_info"] = prefill_info
@@ -587,7 +587,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         captured: dict[str, object] = {}
 
         def capture_prepare_grouped(
-            decode_info, prefill_info, block_sizes, *, merge_verify_windows
+            decode_info, prefill_info, block_sizes, *, merge_verify_windows, **_kwargs
         ):
             del prefill_info, block_sizes, merge_verify_windows
             captured["decode_info"] = decode_info
@@ -635,7 +635,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         captured: dict[str, object] = {}
 
         def capture_prepare_grouped(
-            decode_info, prefill_info, block_sizes, *, merge_verify_windows
+            decode_info, prefill_info, block_sizes, *, merge_verify_windows, **_kwargs
         ):
             del merge_verify_windows
             captured["decode_info"] = decode_info
@@ -783,7 +783,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         captured: dict[str, object] = {}
 
         def capture_prepare_grouped(
-            decode_info, prefill_info, block_sizes, *, merge_verify_windows
+            decode_info, prefill_info, block_sizes, *, merge_verify_windows, **_kwargs
         ):
             del merge_verify_windows
             captured["decode_info"] = decode_info
@@ -839,7 +839,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         captured: dict[str, object] = {}
 
         def capture_prepare_grouped(
-            decode_info, prefill_info, block_sizes, *, merge_verify_windows
+            decode_info, prefill_info, block_sizes, *, merge_verify_windows, **_kwargs
         ):
             del merge_verify_windows
             captured["decode_info"] = decode_info
@@ -904,7 +904,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         captured: dict[str, object] = {}
 
         def capture_prepare_grouped(
-            decode_info, prefill_info, block_sizes, *, merge_verify_windows
+            decode_info, prefill_info, block_sizes, *, merge_verify_windows, **_kwargs
         ):
             del merge_verify_windows
             captured["decode_info"] = decode_info
@@ -1554,6 +1554,37 @@ class TestV1MetalModelRunnerExecuteModel:
         assert out.req_id_to_index == {}
         assert out.sampled_token_ids == []
         assert runner._execute_model_state is None
+
+    def test_step_after_a_failed_sample_raises_the_sample_error(
+        self, monkeypatch
+    ) -> None:
+        """Under async scheduling the engine dispatches the next
+        ``execute_model`` before it reads the failed ``sample_tokens`` future.
+        The failed step's requests never received their sampled tokens (a
+        finished prefill still has ``generated_tokens == 0``), so running on
+        that state builds an empty prefill segment and the engine dies with an
+        unrelated attention error.  The next step must raise the sampling
+        failure instead.
+        """
+        runner = self._make_runner()
+        runner._execute_model_state = object()
+        cause = RuntimeError("logprobs kernel failed to compile")
+
+        def fail(grammar_output):
+            raise cause
+
+        monkeypatch.setattr(runner, "_sample_paged_batch", fail)
+        with pytest.raises(RuntimeError, match="failed to compile"):
+            runner.sample_tokens(None)
+
+        monkeypatch.setattr(
+            runner,
+            "_start_paged_forward",
+            lambda *args, **kwargs: pytest.fail("the next step must not run"),
+        )
+        with pytest.raises(RuntimeError, match="sample_tokens") as info:
+            runner.execute_model(self._make_scheduler_output(["req-0"]))
+        assert info.value.__cause__ is cause
 
     def test_paged_cached_request_without_state_raises(self) -> None:
         runner = self._make_runner()
@@ -2447,12 +2478,12 @@ class TestVerifyLayoutLog:
             (
                 "1",
                 {"model_args": {"kv_lora_rank": 512}},
-                "MLA decode takes one-row segments",
+                "window mode does not support MLA models",
             ),
             (
                 "1",
                 {"is_hybrid": True},
-                "the hybrid decode check takes one-row segments",
+                "window mode does not support hybrid models",
             ),
             (
                 "1",
@@ -2463,7 +2494,7 @@ class TestVerifyLayoutLog:
                         is_hybrid=False,
                     )
                 },
-                "head size 512 exceeds 256",
+                "head size 512 exceeds the window mode's 256",
             ),
         ],
         ids=["off", "mla", "hybrid", "head-size"],

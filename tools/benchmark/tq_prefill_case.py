@@ -15,7 +15,11 @@ from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT
 from vllm_metal.attention.caches.storage import KVCacheStorage
-from vllm_metal.attention.caches.turboquant import QUANT_PARAMS, get_v_centroids
+from vllm_metal.attention.caches.turboquant import (
+    QUANT_PARAMS,
+    get_v_centroids,
+    prefill_workspace_bytes,
+)
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls import sdpa
 from vllm_metal.metal import get_ops
@@ -212,6 +216,7 @@ def build_case(
     x = mx.random.normal((1, sum(qlens), hidden), key=mx.random.key(94)).astype(dtype)
     mx.eval(x, inner.q_proj.weight, inner.k_proj.weight, inner.v_proj.weight)
     ctx = PagedAttentionContext(
+        tq_prefill_workspace_bytes=prefill_workspace_bytes(),
         slot_mapping=new_slots,
         block_tables=tables,
         context_lens=list(context_lens),

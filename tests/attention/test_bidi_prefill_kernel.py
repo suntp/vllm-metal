@@ -519,14 +519,19 @@ def test_tiled_prefill_rows_behind_masked_first_tile_stay_neutral(
     of exp2(score - max), collapsing rows whose real scores are far below 0
     (#876).
 
-    64 rows span two 32-row threadgroups (BQ == TILE_KV).  seq_len 216 puts
-    row 0's window start at key 57 == 25 mod 32, so the last 25 rows of each
-    threadgroup see the first scanned tile fully masked.  q = a*ones and
-    k = -a*ones + noise put every in-window scaled score near -8*a*a.
+    64 rows span two BQ-row threadgroups (BQ == TILE_KV at HD == 64).
+    seq_len 216 puts row 0's window start at key 57 == 25 mod TILE_KV, so
+    the last 25 rows of each threadgroup see the first scanned tile fully
+    masked.  q = a*ones and k = -a*ones + noise put every in-window scaled
+    score near -8*a*a.
     """
     n, seq_len, window = 64, 216, 96
+    cfg = get_ops().tile_config(HD)
+    assert cfg is not None
+    bq, tile_kv = cfg
+    assert n == 2 * bq
     row0_win_start = (seq_len - n) + 1 - window
-    assert row0_win_start % 32 == 25
+    assert row0_win_start % tile_kv == 25
     key_cache, value_cache, _, table = _setup(0, n=n, seq_len=seq_len)
     mx.random.seed(3)
     query = (mx.ones((n, HEADS, HD)) * magnitude).astype(DTYPE)
