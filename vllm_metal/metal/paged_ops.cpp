@@ -580,14 +580,17 @@ static void dispatch_paged_attention_v2_reduce(
       rname, lib, rhash,
       {{&use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)},
        {&use_tq_fc, MTL::DataType::DataTypeBool, NS::UInteger(50)}});
+  if (use_tq_fc && head_size != 64 && head_size != 128 && head_size != 256 &&
+      head_size != 512) {
+    throw std::invalid_argument(
+        "TurboQuant paged reduce requires head_size in {64, 128, 256, 512} "
+        "(got " +
+        std::to_string(head_size) + ")");
+  }
   enc.set_compute_pipeline_state(rkernel);
-  // Metal requires setThreadgroupMemoryLength to be a multiple of 16 bytes
-  // (odd partition counts would yield 8 mod 16 and trip the API-validation
-  // layer).  The kernel reads exactly 2*num_partitions floats; the padding
-  // is never touched.
-  size_t reduce_shmem =
-      static_cast<size_t>(2 * max_num_partitions) * sizeof(float);
-  enc.set_threadgroup_memory_length((reduce_shmem + 15) & ~size_t(15), 0);
+  // Partition stats stay in device memory. The fold uses a static
+  // NUM_WARPS x HEAD_SIZE row buffer, so this dynamic slot is unused.
+  enc.set_threadgroup_memory_length(0, 0);
   enc.set_output_array(out, 0);
   enc.set_input_array(exp_sums, 1);
   enc.set_input_array(max_logits, 2);
@@ -800,9 +803,6 @@ static void dispatch_paged_attention_v2_online(
   const int64_t gqa_partitions = gqa_partition_size > 0
       ? (static_cast<int64_t>(max_seq_len) + gqa_partition_size - 1) /
             gqa_partition_size : 0;
-  // The reducer needs two FP32 values per partition, aligned for Metal.
-  const uint64_t gqa_reduce_bytes =
-      (static_cast<uint64_t>(gqa_partitions) * 8 + 15) & ~uint64_t(15);
   const bool gqa_decode =
       !gqa_disabled
       && pure_decode && window_seqlen_q <= 1 && gqa_single_request
@@ -810,8 +810,7 @@ static void dispatch_paged_attention_v2_online(
       && dtype_ok && query.dtype() == value_cache.dtype()
       && !use_turboquant && softcap <= 0.f && sinks == nullptr
       && sliding_window < 0 && gqa_page_size
-      && gqa_partition_size > 0
-      && gqa_reduce_bytes <= d.mtl_device()->maxThreadgroupMemoryLength();
+      && gqa_partition_size > 0;
   if (gqa_decode) {
     const int gqa_num_partitions = static_cast<int>(gqa_partitions);
     const int gqa_group = num_heads / num_kv_heads;
@@ -832,9 +831,17 @@ static void dispatch_paged_attention_v2_online(
     array g_max_logits =
         make_temp(Shape{total_q_tokens, num_heads, gqa_num_partitions}, float32);
 
-    // Binds mirror paged_attention_gqa_decode's signature exactly (the
-    // kernel declares only these slots; no shared-mem carve).
+    // Binds mirror paged_attention_gqa_decode's signature. P64/P128 stage a
+    // 16-token K+V tile (bs32 is two tiles). P256/P512 declare the buffer
+    // but STAGE_KV is compiled out; a non-zero length here still counts
+    // against occupancy, so those specializations pass 0.
     enc.set_compute_pipeline_state(gkernel);
+    size_t gqa_stage_bytes = 0;
+    if (gqa_partition_size <= 128) {
+      gqa_stage_bytes =
+          static_cast<size_t>(16) * head_size * 2 * query.itemsize();
+    }
+    enc.set_threadgroup_memory_length((gqa_stage_bytes + 15) & ~size_t(15), 0);
     enc.set_output_array(g_exp_sums, 0);
     enc.set_output_array(g_max_logits, 1);
     enc.set_output_array(g_tmp_out, 2);

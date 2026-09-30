@@ -1874,11 +1874,11 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   // Reduction workspace (main path only).
   threadgroup float red_smem[2 * NUM_WARPS];
 
-  // TQ deferred-FWHT staging: warp 0 applies a single inverse FWHT to the
-  // cross-partition weighted sum, which lives here in fp32 before the final
-  // fp16 cast to `out`.  Declared unconditionally; dead in non-TQ kernels.
-  // Size: HEAD_SIZE * 4 bytes = at most 2 KB at HEAD_SIZE=512.
-  threadgroup float combined[HEAD_SIZE];
+  // One fp32 row per warp. Warp 0 folds the 8 rows after a single barrier.
+  // hs512 = 16 KB; partition stats stay in device memory so P64 @ 256K
+  // is no longer gated on a 32 KB dynamic stats buffer.
+  threadgroup float warp_rows[NUM_WARPS * HEAD_SIZE];
+  (void)shared_mem;
 
   // ========================================================================
   // Early-out: only one partition actually contributed.  We still need to
@@ -1924,20 +1924,16 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
     return;
   }
 
-  // Load max logits to shared memory.
-  threadgroup float *shared_max_logits =
-      reinterpret_cast<threadgroup float *>(shared_mem);
+  // Global max from device; each warp later re-reads only its strided
+  // subset of (max, exp-sum) when forming merge weights.
   const device float *max_logits_ptr =
       max_logits + q_token_idx * num_heads * max_num_partitions +
       head_idx * max_num_partitions;
   float max_logit = -FLT_MAX;
   for (int i = thread_position_in_threadgroup.x; i < num_partitions;
        i += threads_per_threadgroup.x) {
-    const float l = max_logits_ptr[i];
-    shared_max_logits[i] = l;
-    max_logit = max(max_logit, l);
+    max_logit = max(max_logit, max_logits_ptr[i]);
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
 
   // Get the global max logit.
   // Reduce within the warp.
@@ -1964,21 +1960,15 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
     max_logit = max(max_logit, sinks[head_idx] * M_LOG2E_F);
   }
 
-  // Load rescaled exp sums to shared memory.
-  threadgroup float *shared_exp_sums = reinterpret_cast<threadgroup float *>(
-      shared_mem + sizeof(float) * num_partitions);
   const device float *exp_sums_ptr = exp_sums +
                                      q_token_idx * num_heads * max_num_partitions +
                                      head_idx * max_num_partitions;
   float global_exp_sum = 0.0f;
   for (int i = thread_position_in_threadgroup.x; i < num_partitions;
        i += threads_per_threadgroup.x) {
-    float l = shared_max_logits[i];
-    float rescaled_exp_sum = exp_sums_ptr[i] * exp2(l - max_logit);
-    global_exp_sum += rescaled_exp_sum;
-    shared_exp_sums[i] = rescaled_exp_sum;
+    global_exp_sum +=
+        exp_sums_ptr[i] * exp2(max_logits_ptr[i] - max_logit);
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
   global_exp_sum = block_sum<NUM_WARPS, NUM_SIMD_LANES>(
       &red_smem[NUM_WARPS], global_exp_sum, simd_tid, simd_lid);
 
@@ -1997,9 +1987,9 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   //
   // TQ path: per-partition tmp_out entries are in the ROTATED (un-FWHT'd)
   // domain (paged_attention skips the FWHT when PARTITION_SIZE>0).  We
-  // accumulate the fp32 weighted sum into shared `combined[HEAD_SIZE]`, then
-  // warp 0 applies the deferred inverse FWHT once on the merged vector and
-  // writes the final fp16 output.  This is exact by linearity of FWHT —
+  // accumulate the fp32 weighted sum into warp_rows, warp 0 folds the 8
+  // rows, then applies the deferred inverse FWHT once on the merged vector
+  // and writes the final fp16 output.  This is exact by linearity of FWHT —
   //   InverseFWHT(Σ_j w_j · V_rot_j) = Σ_j w_j · InverseFWHT(V_rot_j)
   // — and numerically strictly better than applying the FWHT per partition
   // because (a) cross-partition sums happen in fp32 with no intermediate
@@ -2014,50 +2004,80 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   device T *out_ptr =
       out + q_token_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
 
-  if (use_turboquant) {
-    // Stage weighted partial sums into `combined[]` in fp32.
-    for (int i = thread_position_in_threadgroup.x; i < HEAD_SIZE;
-         i += NUM_THREADS) {
-      float acc = 0.0f;
-      for (int j = 0; j < num_partitions; ++j) {
-        acc += float(tmp_out_ptr[j * HEAD_SIZE + i]) * shared_exp_sums[j] *
-               inv_global_exp_sum;
+  // Each of the 8 warps owns a strided subset of partitions; each lane owns
+  // HEAD_SIZE/32 (ceil) head-dim elements. Partial sums land in registers,
+  // then each warp writes its row and warp 0 folds with one barrier.
+  constexpr int ELEMS_PER_LANE =
+      (HEAD_SIZE + NUM_SIMD_LANES - 1) / NUM_SIMD_LANES;
+  float part_acc[ELEMS_PER_LANE];
+#pragma unroll
+  for (int e = 0; e < ELEMS_PER_LANE; e++) {
+    part_acc[e] = 0.f;
+  }
+  for (int j = warp_idx; j < num_partitions; j += NUM_WARPS) {
+    const float w = exp_sums_ptr[j] *
+                    exp2(max_logits_ptr[j] - max_logit) * inv_global_exp_sum;
+    const device T *part = tmp_out_ptr + j * HEAD_SIZE;
+#pragma unroll
+    for (int e = 0; e < ELEMS_PER_LANE; e++) {
+      const int d = lane + e * NUM_SIMD_LANES;
+      if (d < HEAD_SIZE) {
+        part_acc[e] += float(part[d]) * w;
       }
-      combined[i] = acc;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+#pragma unroll
+  for (int e = 0; e < ELEMS_PER_LANE; e++) {
+    const int d = lane + e * NUM_SIMD_LANES;
+    if (d < HEAD_SIZE) {
+      warp_rows[warp_idx * HEAD_SIZE + d] = part_acc[e];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Warp 0 applies the single inverse FWHT and writes out.
-    if (warp_idx == 0) {
-      constexpr int ELEMS_PER_LANE = HEAD_SIZE / 32;
-      float v_accs[ELEMS_PER_LANE];
-      #pragma unroll
+  if (warp_idx == 0) {
+#pragma unroll
+    for (int w = 1; w < NUM_WARPS; w++) {
+#pragma unroll
       for (int e = 0; e < ELEMS_PER_LANE; e++) {
-        const int d = lane + e * 32;
-        v_accs[e] = (d < HEAD_SIZE) ? combined[d] : 0.0f;
-      }
-      inverse_fwht_in_place<HEAD_SIZE, ELEMS_PER_LANE>(v_accs, lane);
-      #pragma unroll
-      for (int e = 0; e < ELEMS_PER_LANE; e++) {
-        const int d = lane + e * 32;
+        const int d = lane + e * NUM_SIMD_LANES;
         if (d < HEAD_SIZE) {
-          out_ptr[d] = T(v_accs[e]);
+          part_acc[e] += warp_rows[w * HEAD_SIZE + d];
         }
       }
     }
-  } else {
-    // Non-TQ: direct weighted sum + write.
+    if (use_turboquant) {
+      if constexpr (HEAD_SIZE % 32 == 0) {
+        inverse_fwht_in_place<HEAD_SIZE, ELEMS_PER_LANE>(part_acc, lane);
 #pragma unroll
-    for (int i = thread_position_in_threadgroup.x; i < HEAD_SIZE;
-         i += NUM_THREADS) {
-      float acc = 0.0f;
-      for (int j = 0; j < num_partitions; ++j) {
-        acc += float(tmp_out_ptr[j * HEAD_SIZE + i]) * shared_exp_sums[j] *
-               inv_global_exp_sum;
+        for (int e = 0; e < ELEMS_PER_LANE; e++) {
+          const int d = lane + e * 32;
+          if (d < HEAD_SIZE) {
+            out_ptr[d] = T(part_acc[e]);
+          }
+        }
       }
-      out_ptr[i] = T(acc);
+    } else {
+#pragma unroll
+      for (int e = 0; e < ELEMS_PER_LANE; e++) {
+        const int d = lane + e * NUM_SIMD_LANES;
+        if (d < HEAD_SIZE) {
+          out_ptr[d] = T(part_acc[e]);
+        }
+      }
     }
   }
+}
+
+// Broadcast one block-table entry: every lane of the simdgroup must execute
+// the shuffle. Lane 0 issues the device load; the rest receive the copy.
+inline uint32_t gqa_broadcast_page_id(device const uint32_t *bt, int page,
+                                      uint lane) {
+  uint32_t page_id = 0;
+  if (lane == 0) {
+    page_id = bt[page];
+  }
+  return simd_shuffle(page_id, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -2065,11 +2085,22 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
 //
 // One threadgroup per (PARTITION_SIZE-token partition, kv head, sequence);
 // each simdgroup owns one query head of the GQA group. Co-locating these
-// heads can improve KV cache locality, but each simdgroup still issues its
-// own K/V loads (there is no explicit cross-simdgroup broadcast). The online
-// softmax stays in registers, with no score staging or barriers. The serial
-// token loop trades intra-head parallelism for this locality, so dispatch
-// must account for the shape and device rather than context length alone.
+// heads improves KV cache locality.
+//
+// The producer walks pages, not tokens: PARTITION_SIZE is a multiple of
+// BLOCK_SIZE so the partition start is page-aligned. Lane 0 preloads the
+// next page_id and simd_shuffle broadcasts it; each simdgroup reloads the
+// same entry rather than staging the table in threadgroup memory. Full
+// pages run a 4-token inner step so independent QK dots overlap K/V
+// latency; a 1-3 token tail covers the last partial page.
+//
+// P64/P128 stage 16-token K/V tiles into threadgroup memory (bs32 is two
+// tiles). Simdgroups round-robin the tile rows so G=6 still covers 16
+// tokens; every query head then reads the staged rows. Each tile pairs a
+// fill barrier with a consume barrier. P256/P512 keep the device 4-way
+// path; dispatch reserves staging memory only for P64/P128.
+// Dispatch still accounts for the shape and device rather than context
+// length alone.
 //
 // Partials are written in the exact contract paged_attention_v2_reduce
 // consumes: log2-space running (max, exp-sum) stats plus the
@@ -2090,13 +2121,18 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
     const constant int &q_stride [[buffer(15)]],
     const constant int &kv_block_stride [[buffer(16)]],
     const constant int &kv_head_stride [[buffer(17)]],
+    threadgroup T *shared_kv [[threadgroup(0)]],
     uint3 tg_pos [[threadgroup_position_in_grid]],
     uint3 tg_per_grid [[threadgroups_per_grid]],
     uint3 tptg [[threads_per_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
   static_assert(HEAD_SIZE % 32 == 0, "one lane-strided slice per lane");
+  static_assert(PARTITION_SIZE % BLOCK_SIZE == 0,
+                "partition start is page-aligned");
   constexpr int SLICE = HEAD_SIZE / 32;  // elements per lane
+  constexpr int STAGE_TOKENS = 16;
+  constexpr bool STAGE_KV = PARTITION_SIZE <= 128;
   const int partition_idx = tg_pos.x;
   const int kv_head_idx = tg_pos.y;
   const int seq_idx = tg_pos.z;
@@ -2135,30 +2171,183 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
   float l = 0.f;
   float acc[SLICE] = {0.f};
   const float log2e_scale = scale * M_LOG2E_F;
-  for (int t = t0; t < t_end; t++) {
-    const int64_t row = static_cast<int64_t>(bt[t / BLOCK_SIZE]) *
-            kv_block_stride +
-        (t % BLOCK_SIZE) * kv_token_stride + kv_head_idx * kv_head_stride +
-        lane * SLICE;
-    device const T *krow = k_cache + row;
-    float dot = 0.f;
-#pragma unroll
-    for (int i = 0; i < SLICE; i++) {
-      dot += qv[i] * float(krow[i]);
+  const int page0 = t0 / BLOCK_SIZE;
+  const int page_end = (t_end + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  uint32_t page_id = gqa_broadcast_page_id(bt, page0, lane);
+  uint32_t next_page_id = page_id;
+  if (page0 + 1 < page_end) {
+    next_page_id = gqa_broadcast_page_id(bt, page0 + 1, lane);
+  }
+  for (int page = page0; page < page_end; page++) {
+    const uint32_t cur_page = page_id;
+    page_id = next_page_id;
+    if (page + 2 < page_end) {
+      next_page_id = gqa_broadcast_page_id(bt, page + 2, lane);
     }
-    const float s = simd_sum(dot) * log2e_scale;
-    const float m_new = max(m, s);
-    // exp2(-FLT_MAX - s) == 0 under -fno-fast-math, so the first-iteration
-    // rescale needs no guard (same identity the masked-score path uses).
-    const float alpha = exp2(m - m_new);
-    const float p = exp2(s - m_new);
-    l = l * alpha + p;
-    device const T *vrow = v_cache + row;
+    const int tok0 = page * BLOCK_SIZE;
+    const int tok1 = min(tok0 + BLOCK_SIZE, t_end);
+    const int64_t page_kv = static_cast<int64_t>(cur_page) * kv_block_stride +
+                            kv_head_idx * kv_head_stride;
+    if constexpr (STAGE_KV) {
+      threadgroup T *K_smem = shared_kv;
+      threadgroup T *V_smem = shared_kv + STAGE_TOKENS * HEAD_SIZE;
+      for (int tile = 0; tile < BLOCK_SIZE; tile += STAGE_TOKENS) {
+        const int tile0 = tok0 + tile;
+        if (tile0 >= tok1) {
+          break;
+        }
+        const int n_tok = min(tile0 + STAGE_TOKENS, tok1) - tile0;
+        for (int t_local = static_cast<int>(sg); t_local < n_tok;
+             t_local += group) {
+          const int64_t row = page_kv +
+                              static_cast<int64_t>(tile + t_local) *
+                                  kv_token_stride +
+                              static_cast<int64_t>(lane) * SLICE;
+          threadgroup T *kdst = K_smem + t_local * HEAD_SIZE + lane * SLICE;
+          threadgroup T *vdst = V_smem + t_local * HEAD_SIZE + lane * SLICE;
+          device const T *ksrc = k_cache + row;
+          device const T *vsrc = v_cache + row;
 #pragma unroll
-    for (int i = 0; i < SLICE; i++) {
-      acc[i] = acc[i] * alpha + p * float(vrow[i]);
+          for (int i = 0; i < SLICE; i++) {
+            kdst[i] = ksrc[i];
+            vdst[i] = vsrc[i];
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        int t = 0;
+        for (; t + 4 <= n_tok; t += 4) {
+          threadgroup const T *k0 =
+              K_smem + t * HEAD_SIZE + lane * SLICE;
+          threadgroup const T *k1 = k0 + HEAD_SIZE;
+          threadgroup const T *k2 = k1 + HEAD_SIZE;
+          threadgroup const T *k3 = k2 + HEAD_SIZE;
+          float d0 = 0.f;
+          float d1 = 0.f;
+          float d2 = 0.f;
+          float d3 = 0.f;
+#pragma unroll
+          for (int i = 0; i < SLICE; i++) {
+            d0 += qv[i] * float(k0[i]);
+            d1 += qv[i] * float(k1[i]);
+            d2 += qv[i] * float(k2[i]);
+            d3 += qv[i] * float(k3[i]);
+          }
+          const float s0 = simd_sum(d0) * log2e_scale;
+          const float s1 = simd_sum(d1) * log2e_scale;
+          const float s2 = simd_sum(d2) * log2e_scale;
+          const float s3 = simd_sum(d3) * log2e_scale;
+          const float m_new = max(m, max(max(s0, s1), max(s2, s3)));
+          const float alpha = exp2(m - m_new);
+          const float p0 = exp2(s0 - m_new);
+          const float p1 = exp2(s1 - m_new);
+          const float p2 = exp2(s2 - m_new);
+          const float p3 = exp2(s3 - m_new);
+          l = l * alpha + p0 + p1 + p2 + p3;
+          threadgroup const T *v0 =
+              V_smem + t * HEAD_SIZE + lane * SLICE;
+          threadgroup const T *v1 = v0 + HEAD_SIZE;
+          threadgroup const T *v2 = v1 + HEAD_SIZE;
+          threadgroup const T *v3 = v2 + HEAD_SIZE;
+#pragma unroll
+          for (int i = 0; i < SLICE; i++) {
+            acc[i] = acc[i] * alpha + p0 * float(v0[i]) + p1 * float(v1[i]) +
+                     p2 * float(v2[i]) + p3 * float(v3[i]);
+          }
+          m = m_new;
+        }
+        for (; t < n_tok; t++) {
+          threadgroup const T *krow =
+              K_smem + t * HEAD_SIZE + lane * SLICE;
+          threadgroup const T *vrow =
+              V_smem + t * HEAD_SIZE + lane * SLICE;
+          float dot = 0.f;
+#pragma unroll
+          for (int i = 0; i < SLICE; i++) {
+            dot += qv[i] * float(krow[i]);
+          }
+          const float s = simd_sum(dot) * log2e_scale;
+          const float m_new = max(m, s);
+          const float alpha = exp2(m - m_new);
+          const float p = exp2(s - m_new);
+          l = l * alpha + p;
+#pragma unroll
+          for (int i = 0; i < SLICE; i++) {
+            acc[i] = acc[i] * alpha + p * float(vrow[i]);
+          }
+          m = m_new;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+    } else {
+      const int64_t page_base =
+          page_kv + static_cast<int64_t>(lane) * SLICE;
+      int t = tok0;
+      for (; t + 4 <= tok1; t += 4) {
+        const int64_t r0 = page_base + (t - tok0) * kv_token_stride;
+        const int64_t r1 = r0 + kv_token_stride;
+        const int64_t r2 = r1 + kv_token_stride;
+        const int64_t r3 = r2 + kv_token_stride;
+        device const T *k0 = k_cache + r0;
+        device const T *k1 = k_cache + r1;
+        device const T *k2 = k_cache + r2;
+        device const T *k3 = k_cache + r3;
+        float d0 = 0.f;
+        float d1 = 0.f;
+        float d2 = 0.f;
+        float d3 = 0.f;
+#pragma unroll
+        for (int i = 0; i < SLICE; i++) {
+          d0 += qv[i] * float(k0[i]);
+          d1 += qv[i] * float(k1[i]);
+          d2 += qv[i] * float(k2[i]);
+          d3 += qv[i] * float(k3[i]);
+        }
+        const float s0 = simd_sum(d0) * log2e_scale;
+        const float s1 = simd_sum(d1) * log2e_scale;
+        const float s2 = simd_sum(d2) * log2e_scale;
+        const float s3 = simd_sum(d3) * log2e_scale;
+        // Joint max is the same online-softmax identity as four serial
+        // updates. exp2(-FLT_MAX - s) == 0 under -fno-fast-math, so the
+        // first-iteration rescale needs no guard.
+        const float m_new = max(m, max(max(s0, s1), max(s2, s3)));
+        const float alpha = exp2(m - m_new);
+        const float p0 = exp2(s0 - m_new);
+        const float p1 = exp2(s1 - m_new);
+        const float p2 = exp2(s2 - m_new);
+        const float p3 = exp2(s3 - m_new);
+        l = l * alpha + p0 + p1 + p2 + p3;
+        device const T *v0 = v_cache + r0;
+        device const T *v1 = v_cache + r1;
+        device const T *v2 = v_cache + r2;
+        device const T *v3 = v_cache + r3;
+#pragma unroll
+        for (int i = 0; i < SLICE; i++) {
+          acc[i] = acc[i] * alpha + p0 * float(v0[i]) + p1 * float(v1[i]) +
+                   p2 * float(v2[i]) + p3 * float(v3[i]);
+        }
+        m = m_new;
+      }
+      for (; t < tok1; t++) {
+        const int64_t row = page_base + (t - tok0) * kv_token_stride;
+        device const T *krow = k_cache + row;
+        float dot = 0.f;
+#pragma unroll
+        for (int i = 0; i < SLICE; i++) {
+          dot += qv[i] * float(krow[i]);
+        }
+        const float s = simd_sum(dot) * log2e_scale;
+        const float m_new = max(m, s);
+        const float alpha = exp2(m - m_new);
+        const float p = exp2(s - m_new);
+        l = l * alpha + p;
+        device const T *vrow = v_cache + row;
+#pragma unroll
+        for (int i = 0; i < SLICE; i++) {
+          acc[i] = acc[i] * alpha + p * float(vrow[i]);
+        }
+        m = m_new;
+      }
     }
-    m = m_new;
   }
 
   const int64_t pidx =
@@ -2398,6 +2587,7 @@ instantiate_paged_attention_v2(half, char, uchar, 32);
       const constant int &q_stride [[buffer(15)]],                           \
       const constant int &kv_block_stride [[buffer(16)]],                    \
       const constant int &kv_head_stride [[buffer(17)]],                     \
+      threadgroup type *shared_kv [[threadgroup(0)]],                        \
       uint3 tg_pos [[threadgroup_position_in_grid]],                         \
       uint3 tg_per_grid [[threadgroups_per_grid]],                           \
       uint3 tptg [[threads_per_threadgroup]],                                \

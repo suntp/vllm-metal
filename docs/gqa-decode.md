@@ -60,12 +60,28 @@ scheduler page selects block32, while a 784- or 528-token page selects
 block16. Translated page IDs address their kernel-sized subpages even when
 upstream K/V storage remains unreshaped.
 
+The GQA producer walks pages rather than tokens. Lane 0 preloads the next
+block-table entry and `simd_shuffle` broadcasts it; a 4-token inner step
+overlaps independent QK dots with K/V latency. P64 and P128 additionally
+stage 16-token K/V tiles into threadgroup memory (a 32-token kernel page is
+two tiles). Simdgroups round-robin the tile rows so a group of 6 still
+covers 16 tokens; each tile pairs a fill barrier with a consume barrier.
+P256 and P512 keep the device 4-way path, and dispatch reserves staging
+memory only for P64/P128. Online softmax stays in registers.
+
+The producer writes the same log2-space `(max, exp-sum)` plus
+epsilon-normalized `tmp_out` contract as split-KV. The shared
+`paged_attention_v2_reduce` therefore merges GQA partials. That reduce
+walks partitions warp-strided, keeps stats in device memory, and folds
+eight `HEAD_SIZE` rows with one barrier. Changes to the reduce affect the
+established split-KV path as well as GQA.
+
 Every eligible call additionally requires:
 
 - One pure-decode request, with `num_decode_requests` equal to 1 or omitted.
 - A verification window of at most 1.
 - Matching FP16/BF16 query, key-cache and value-cache types.
-- A kernel page size allowed above and sufficient reducer shared memory.
+- A kernel page size allowed above.
 - No TurboQuant, attention sinks, logit soft-capping or sliding window.
 - A known, positive GPU core count.
 
@@ -107,6 +123,9 @@ make missing writes observable even in a long context.
 The 1056-token upstream-page case also exercises the real block-table
 translation and unreshaped K/V storage: the block32 kernel addresses each
 translated page with its 32-token stride.
+Staged-path tests cover a 32-token kernel page (two 16-token tiles),
+partial last pages with `n_tok` in `{1,5,6,7,13,15}`, and the group-6
+round-robin used by 24/4/256.
 `tests/test_attention_sdpa.py` checks that the environment switch and scheduler
 decode count reach the primitive.
 
@@ -169,8 +188,8 @@ enablement or performance claims in #715:
    and multiple query rows. The existing verification kernel already shares
    KV across rows; compare against it while preserving causal masks and
    controlling register pressure. A larger gain is possible, not established.
-6. **Kernel pipeline and explicit KV sharing:** independently test processing
-   two to four tokens per loop and cooperative threadgroup-memory staging.
-   Compare latency savings against barriers, extra registers/shared memory
-   and occupancy changes; repeat numerical and serving validation before
-   adopting either algorithmic change.
+6. **Cross-device staging:** P64/P128 threadgroup K/V staging is in the
+   producer. On an M5 Pro its isolated effect is small because L2 already
+   coalesces the repeated loads; a smaller-L2 device may show more. Keep
+   the occupancy rule that dispatch reserves staging memory only for
+   P64/P128, and re-measure before treating staging as a cross-device win.

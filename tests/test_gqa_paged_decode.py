@@ -390,6 +390,38 @@ def test_gqa_kernel_numerics_without_core_detection(
     _assert_close(out, ref, dtype)
 
 
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("part", [64, 128])
+@pytest.mark.parametrize("n_tok", [1, 5, 6, 7, 13, 15])
+@pytest.mark.parametrize(
+    "q,kv,head,block",
+    [
+        (24, 4, 256, 16),  # G=6 staged round-robin over 16 rows.
+        (16, 2, 256, 32),  # Two 16-token tiles reuse the same smem buffer.
+        (16, 2, 128, 16),
+    ],
+)
+def test_gqa_staged_partial_page_tails(dtype, part, n_tok, q, kv, head, block):
+    """Staged P64/P128 remainder tiles, including n_tok % 4 != 0."""
+    # One full partition plus a last page of n_tok tokens. For block32 the
+    # last partition also contains a complete 32-token page (two tiles).
+    extra = block if block > 16 else 0
+    out, ref = _run_primitive(
+        [part + extra + n_tok],
+        dtype,
+        interleaved=True,
+        seed=64 + n_tok,
+        num_query_heads=q,
+        num_kv_heads=kv,
+        head_size=head,
+        block_size=block,
+        test_partition=part,
+    )
+    assert _dispatch_family() == "gqa_decode"
+    assert get_ops().last_gqa_partition_size() == part
+    _assert_close(out, ref, dtype)
+
+
 @pytest.mark.parametrize("part", [0, 32, 1024])
 def test_private_gqa_entry_rejects_unshipped_partitions(part):
     with pytest.raises(ValueError, match="GQA test partition"):
