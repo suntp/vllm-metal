@@ -56,6 +56,21 @@ def _assert_close(out: mx.array, ref: mx.array, dtype: mx.Dtype) -> None:
     )
 
 
+def _restore_test_gpu_cores() -> None:
+    ops = get_ops()
+    ops._override_detected_gpu_core_count_for_test(-1)
+    if ops.detected_gpu_core_count() <= 0:
+        ops._override_detected_gpu_core_count_for_test(10)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _inject_test_gpu_cores():
+    """CI runners often omit IORegistry gpu-core-count; keep routing tests on."""
+    _restore_test_gpu_cores()
+    yield
+    get_ops()._override_detected_gpu_core_count_for_test(-1)
+
+
 def _require_grid(kv_len: int, query_heads: int) -> None:
     """Positive route tests need the measured grid guard on this GPU."""
     cores = get_ops().detected_gpu_core_count()
@@ -465,18 +480,62 @@ def test_private_gqa_partition_is_local_to_lazy_primitive():
     assert ops.gqa_decode_partition_size(32, 8, 128, 32768, 0) == 0
 
 
-def test_unknown_core_count_keeps_measured_shape_on_baseline() -> None:
-    if get_ops().detected_gpu_core_count() > 0:
-        pytest.skip("This platform exposes GPU core count")
+def test_core_count_override_restores_hardware_detection() -> None:
+    ops = get_ops()
+    ops._override_detected_gpu_core_count_for_test(7)
+    try:
+        assert ops.detected_gpu_core_count() == 7
+    finally:
+        _restore_test_gpu_cores()
+    assert ops.detected_gpu_core_count() > 0
+
+
+def test_core_count_override_changes_default_routing() -> None:
+    """Production dispatch reads the override through detected_gpu_core_count()."""
+    ops = get_ops()
+    # Q=32, KV=2000: 31 full P64 partitions. Eligible iff 31*32 >= 33*cores,
+    # i.e. cores <= 31. Forty cores raise the P64 gate to 2688.
+    ops._override_detected_gpu_core_count_for_test(40)
+    try:
+        assert ops.detected_gpu_core_count() == 40
+        out, ref = _run_primitive(
+            [2000],
+            mx.bfloat16,
+            interleaved=False,
+            seed=41,
+            num_decode_requests=1,
+        )
+        _assert_fallback()
+        _assert_close(out, ref, mx.bfloat16)
+    finally:
+        _restore_test_gpu_cores()
     out, ref = _run_primitive(
-        [32768],
+        [2000],
         mx.bfloat16,
         interleaved=False,
-        seed=37,
+        seed=41,
         num_decode_requests=1,
     )
-    _assert_fallback()
+    assert _dispatch_family() == "gqa_decode"
     _assert_close(out, ref, mx.bfloat16)
+
+
+def test_unknown_core_count_keeps_measured_shape_on_baseline() -> None:
+    ops = get_ops()
+    ops._override_detected_gpu_core_count_for_test(0)
+    try:
+        assert ops.detected_gpu_core_count() == 0
+        out, ref = _run_primitive(
+            [32768],
+            mx.bfloat16,
+            interleaved=False,
+            seed=37,
+            num_decode_requests=1,
+        )
+        _assert_fallback()
+        _assert_close(out, ref, mx.bfloat16)
+    finally:
+        _restore_test_gpu_cores()
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
@@ -733,7 +792,9 @@ def test_each_geometry_lower_boundary_dispatch(q, kv, head, block_size, offset):
 )
 @pytest.mark.parametrize("n", [131071, 131072, 131073, 196608, 262144, 262145])
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-def test_each_geometry_continues_gqa_beyond_128k(q, kv, head, block_size, n, dtype):
+def test_each_geometry_stays_on_gqa_at_long_context(
+    q, kv, head, block_size, n, dtype
+):
     _require_grid(n, q)
     out, ref = _run_primitive(
         [n],
@@ -753,14 +814,14 @@ def test_each_geometry_continues_gqa_beyond_128k(q, kv, head, block_size, n, dty
     "q,kv,head,n",
     [
         (16, 4, 256, 16384),
-        (16, 4, 256, 32768),  # Paired model-generation validation is unresolved.
+        (16, 4, 256, 32768),  # 16/4/256 is outside default routing.
         (16, 4, 256, 65536),
         (16, 4, 256, 131073),
-        (32, 4, 64, 32768),  # Both narrow-head regressions stay excluded.
+        (32, 4, 64, 32768),  # Head dim 64 is not a shipped GQA specialization.
         (64, 8, 64, 32768),
-        (32, 4, 64, 65536),  # Same old byte proxy/grid as the preceding row.
+        (32, 4, 64, 65536),
         (16, 2, 96, 65536),
-        (32, 4, 256, 65536),  # Unmeasured default geometry.
+        (32, 4, 256, 65536),  # Unmeasured 32/4/256 stays on the established path.
         (16, 8, 128, 65536),
         (16, 16, 128, 65536),  # MHA.
     ],

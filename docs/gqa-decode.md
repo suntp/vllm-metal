@@ -87,9 +87,8 @@ Every eligible call additionally requires:
 
 Other calls, including multi-request batches and unknown core counts, use the
 established attention family. Model context limits, cache capacity and
-primitive resource limits still apply; there is no extra 128K ceiling.
-The 16/4/256 geometry remains excluded because its previous full-model
-numerical validation did not support expanding the default scope.
+primitive resource limits still apply. The 16/4/256 geometry remains
+excluded from default routing.
 
 ## Disable switch
 
@@ -114,8 +113,8 @@ the executed 64/128/256/512 specialization through
 and disabled cases must report the appropriate established family, including
 upstream mixed prefill/decode.
 References include independent grouped CPU FP32 attention and native MLX SDPA.
-All four geometries and both cache dtypes are checked across the former
-128K boundary, at 192K, and at 256K including a partial final partition.
+All four geometries and both cache dtypes are checked at 128K, 192K,
+and 256K, including a partial final partition.
 Shared-storage tests use upstream-allocated
 K/V views, non-contiguous page tables, native writes, prefix-page copying,
 source-page clearing and a subsequent decode write. Dominant attention rows
@@ -129,9 +128,11 @@ round-robin used by 24/4/256.
 `tests/test_attention_sdpa.py` checks that the environment switch and scheduler
 decode count reach the primitive.
 
-Default-policy positive route tests need a reported GPU core count and
-sufficient partition grid. They skip on hosts that cannot enable GQA;
-the unknown-core fallback test still verifies the production policy there.
+Default-policy positive route tests need a GPU core count and a sufficient
+partition grid. Hosts whose IORegistry does not report cores inject a
+test-only count through `_override_detected_gpu_core_count_for_test` so
+the default selector still runs; the unknown-core fallback test forces
+that count to zero. Production serving never calls the override.
 Kernel correctness is tested separately through the private
 `_gqa_paged_attention_for_test` entry, which selects an explicit partition
 without changing global state or the public primitive's routing API.

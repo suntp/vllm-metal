@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 
@@ -93,7 +94,12 @@ constexpr int kWindowMaxHeadSize = VLLM_METAL_PA_WINDOW_MAX_HEAD;
 // split-KV gate needs to scale per machine — a small laptop GPU and a large
 // desktop one saturate at very different grid sizes. Read once; zero means
 // unknown so the new GQA performance gate can fail closed.
-static int detected_gpu_core_count() {
+// Tests may inject a non-negative count through
+// `_override_detected_gpu_core_count_for_test` so CI hosts without
+// IORegistry still exercise default routing. Production must not call it.
+static std::atomic<int> g_test_gpu_core_count{-1};
+
+static int hardware_gpu_core_count() {
   static const int v = []() {
     int cores = 0;
     io_iterator_t it;
@@ -120,6 +126,22 @@ static int detected_gpu_core_count() {
   return v;
 }
 
+static int detected_gpu_core_count() {
+  const int override =
+      g_test_gpu_core_count.load(std::memory_order_relaxed);
+  if (override >= 0)
+    return override;
+  return hardware_gpu_core_count();
+}
+
+static void override_detected_gpu_core_count_for_test(int cores) {
+  if (cores < -1)
+    throw std::invalid_argument(
+        "test GPU core override must be >= -1 (got " +
+        std::to_string(cores) + ")");
+  g_test_gpu_core_count.store(cores, std::memory_order_relaxed);
+}
+
 // Preserve the established split-KV fallback when detection is unavailable.
 static int gpu_core_count() {
   const int cores = detected_gpu_core_count();
@@ -136,6 +158,11 @@ static bool gqa_decode_geometry_supported(int num_heads, int num_kv_heads,
 }
 
 // Shared by production selection, private test dispatch and library checks.
+// The four-tier list is compiled against the established 512-token split-KV
+// default; a different VLLM_METAL_PARTITION_SIZE must not silently disable
+// GQA or request uninstantiated specializations.
+static_assert(kPartitionSize == 512,
+              "GQA partition list assumes the established 512-token split");
 constexpr std::array<int, 4> kGqaPartitionSizes = {512, 256, 128, 64};
 struct GqaKernelLayout {
   int head_size;
@@ -2033,6 +2060,10 @@ NB_MODULE(_paged_ops, m) {
   m.attr("PARTITION_SIZE") = nb::int_(kPartitionSize);
   m.def("detected_gpu_core_count", &detected_gpu_core_count,
         "Detected GPU core count, or zero when detection is unavailable.");
+  m.def("_override_detected_gpu_core_count_for_test",
+        &override_detected_gpu_core_count_for_test, nb::arg("cores"),
+        "Test-only. A non-negative count replaces IORegistry detection; "
+        "-1 restores hardware detection. Production routing must not call this.");
   m.def("gqa_decode_partition_size", &gqa_decode_partition_size,
         nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
         nb::arg("max_seq_len"), nb::arg("gpu_cores"),
