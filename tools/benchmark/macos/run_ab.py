@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Server-protocol A/B benchmark for macOS (#713 discipline, automated).
 
-Boots ``vllm serve`` arms that differ only in one gate environment
-variable, alternates their order across repeats, gates every measurement
-block on a quiet GPU window, and writes a machine-readable evidence pack.
-Absolute numbers therefore come from the server topology only; the
-actual dispatch family is read back from the worker when available.
+Boots one ``vllm serve`` process per arm, alternates arm order across
+repeats, gates every measurement block on a quiet GPU window, warms each
+(arm, length) by real decode seconds, and writes a machine-readable
+evidence pack.  Absolute numbers therefore come from the server topology
+only; the actual dispatch family is read back from the worker when
+available.  Arms default to an on/off pair over one gate environment
+variable; ``--arm`` generalizes this to named arms with full environment
+control (including ``PYTHONPATH`` to compare source trees).
 
 Example::
 
@@ -88,6 +91,59 @@ def parse_key_values(raw: list[str]) -> dict[str, str]:
     return parsed
 
 
+def parse_arms(raw: list[str]) -> list[tuple[str, dict[str, str]]]:
+    """Parse repeatable ``NAME[:KEY=VAL[,KEY=VAL...]]`` arm specs.
+
+    The first arm is the baseline every other arm is compared against.
+    An arm with no ``KEY=VAL`` part differs from the others only in what
+    its own environment sets.  Arms that override ``PYTHONPATH`` (to run
+    a different source tree) should keep the harness checkout on it so
+    the worker probe stays importable inside the server process.
+    """
+    arms: list[tuple[str, dict[str, str]]] = []
+    seen: set[str] = set()
+    for item in raw:
+        name, _, env_raw = item.partition(":")
+        name = name.strip()
+        if not name or name in seen:
+            raise ValueError(f"--arm needs unique non-empty names, got {item!r}")
+        entries = [entry for entry in env_raw.split(",") if entry.strip()]
+        arms.append((name, parse_key_values(entries)))
+        seen.add(name)
+    return arms
+
+
+def arm_order(names: list[str], rep: int) -> list[str]:
+    """Arm order for one repeat: rotate by *rep* so no arm always runs
+    first.  A fixed arm order reads as a systematic gain for whichever
+    arm happens to be second (#713)."""
+    count = len(names)
+    return [names[(rep + index) % count] for index in range(count)]
+
+
+def run_fingerprint(arms: list[tuple[str, dict[str, str]]], args) -> str:
+    """Identity of a benchmark configuration, for ``--resume``.
+
+    Covers everything that changes the numbers (model, lengths, arms,
+    timing parameters); excludes the output location and the port.
+    """
+    payload = {
+        "model": str(args.model.resolve()),
+        "lengths": sorted(args.lengths),
+        "tokens": args.tokens,
+        "runs": args.runs,
+        "reps": args.reps,
+        "seed": args.seed,
+        "warmup_decode_seconds": args.warmup_decode_seconds,
+        "arms": arms,
+        "extra_env": args.extra_env,
+        "expect_family": args.expect_family,
+        "server_arg": sorted(args.server_arg),
+    }
+    canonical = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
 def validate_args(args: argparse.Namespace, config: dict) -> int:
     """Shared validation; returns the derived max-model-len."""
     if not (args.model / "config.json").is_file():
@@ -150,9 +206,17 @@ def measure_lengths(
     arm: str,
     handle,
     prompts: dict[int, list[int]],
-) -> dict[int, list[dict]]:
-    """All lengths for one already-booted arm; returns run records."""
+) -> tuple[dict[int, list[dict]], dict[int, float]]:
+    """All lengths for one already-booted arm.
+
+    Returns ``(run records, warmup decode seconds per length)``.  Each
+    length is warmed by at least ``--warmup-decode-seconds`` of real
+    decode (page cache, clocks and shader caches settle) before the
+    measured runs; short spot warmups read as a regression that is not
+    (#713).
+    """
     records: dict[int, list[dict]] = {}
+    warmup: dict[int, float] = {}
     for length in sorted(args.lengths):
         prompt_ids = prompts[length]
         # Cold prefill primes the prefix cache; its decode is discarded.
@@ -163,13 +227,21 @@ def measure_lengths(
             max_tokens=8,
             seed=args.seed,
         )
-        # One discarded warmup: page-cache and clock state settle here.
-        completions.stream_completion(
-            handle.base_url,
-            args.served_model_name,
-            prompt_ids,
-            max_tokens=args.tokens,
-            seed=args.seed,
+        # Discarded warmup decode until the configured seconds accumulate.
+        warm_seconds = 0.0
+        while warm_seconds < args.warmup_decode_seconds:
+            warm = completions.stream_completion(
+                handle.base_url,
+                args.served_model_name,
+                prompt_ids,
+                max_tokens=args.tokens,
+                seed=args.seed,
+            )
+            warm_seconds += warm.decode_s
+        warmup[length] = warm_seconds
+        print(
+            f"  length {length}: warm decode {warm_seconds:.1f}s, measuring",
+            flush=True,
         )
         runs: list[dict] = []
         for index in range(args.runs):
@@ -210,7 +282,7 @@ def measure_lengths(
                 flush=True,
             )
         records[length] = runs
-    return records
+    return records, warmup
 
 
 def run(args: argparse.Namespace) -> dict:
@@ -265,14 +337,46 @@ def run(args: argparse.Namespace) -> dict:
     }
     evidence.write_json(output / "results.json", result)
 
-    arms: dict[str, dict[int, list[dict]]] = {"on": {}, "off": {}}
-    arm_orders = []
-    for rep in range(args.reps):
-        arm_orders.append(["on", "off"] if rep % 2 == 0 else ["off", "on"])
+    arm_plan = (
+        parse_arms(args.arm)
+        if args.arm
+        else [
+            ("on", {args.gate_env: args.gate_on_value}),
+            ("off", {args.gate_env: args.gate_off_value}),
+        ]
+    )
+    arm_env = dict(arm_plan)
+    arm_names = [name for name, _ in arm_plan]
+    result["arms_plan"] = [{"name": name, "env": env} for name, env in arm_plan]
+    result["fingerprint"] = run_fingerprint(arm_plan, args)
+
+    arms: dict[str, dict[int, list[dict]]] = {name: {} for name in arm_names}
+    arm_orders = [arm_order(arm_names, rep) for rep in range(args.reps)]
     result["arm_orders"] = arm_orders
+
+    # --resume picks up a crashed or interrupted run at exactly the same
+    # configuration; a different fingerprint refuses rather than mixing.
+    units_done: set[str] = set()
+    if args.resume and (output / "results.json").exists():
+        saved = json.loads((output / "results.json").read_text())
+        if saved.get("fingerprint") != result["fingerprint"]:
+            raise SystemExit(
+                "existing results.json was produced with a different "
+                "configuration; choose a new --output"
+            )
+        for name, per_length in saved.get("arms", {}).items():
+            arms[name] = {
+                int(length): list(runs) for length, runs in per_length.items()
+            }
+        units_done = set(saved.get("units_done", []))
+        print(f"resuming: {len(units_done)} unit(s) already complete", flush=True)
+
     for rep, order in enumerate(arm_orders):
         for arm in order:
-            gate_value = args.gate_on_value if arm == "on" else args.gate_off_value
+            unit = f"rep{rep}:{arm}"
+            if unit in units_done:
+                print(f"rep {rep} arm {arm}: already complete, skipping", flush=True)
+                continue
             quiet = (
                 gpu_state.wait_quiet_window(args.quiet_threshold)
                 if not args.no_quiet_wait
@@ -289,7 +393,7 @@ def run(args: argparse.Namespace) -> dict:
                 model=args.model,
                 port=args.port,
                 served_model_name=args.served_model_name,
-                env={args.gate_env: gate_value, **args.extra_env},
+                env={**arm_env[arm], **args.extra_env},
                 shared_env={"VLLM_SERVER_DEV_MODE": "1"},
                 worker_extension_cls=(
                     "tools.benchmark.macos.dispatch_probe.MacosBenchmarkProbe"
@@ -309,9 +413,14 @@ def run(args: argparse.Namespace) -> dict:
             handle = None
             try:
                 handle = start_server(serve_config)
-                runs = measure_lengths(args, arm, handle, prompts)
+                runs, warm = measure_lengths(args, arm, handle, prompts)
                 for length, length_runs in runs.items():
                     arms[arm].setdefault(length, []).extend(length_runs)
+                result.setdefault("warmup_decode_s", {}).setdefault(arm, {}).update(
+                    {str(length): seconds for length, seconds in warm.items()}
+                )
+                units_done.add(unit)
+                result["units_done"] = sorted(units_done)
             finally:
                 if handle is not None:
                     stop_server(handle)
@@ -324,7 +433,8 @@ def run(args: argparse.Namespace) -> dict:
             }
             evidence.write_json(output / "results.json", result)
 
-    result["comparison"] = evidence.summarize(arms, ["off", "on"])
+    reference_order = arm_names if args.arm else ["off", "on"]
+    result["comparison"] = evidence.summarize(arms, reference_order)
     result["finished_utc"] = datetime.now(UTC).isoformat()
     evidence.write_json(output / "results.json", result)
     return result
@@ -366,6 +476,27 @@ def main(argv: list[str] | None = None) -> None:
         "--gate-off-value",
         default="1",
         help="value for the 'off' arm (default 1: the disable flag set)",
+    )
+    parser.add_argument(
+        "--arm",
+        action="append",
+        default=None,
+        metavar="NAME[:KEY=VAL,...]",
+        help="repeatable explicit arm; replaces the on/off gate pair. The "
+        "first arm is the baseline others are compared against. Example: "
+        "--arm base --arm staged:VLLM_METAL_GATE=1",
+    )
+    parser.add_argument(
+        "--warmup-decode-seconds",
+        type=float,
+        default=10.0,
+        help="discarded decode seconds per (arm, length) before measuring",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue an interrupted run in --output with the same "
+        "configuration; completed (rep, arm) units are skipped",
     )
     parser.add_argument(
         "--reps",
@@ -420,6 +551,23 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     args.extra_env = parse_key_values(args.extra_env)
     args.expect_family = parse_expect_family(args.expect_family)
+    if args.arm:
+        if len(args.arm) < 2:
+            raise SystemExit("--arm needs at least two arms to compare")
+        try:
+            parse_arms(args.arm)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from None
+        gate_changed = (
+            args.gate_env != DEFAULT_GATE_ENV
+            or args.gate_on_value != "0"
+            or args.gate_off_value != "1"
+        )
+        if gate_changed:
+            raise SystemExit(
+                "--arm replaces --gate-env/--gate-on-value/"
+                "--gate-off-value; pass one or the other"
+            )
     try:
         result = run(args)
     except KeyboardInterrupt:
@@ -432,11 +580,7 @@ def main(argv: list[str] | None = None) -> None:
             for arm, stats in medians.items()
             if stats["median"]
         )
-        speedups = {
-            key: value
-            for key, value in entry.items()
-            if key.endswith("_vs_on") or key.endswith("_vs_off")
-        }
+        speedups = {key: value for key, value in entry.items() if "_vs_" in key}
         print(
             f"length {length}: {line} | {speedups} | "
             f"all_text_equal={entry['all_text_equal']}"

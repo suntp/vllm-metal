@@ -9,14 +9,18 @@ and comparison logic so evidence packs stay well-formed.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 import pytest
 
 from tools.benchmark.macos import evidence, gpu_state
 from tools.benchmark.macos.run_ab import (
+    arm_order,
     assemble_prompt,
+    parse_arms,
     parse_expect_family,
     parse_key_values,
+    run_fingerprint,
 )
 
 _IOREG_SAMPLE = """\
@@ -145,6 +149,57 @@ def test_summarize_computes_speedup_and_equality() -> None:
     assert entry["off_vs_on"] == pytest.approx(10.0 / 21.0)
     assert entry["all_text_equal"] is False
     assert entry["families"]["on"] == ["gqa_decode"]
+
+
+def test_parse_arms_names_environments_and_rejects_duplicates() -> None:
+    assert parse_arms(["base", "cand:V=1,W=2", "t:PYTHONPATH=/a:/b"]) == [
+        ("base", {}),
+        ("cand", {"V": "1", "W": "2"}),
+        ("t", {"PYTHONPATH": "/a:/b"}),
+    ]
+    with pytest.raises(ValueError, match="unique"):
+        parse_arms(["a", "a"])
+    with pytest.raises(ValueError, match="unique"):
+        parse_arms([""])
+    with pytest.raises(ValueError, match="KEY=VALUE"):
+        parse_arms(["x:novalue"])
+
+
+def test_arm_order_rotates_so_no_arm_always_runs_first() -> None:
+    assert arm_order(["on", "off"], 0) == ["on", "off"]
+    assert arm_order(["on", "off"], 1) == ["off", "on"]
+    assert arm_order(["a", "b", "c"], 0) == ["a", "b", "c"]
+    assert arm_order(["a", "b", "c"], 1) == ["b", "c", "a"]
+    firsts = {arm_order(["a", "b", "c"], rep)[0] for rep in range(3)}
+    assert firsts == {"a", "b", "c"}
+
+
+def _fingerprint_args(**overrides) -> argparse.Namespace:
+    base = {
+        "model": Path("/tmp/model"),
+        "lengths": [32768, 65536],
+        "tokens": 128,
+        "runs": 3,
+        "reps": 2,
+        "seed": 0,
+        "warmup_decode_seconds": 10.0,
+        "extra_env": {},
+        "expect_family": {},
+        "server_arg": [],
+    }
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def test_run_fingerprint_stable_and_configuration_sensitive() -> None:
+    arms = [("on", {"G": "0"}), ("off", {"G": "1"})]
+    same = run_fingerprint(arms, _fingerprint_args())
+    assert run_fingerprint(arms, _fingerprint_args()) == same
+    assert (
+        run_fingerprint([("on", {"G": "2"}), ("off", {})], _fingerprint_args()) != same
+    )
+    assert run_fingerprint(arms, _fingerprint_args(tokens=64)) != same
+    assert run_fingerprint(arms, _fingerprint_args(lengths=[65536])) != same
 
 
 def test_validate_args_rejects_oversized_lengths(tmp_path) -> None:
