@@ -792,9 +792,7 @@ def test_each_geometry_lower_boundary_dispatch(q, kv, head, block_size, offset):
 )
 @pytest.mark.parametrize("n", [131071, 131072, 131073, 196608, 262144, 262145])
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-def test_each_geometry_stays_on_gqa_at_long_context(
-    q, kv, head, block_size, n, dtype
-):
+def test_each_geometry_stays_on_gqa_at_long_context(q, kv, head, block_size, n, dtype):
     _require_grid(n, q)
     out, ref = _run_primitive(
         [n],
