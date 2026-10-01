@@ -27,6 +27,10 @@ class CompletionResult:
     completion_tokens: int
     text: str
     text_sha256: str
+    token_ids: list[int]
+    token_ids_sha256: str
+    token_event_sizes: list[int]
+    token_event_elapsed_s: list[float]
 
 
 def stream_completion(
@@ -48,6 +52,7 @@ def stream_completion(
         "temperature": temperature,
         "seed": seed,
         "ignore_eos": ignore_eos,
+        "return_token_ids": True,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
@@ -60,6 +65,9 @@ def stream_completion(
     first: float | None = None
     last: float | None = None
     pieces: list[str] = []
+    token_ids: list[int] = []
+    token_event_sizes: list[int] = []
+    token_event_elapsed_s: list[float] = []
     usage: dict | None = None
     with urllib.request.urlopen(request, timeout=timeout_s) as response:
         for raw in response:
@@ -74,15 +82,26 @@ def stream_completion(
             for choice in data.get("choices", []):
                 piece = choice.get("text", "")
                 if piece:
+                    pieces.append(piece)
+                ids = choice.get("token_ids") or []
+                if ids:
                     now = time.perf_counter()
                     if first is None:
                         first = now
                     last = now
-                    pieces.append(piece)
+                    token_ids.extend(ids)
+                    token_event_sizes.append(len(ids))
+                    token_event_elapsed_s.append(now - start)
     if usage is None or first is None or last is None or last <= first:
         raise RuntimeError(f"incomplete streaming response: usage={usage}")
     text = "".join(pieces)
     completion_tokens = int(usage["completion_tokens"])
+    if len(token_ids) != completion_tokens:
+        raise RuntimeError(
+            f"streamed {len(token_ids)} token IDs, usage reports {completion_tokens}"
+        )
+    if token_event_sizes[0] != 1:
+        raise RuntimeError("the first token event must contain exactly one token")
     if completion_tokens != max_tokens:
         raise RuntimeError(
             f"expected {max_tokens} completion tokens, got {completion_tokens}"
@@ -96,4 +115,10 @@ def stream_completion(
         completion_tokens=completion_tokens,
         text=text,
         text_sha256=hashlib.sha256(text.encode()).hexdigest(),
+        token_ids=token_ids,
+        token_ids_sha256=hashlib.sha256(
+            json.dumps(token_ids, separators=(",", ":")).encode()
+        ).hexdigest(),
+        token_event_sizes=token_event_sizes,
+        token_event_elapsed_s=token_event_elapsed_s,
     )

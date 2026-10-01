@@ -182,8 +182,8 @@ def validate_args(args: argparse.Namespace, config: dict) -> int:
     return max_len
 
 
-def read_dispatch_family(base_url: str) -> str:
-    """Actual dispatch family via the worker probe, or a placeholder."""
+def read_dispatch(base_url: str) -> dict:
+    """Actual dispatch metadata via the worker probe, or a placeholder."""
     try:
         response = request_json(
             base_url,
@@ -192,13 +192,12 @@ def read_dispatch_family(base_url: str) -> str:
             timeout=30,
         )
     except Exception:  # noqa: BLE001 - probe is best-effort by design
-        return "unavailable"
+        return {"family": "unavailable"}
     results = response.get("results") or [response]
     entry = results[0] if results else {}
     if not isinstance(entry, dict):
-        return "unavailable"
-    family = entry.get("family", "unavailable")
-    return str(family)
+        return {"family": "unavailable"}
+    return entry
 
 
 def measure_lengths(
@@ -257,7 +256,8 @@ def measure_lengths(
                 raise RuntimeError(
                     f"prompt reshaped: sent {length}, server saw {result.prompt_tokens}"
                 )
-            family = read_dispatch_family(handle.base_url)
+            dispatch = read_dispatch(handle.base_url)
+            family = dispatch.get("family", "unavailable")
             expected = args.expect_family.get(arm)
             if expected and family != expected:
                 raise RuntimeError(
@@ -271,7 +271,12 @@ def measure_lengths(
                 "decode_tps": result.decode_tps,
                 "completion_tokens": result.completion_tokens,
                 "text_sha256": result.text_sha256,
+                "token_ids": result.token_ids,
+                "token_ids_sha256": result.token_ids_sha256,
+                "token_event_sizes": result.token_event_sizes,
+                "token_event_elapsed_s": result.token_event_elapsed_s,
                 "dispatch_family": family,
+                "dispatch": dispatch,
                 "utilization_before": utilization,
             }
             runs.append(run)

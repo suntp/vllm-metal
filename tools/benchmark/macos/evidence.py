@@ -126,6 +126,14 @@ def summarize(
             run["text_sha256"] for runs in arms.values() for run in runs.get(length, [])
         }
         entry["all_text_equal"] = len(hashes) == 1
+        token_hashes = [
+            run.get("token_ids_sha256")
+            for runs in arms.values()
+            for run in runs.get(length, [])
+        ]
+        entry["all_token_ids_equal"] = (
+            len(set(token_hashes)) == 1 if token_hashes and all(token_hashes) else None
+        )
         comparison[length] = entry
     return comparison
 

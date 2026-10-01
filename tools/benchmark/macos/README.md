@@ -36,6 +36,12 @@ to every tool.
 
 ## Protocol 1: serving A/B (`run_ab.py`)
 
+The client requests token IDs and measures from the first emitted token event
+to the last, including events with empty decoded text. It checks the streamed
+ID count against usage and rejects a bundled first-token event. Evidence keeps
+token IDs, event sizes/timestamps, and the worker's kernel family and partition.
+Text equality and token-ID equality are reported separately.
+
 Arms default to an on/off pair over one gate variable:
 
 ```sh

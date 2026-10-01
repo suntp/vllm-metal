@@ -28,9 +28,13 @@ class MacosBenchmarkProbe:
             ops = get_ops()
             reader = getattr(ops, "last_paged_dispatch", None)
             family = reader() if callable(reader) else "unavailable"
+            partition_reader = getattr(ops, "last_gqa_partition_size", None)
+            partition = partition_reader() if callable(partition_reader) else None
+            core_reader = getattr(ops, "detected_gpu_core_count", None)
+            cores = core_reader() if callable(core_reader) else None
         except Exception as exc:  # noqa: BLE001 - recorded, never raised
             return {"family": "unavailable", "error": repr(exc)}
-        return {"family": family}
+        return {"family": family, "partition": partition, "gpu_cores": cores}
 
     def memory_probe(self) -> dict:
         """Peak MLX memory since process start (high-water mark)."""
