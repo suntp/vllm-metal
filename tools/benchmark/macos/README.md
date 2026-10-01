@@ -42,6 +42,12 @@ ID count against usage and rejects a bundled first-token event. Evidence keeps
 token IDs, event sizes/timestamps, and the worker's kernel family and partition.
 Text equality and token-ID equality are reported separately.
 
+Dispatch recording is opt-in on newer native builds. The HTTP harness enables
+it through a worker RPC before warmup; the primitive harness enables it in its
+own process. Subsequent reads do not reset observations. Both timing arms use
+the same diagnostic setting. Older builds with always-on recording remain
+supported. This instrumentation does not alter routing or force a partition.
+
 Arms default to an on/off pair over one gate variable:
 
 ```sh

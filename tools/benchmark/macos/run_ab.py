@@ -182,13 +182,15 @@ def validate_args(args: argparse.Namespace, config: dict) -> int:
     return max_len
 
 
-def read_dispatch(base_url: str) -> dict:
+def read_dispatch(base_url: str, *, enable: bool = False) -> dict:
     """Actual dispatch metadata via the worker probe, or a placeholder."""
     try:
         response = request_json(
             base_url,
             "/collective_rpc",
-            {"method": "paged_dispatch_probe"},
+            {"method": "paged_dispatch_probe", "kwargs": {"enable": True}}
+            if enable
+            else {"method": "paged_dispatch_probe"},
             timeout=30,
         )
     except Exception:  # noqa: BLE001 - probe is best-effort by design
@@ -216,6 +218,9 @@ def measure_lengths(
     """
     records: dict[int, list[dict]] = {}
     warmup: dict[int, float] = {}
+    # Recording must be enabled inside the worker before its first request.
+    # Reading after a request cannot recover an unrecorded dispatch.
+    read_dispatch(handle.base_url, enable=True)
     for length in sorted(args.lengths):
         prompt_ids = prompts[length]
         # Cold prefill primes the prefix cache; its decode is discarded.

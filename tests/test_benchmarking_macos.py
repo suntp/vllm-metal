@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from tools.benchmark.macos import evidence, gpu_state
+from tools.benchmark.macos import evidence, gpu_state, run_ab
+from tools.benchmark.macos.dispatch_probe import MacosBenchmarkProbe
 from tools.benchmark.macos.run_ab import (
     arm_order,
     assemble_prompt,
@@ -30,6 +32,62 @@ ooo AGXAccelerator <class AGXAccelerator> 1000
 ooo AGXAccelerator <class AGXAccelerator> 1001
   | "PerformanceStatistics" = {"In use system memory (driver)"=0,"Tiler Utilization %"=1,"Renderer Utilization %"=3,"Device Utilization %"=4,"Allocated PB Size"=109576192}
 """
+
+
+def test_dispatch_opt_in_precedes_the_first_request(monkeypatch) -> None:
+    events = []
+
+    def rpc(base_url, path, payload, **kwargs):
+        assert path == "/collective_rpc"
+        assert payload == {
+            "method": "paged_dispatch_probe",
+            "kwargs": {"enable": True},
+        }
+        events.append("enable in worker")
+        return {"results": [{"family": "", "partition": 0}]}
+
+    monkeypatch.setattr(run_ab, "request_json", rpc)
+    monkeypatch.setattr(
+        run_ab.completions,
+        "stream_completion",
+        lambda *a, **k: events.append("request"),
+    )
+    run_ab.measure_lengths(
+        SimpleNamespace(
+            lengths=[4],
+            served_model_name="test",
+            seed=1,
+            warmup_decode_seconds=0,
+            runs=0,
+        ),
+        "on",
+        SimpleNamespace(base_url="http://worker"),
+        {4: [1, 2, 3, 4]},
+    )
+    assert events == ["enable in worker", "request"]
+
+
+@pytest.mark.parametrize("opt_in_api", [False, True])
+def test_dispatch_reads_do_not_clear_the_record(monkeypatch, opt_in_api) -> None:
+    import mlx.core as mx
+
+    import vllm_metal.metal
+
+    enabled = []
+    ops = SimpleNamespace(
+        last_paged_dispatch=lambda: "gqa_decode",
+        last_gqa_partition_size=lambda: 128,
+        detected_gpu_core_count=lambda: 20,
+    )
+    if opt_in_api:
+        ops._set_paged_dispatch_diagnostics = lambda value: enabled.append(value)
+    monkeypatch.setattr(vllm_metal.metal, "get_ops", lambda: ops)
+    monkeypatch.setattr(mx, "synchronize", lambda: None)
+    probe = MacosBenchmarkProbe()
+    probe.paged_dispatch_probe(enable=True)
+    result = probe.paged_dispatch_probe()
+    assert result == {"family": "gqa_decode", "partition": 128, "gpu_cores": 20}
+    assert enabled == ([True] if opt_in_api else [])
 
 
 def test_parse_utilization_takes_peak_entry() -> None:

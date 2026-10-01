@@ -18,14 +18,21 @@ from __future__ import annotations
 
 
 class MacosBenchmarkProbe:
-    """Worker extension: one-arg-free RPC targets for the harness."""
+    """Worker RPC targets for benchmark setup and observations."""
 
-    def paged_dispatch_probe(self) -> dict:
-        """Dispatch family of the most recent paged-attention eval."""
+    def paged_dispatch_probe(self, enable: bool = False) -> dict:
+        """Opt in before requests; subsequent reads preserve the observation."""
         try:
             from vllm_metal.metal import get_ops
 
             ops = get_ops()
+            if enable:
+                import mlx.core as mx
+
+                mx.synchronize()
+                setter = getattr(ops, "_set_paged_dispatch_diagnostics", None)
+                if callable(setter):
+                    setter(True)
             reader = getattr(ops, "last_paged_dispatch", None)
             family = reader() if callable(reader) else "unavailable"
             partition_reader = getattr(ops, "last_gqa_partition_size", None)

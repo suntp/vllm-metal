@@ -362,6 +362,9 @@ def main() -> None:
     from vllm_metal.metal import get_ops
 
     ops = get_ops()
+    diagnostics = getattr(ops, "_set_paged_dispatch_diagnostics", None)
+    if callable(diagnostics):
+        diagnostics(True)
     cores = ops.detected_gpu_core_count()
     geometries = build_geometries(args)
     baseline_mode = args.baseline
