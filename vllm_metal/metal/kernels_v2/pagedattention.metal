@@ -2060,125 +2060,6 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   }
 }
 
-// ---------------------------------------------------------------------------
-// GQA-shared flash-decode pass for pure-decode batches.
-//
-// One threadgroup per (PARTITION_SIZE-token partition, kv head, sequence);
-// each simdgroup owns one query head of the GQA group. Co-locating these
-// heads can improve KV cache locality, but each simdgroup still issues its
-// own K/V loads (there is no explicit cross-simdgroup broadcast). The online
-// softmax stays in registers, with no score staging or barriers. The serial
-// token loop trades intra-head parallelism for this locality, so dispatch
-// must account for the shape and device rather than context length alone.
-//
-// Partials are written in the exact contract paged_attention_v2_reduce
-// consumes: log2-space running (max, exp-sum) stats plus the
-// epsilon-normalised partial at tmp_out[token, head, partition, :], so the
-// existing reduce pass merges them unchanged.  Engaged only for pure-decode
-// batches without TurboQuant/FP8/sinks/softcap/sliding-window (dispatch gate
-// in paged_ops.cpp); everything else keeps the established paths.
-template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
-[[kernel]] void paged_attention_gqa_decode(
-    device float *exp_sums [[buffer(0)]], device float *max_logits [[buffer(1)]],
-    device T *tmp_out [[buffer(2)]], device const T *q [[buffer(3)]],
-    device const T *k_cache [[buffer(4)]], device const T *v_cache [[buffer(5)]],
-    const constant int &num_kv_heads [[buffer(8)]],
-    const constant float &scale [[buffer(9)]],
-    device const uint32_t *block_tables [[buffer(11)]],
-    device const uint32_t *context_lens [[buffer(12)]],
-    const constant int &max_num_blocks_per_seq [[buffer(13)]],
-    const constant int &q_stride [[buffer(15)]],
-    const constant int &kv_block_stride [[buffer(16)]],
-    const constant int &kv_head_stride [[buffer(17)]],
-    uint3 tg_pos [[threadgroup_position_in_grid]],
-    uint3 tg_per_grid [[threadgroups_per_grid]],
-    uint3 tptg [[threads_per_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
-  static_assert(HEAD_SIZE % 32 == 0, "one lane-strided slice per lane");
-  constexpr int SLICE = HEAD_SIZE / 32;  // elements per lane
-  const int partition_idx = tg_pos.x;
-  const int kv_head_idx = tg_pos.y;
-  const int seq_idx = tg_pos.z;
-  const int context_len = static_cast<int>(context_lens[seq_idx]);
-  const int t0 = partition_idx * PARTITION_SIZE;
-  if (t0 >= context_len) {
-    // The reduce reads only ceil(context_len / PARTITION_SIZE) partitions,
-    // so stats for later partitions are never consumed (same early-out as
-    // the partitioned per-token kernel).
-    return;
-  }
-  const int t_end = min(t0 + PARTITION_SIZE, context_len);
-
-  const int group = tptg.x / 32;  // query heads per kv head (GQA group)
-  const int head_idx = kv_head_idx * group + static_cast<int>(sg);
-  const int num_heads = num_kv_heads * group;
-  const int max_num_partitions = tg_per_grid.x;
-  const int64_t kv_token_stride =
-      static_cast<int64_t>(num_kv_heads) * kv_head_stride;
-
-  // Lane-strided query slice, loaded once.
-  device const T *q_ptr =
-      q + seq_idx * q_stride + head_idx * HEAD_SIZE + lane * SLICE;
-  float qv[SLICE];
-#pragma unroll
-  for (int i = 0; i < SLICE; i++) {
-    qv[i] = float(q_ptr[i]);
-  }
-
-  device const uint32_t *bt =
-      block_tables + seq_idx * max_num_blocks_per_seq;
-
-  // Online softmax in log2 space (v2_reduce contract): folding log2(e) into
-  // the scale turns every exp into a 1-instruction exp2 on Apple GPUs.
-  float m = -FLT_MAX;
-  float l = 0.f;
-  float acc[SLICE] = {0.f};
-  const float log2e_scale = scale * M_LOG2E_F;
-  for (int t = t0; t < t_end; t++) {
-    const int64_t row = static_cast<int64_t>(bt[t / BLOCK_SIZE]) *
-            kv_block_stride +
-        (t % BLOCK_SIZE) * kv_token_stride + kv_head_idx * kv_head_stride +
-        lane * SLICE;
-    device const T *krow = k_cache + row;
-    float dot = 0.f;
-#pragma unroll
-    for (int i = 0; i < SLICE; i++) {
-      dot += qv[i] * float(krow[i]);
-    }
-    const float s = simd_sum(dot) * log2e_scale;
-    const float m_new = max(m, s);
-    // exp2(-FLT_MAX - s) == 0 under -fno-fast-math, so the first-iteration
-    // rescale needs no guard (same identity the masked-score path uses).
-    const float alpha = exp2(m - m_new);
-    const float p = exp2(s - m_new);
-    l = l * alpha + p;
-    device const T *vrow = v_cache + row;
-#pragma unroll
-    for (int i = 0; i < SLICE; i++) {
-      acc[i] = acc[i] * alpha + p * float(vrow[i]);
-    }
-    m = m_new;
-  }
-
-  const int64_t pidx =
-      (static_cast<int64_t>(seq_idx) * num_heads + head_idx) *
-          max_num_partitions +
-      partition_idx;
-  if (lane == 0) {
-    max_logits[pidx] = m;
-    exp_sums[pidx] = l;
-  }
-  device T *out_ptr = tmp_out + pidx * HEAD_SIZE + lane * SLICE;
-  const float inv_l = 1.f / (l + kPagedAttentionSoftmaxEpsilon);
-#pragma unroll
-  for (int i = 0; i < SLICE; i++) {
-    out_ptr[i] = T(acc[i] * inv_l);
-  }
-}
-
-// Broadcast one block-table entry: every lane of the simdgroup must execute
-// the shuffle. Lane 0 issues the device load; the rest receive the copy.
 inline uint32_t gqa_broadcast_page_id(device const uint32_t *bt, int page,
                                       uint lane) {
   uint32_t page_id = 0;
@@ -2200,13 +2081,11 @@ inline uint32_t gqa_broadcast_page_id(device const uint32_t *bt, int page,
 // next page_id and simd_shuffle broadcasts it; each simdgroup reloads the
 // same entry rather than staging the table in threadgroup memory. Full
 // pages run a 4-token inner step so independent QK dots overlap K/V
-// latency; a 1-3 token tail covers the last partial page.
-//
-// P64/P128 stage 16-token K/V tiles into threadgroup memory (bs32 is two
-// tiles). Simdgroups round-robin the tile rows so G=6 still covers 16
-// tokens; every query head then reads the staged rows. Each tile pairs a
-// fill barrier with a consume barrier. P256/P512 keep the device 4-way
-// path; dispatch reserves staging memory only for P64/P128.
+// latency; a 1-3 token tail covers the last partial page. Every tier
+// reads K/V straight from device memory: at the short-context lengths
+// where the small tiers are selected the working set is L2-resident, so
+// threadgroup staging measured as a net cost (its barriers outweigh the
+// redundant reads they remove) and lives in a long-context follow-up.
 // Dispatch still accounts for the shape and device rather than context
 // length alone.
 //
@@ -2229,7 +2108,6 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
     const constant int &q_stride [[buffer(15)]],
     const constant int &kv_block_stride [[buffer(16)]],
     const constant int &kv_head_stride [[buffer(17)]],
-    threadgroup T *shared_kv [[threadgroup(0)]],
     uint3 tg_pos [[threadgroup_position_in_grid]],
     uint3 tg_per_grid [[threadgroups_per_grid]],
     uint3 tptg [[threads_per_threadgroup]],
@@ -2239,8 +2117,6 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
   static_assert(PARTITION_SIZE % BLOCK_SIZE == 0,
                 "partition start is page-aligned");
   constexpr int SLICE = HEAD_SIZE / 32;  // elements per lane
-  constexpr int STAGE_TOKENS = 16;
-  constexpr bool STAGE_KV = PARTITION_SIZE <= 128;
   const int partition_idx = tg_pos.x;
   const int kv_head_idx = tg_pos.y;
   const int seq_idx = tg_pos.z;
@@ -2296,165 +2172,73 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
     const int tok1 = min(tok0 + BLOCK_SIZE, t_end);
     const int64_t page_kv = static_cast<int64_t>(cur_page) * kv_block_stride +
                             kv_head_idx * kv_head_stride;
-    if constexpr (STAGE_KV) {
-      threadgroup T *K_smem = shared_kv;
-      threadgroup T *V_smem = shared_kv + STAGE_TOKENS * HEAD_SIZE;
-      for (int tile = 0; tile < BLOCK_SIZE; tile += STAGE_TOKENS) {
-        const int tile0 = tok0 + tile;
-        if (tile0 >= tok1) {
-          break;
-        }
-        const int n_tok = min(tile0 + STAGE_TOKENS, tok1) - tile0;
-        for (int t_local = static_cast<int>(sg); t_local < n_tok;
-             t_local += group) {
-          const int64_t row = page_kv +
-                              static_cast<int64_t>(tile + t_local) *
-                                  kv_token_stride +
-                              static_cast<int64_t>(lane) * SLICE;
-          threadgroup T *kdst = K_smem + t_local * HEAD_SIZE + lane * SLICE;
-          threadgroup T *vdst = V_smem + t_local * HEAD_SIZE + lane * SLICE;
-          device const T *ksrc = k_cache + row;
-          device const T *vsrc = v_cache + row;
+    const int64_t page_base =
+        page_kv + static_cast<int64_t>(lane) * SLICE;
+    int t = tok0;
+    for (; t + 4 <= tok1; t += 4) {
+      const int64_t r0 = page_base + (t - tok0) * kv_token_stride;
+      const int64_t r1 = r0 + kv_token_stride;
+      const int64_t r2 = r1 + kv_token_stride;
+      const int64_t r3 = r2 + kv_token_stride;
+      device const T *k0 = k_cache + r0;
+      device const T *k1 = k_cache + r1;
+      device const T *k2 = k_cache + r2;
+      device const T *k3 = k_cache + r3;
+      float d0 = 0.f;
+      float d1 = 0.f;
+      float d2 = 0.f;
+      float d3 = 0.f;
 #pragma unroll
-          for (int i = 0; i < SLICE; i++) {
-            kdst[i] = ksrc[i];
-            vdst[i] = vsrc[i];
-          }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        int t = 0;
-        for (; t + 4 <= n_tok; t += 4) {
-          threadgroup const T *k0 =
-              K_smem + t * HEAD_SIZE + lane * SLICE;
-          threadgroup const T *k1 = k0 + HEAD_SIZE;
-          threadgroup const T *k2 = k1 + HEAD_SIZE;
-          threadgroup const T *k3 = k2 + HEAD_SIZE;
-          float d0 = 0.f;
-          float d1 = 0.f;
-          float d2 = 0.f;
-          float d3 = 0.f;
-#pragma unroll
-          for (int i = 0; i < SLICE; i++) {
-            d0 += qv[i] * float(k0[i]);
-            d1 += qv[i] * float(k1[i]);
-            d2 += qv[i] * float(k2[i]);
-            d3 += qv[i] * float(k3[i]);
-          }
-          const float s0 = simd_sum(d0) * log2e_scale;
-          const float s1 = simd_sum(d1) * log2e_scale;
-          const float s2 = simd_sum(d2) * log2e_scale;
-          const float s3 = simd_sum(d3) * log2e_scale;
-          const float m_new = max(m, max(max(s0, s1), max(s2, s3)));
-          const float alpha = exp2(m - m_new);
-          const float p0 = exp2(s0 - m_new);
-          const float p1 = exp2(s1 - m_new);
-          const float p2 = exp2(s2 - m_new);
-          const float p3 = exp2(s3 - m_new);
-          l = l * alpha + p0 + p1 + p2 + p3;
-          threadgroup const T *v0 =
-              V_smem + t * HEAD_SIZE + lane * SLICE;
-          threadgroup const T *v1 = v0 + HEAD_SIZE;
-          threadgroup const T *v2 = v1 + HEAD_SIZE;
-          threadgroup const T *v3 = v2 + HEAD_SIZE;
-#pragma unroll
-          for (int i = 0; i < SLICE; i++) {
-            acc[i] = acc[i] * alpha + p0 * float(v0[i]) + p1 * float(v1[i]) +
-                     p2 * float(v2[i]) + p3 * float(v3[i]);
-          }
-          m = m_new;
-        }
-        for (; t < n_tok; t++) {
-          threadgroup const T *krow =
-              K_smem + t * HEAD_SIZE + lane * SLICE;
-          threadgroup const T *vrow =
-              V_smem + t * HEAD_SIZE + lane * SLICE;
-          float dot = 0.f;
-#pragma unroll
-          for (int i = 0; i < SLICE; i++) {
-            dot += qv[i] * float(krow[i]);
-          }
-          const float s = simd_sum(dot) * log2e_scale;
-          const float m_new = max(m, s);
-          const float alpha = exp2(m - m_new);
-          const float p = exp2(s - m_new);
-          l = l * alpha + p;
-#pragma unroll
-          for (int i = 0; i < SLICE; i++) {
-            acc[i] = acc[i] * alpha + p * float(vrow[i]);
-          }
-          m = m_new;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int i = 0; i < SLICE; i++) {
+        d0 += qv[i] * float(k0[i]);
+        d1 += qv[i] * float(k1[i]);
+        d2 += qv[i] * float(k2[i]);
+        d3 += qv[i] * float(k3[i]);
       }
-    } else {
-      const int64_t page_base =
-          page_kv + static_cast<int64_t>(lane) * SLICE;
-      int t = tok0;
-      for (; t + 4 <= tok1; t += 4) {
-        const int64_t r0 = page_base + (t - tok0) * kv_token_stride;
-        const int64_t r1 = r0 + kv_token_stride;
-        const int64_t r2 = r1 + kv_token_stride;
-        const int64_t r3 = r2 + kv_token_stride;
-        device const T *k0 = k_cache + r0;
-        device const T *k1 = k_cache + r1;
-        device const T *k2 = k_cache + r2;
-        device const T *k3 = k_cache + r3;
-        float d0 = 0.f;
-        float d1 = 0.f;
-        float d2 = 0.f;
-        float d3 = 0.f;
+      const float s0 = simd_sum(d0) * log2e_scale;
+      const float s1 = simd_sum(d1) * log2e_scale;
+      const float s2 = simd_sum(d2) * log2e_scale;
+      const float s3 = simd_sum(d3) * log2e_scale;
+      // Joint max is the same online-softmax identity as four serial
+      // updates. exp2(-FLT_MAX - s) == 0 under -fno-fast-math, so the
+      // first-iteration rescale needs no guard.
+      const float m_new = max(m, max(max(s0, s1), max(s2, s3)));
+      const float alpha = exp2(m - m_new);
+      const float p0 = exp2(s0 - m_new);
+      const float p1 = exp2(s1 - m_new);
+      const float p2 = exp2(s2 - m_new);
+      const float p3 = exp2(s3 - m_new);
+      l = l * alpha + p0 + p1 + p2 + p3;
+      device const T *v0 = v_cache + r0;
+      device const T *v1 = v_cache + r1;
+      device const T *v2 = v_cache + r2;
+      device const T *v3 = v_cache + r3;
 #pragma unroll
-        for (int i = 0; i < SLICE; i++) {
-          d0 += qv[i] * float(k0[i]);
-          d1 += qv[i] * float(k1[i]);
-          d2 += qv[i] * float(k2[i]);
-          d3 += qv[i] * float(k3[i]);
-        }
-        const float s0 = simd_sum(d0) * log2e_scale;
-        const float s1 = simd_sum(d1) * log2e_scale;
-        const float s2 = simd_sum(d2) * log2e_scale;
-        const float s3 = simd_sum(d3) * log2e_scale;
-        // Joint max is the same online-softmax identity as four serial
-        // updates. exp2(-FLT_MAX - s) == 0 under -fno-fast-math, so the
-        // first-iteration rescale needs no guard.
-        const float m_new = max(m, max(max(s0, s1), max(s2, s3)));
-        const float alpha = exp2(m - m_new);
-        const float p0 = exp2(s0 - m_new);
-        const float p1 = exp2(s1 - m_new);
-        const float p2 = exp2(s2 - m_new);
-        const float p3 = exp2(s3 - m_new);
-        l = l * alpha + p0 + p1 + p2 + p3;
-        device const T *v0 = v_cache + r0;
-        device const T *v1 = v_cache + r1;
-        device const T *v2 = v_cache + r2;
-        device const T *v3 = v_cache + r3;
-#pragma unroll
-        for (int i = 0; i < SLICE; i++) {
-          acc[i] = acc[i] * alpha + p0 * float(v0[i]) + p1 * float(v1[i]) +
-                   p2 * float(v2[i]) + p3 * float(v3[i]);
-        }
-        m = m_new;
+      for (int i = 0; i < SLICE; i++) {
+        acc[i] = acc[i] * alpha + p0 * float(v0[i]) + p1 * float(v1[i]) +
+                 p2 * float(v2[i]) + p3 * float(v3[i]);
       }
-      for (; t < tok1; t++) {
-        const int64_t row = page_base + (t - tok0) * kv_token_stride;
-        device const T *krow = k_cache + row;
-        float dot = 0.f;
+      m = m_new;
+    }
+    for (; t < tok1; t++) {
+      const int64_t row = page_base + (t - tok0) * kv_token_stride;
+      device const T *krow = k_cache + row;
+      float dot = 0.f;
 #pragma unroll
-        for (int i = 0; i < SLICE; i++) {
-          dot += qv[i] * float(krow[i]);
-        }
-        const float s = simd_sum(dot) * log2e_scale;
-        const float m_new = max(m, s);
-        const float alpha = exp2(m - m_new);
-        const float p = exp2(s - m_new);
-        l = l * alpha + p;
-        device const T *vrow = v_cache + row;
-#pragma unroll
-        for (int i = 0; i < SLICE; i++) {
-          acc[i] = acc[i] * alpha + p * float(vrow[i]);
-        }
-        m = m_new;
+      for (int i = 0; i < SLICE; i++) {
+        dot += qv[i] * float(krow[i]);
       }
+      const float s = simd_sum(dot) * log2e_scale;
+      const float m_new = max(m, s);
+      const float alpha = exp2(m - m_new);
+      const float p = exp2(s - m_new);
+      l = l * alpha + p;
+      device const T *vrow = v_cache + row;
+#pragma unroll
+      for (int i = 0; i < SLICE; i++) {
+        acc[i] = acc[i] * alpha + p * float(vrow[i]);
+      }
+      m = m_new;
     }
   }
 
@@ -2695,7 +2479,6 @@ instantiate_paged_attention_v2(half, char, uchar, 32);
       const constant int &q_stride [[buffer(15)]],                           \
       const constant int &kv_block_stride [[buffer(16)]],                    \
       const constant int &kv_head_stride [[buffer(17)]],                     \
-      threadgroup type *shared_kv [[threadgroup(0)]],                        \
       uint3 tg_pos [[threadgroup_position_in_grid]],                         \
       uint3 tg_per_grid [[threadgroups_per_grid]],                           \
       uint3 tptg [[threads_per_threadgroup]],                                \

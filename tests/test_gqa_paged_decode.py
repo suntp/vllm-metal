@@ -411,15 +411,15 @@ def test_gqa_kernel_numerics_without_core_detection(
 @pytest.mark.parametrize(
     "q,kv,head,block",
     [
-        (24, 4, 256, 16),  # G=6 staged round-robin over 16 rows.
-        (16, 2, 256, 32),  # Two 16-token tiles reuse the same smem buffer.
+        (24, 4, 256, 16),  # G=6 short-tier geometry.
+        (16, 2, 256, 32),  # block32: the last page spans two 16-token groups.
         (16, 2, 128, 16),
     ],
 )
-def test_gqa_staged_partial_page_tails(dtype, part, n_tok, q, kv, head, block):
-    """Staged P64/P128 remainder tiles, including n_tok % 4 != 0."""
-    # One full partition plus a last page of n_tok tokens. For block32 the
-    # last partition also contains a complete 32-token page (two tiles).
+def test_gqa_partial_page_tails(dtype, part, n_tok, q, kv, head, block):
+    """Short-tier remainder pages, including n_tok % 4 != 0."""
+    # One full partition plus a last page of n_tok tokens; the tail falls
+    # through the 4-way groups into the per-token loop.
     extra = block if block > 16 else 0
     out, ref = _run_primitive(
         [part + extra + n_tok],
@@ -494,7 +494,7 @@ def test_core_count_override_changes_default_routing() -> None:
     """Production dispatch reads the override through detected_gpu_core_count()."""
     ops = get_ops()
     # Q=32, KV=2000: 31 full P64 partitions. Eligible iff 31*32 >= 33*cores,
-    # i.e. cores <= 31. Forty cores raise the P64 gate to 2688.
+    # i.e. cores <= 30. Forty cores raise the P64 gate to 2688.
     ops._override_detected_gpu_core_count_for_test(40)
     try:
         assert ops.detected_gpu_core_count() == 40

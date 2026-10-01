@@ -62,12 +62,12 @@ upstream K/V storage remains unreshaped.
 
 The GQA producer walks pages rather than tokens. Lane 0 preloads the next
 block-table entry and `simd_shuffle` broadcasts it; a 4-token inner step
-overlaps independent QK dots with K/V latency. P64 and P128 additionally
-stage 16-token K/V tiles into threadgroup memory (a 32-token kernel page is
-two tiles). Simdgroups round-robin the tile rows so a group of 6 still
-covers 16 tokens; each tile pairs a fill barrier with a consume barrier.
-P256 and P512 keep the device 4-way path, and dispatch reserves staging
-memory only for P64/P128. Online softmax stays in registers.
+overlaps independent QK dots with K/V latency. Every tier reads K/V
+straight from device memory: at the short-context lengths where the small
+tiers are selected the working set is L2-resident, and threadgroup
+staging of those tiers measured as a net cost at 32/8 and noise-level at
+16/2 on this device, so it is omitted here (see follow-ups). Online
+softmax stays in registers.
 
 The producer writes the same log2-space `(max, exp-sum)` plus
 epsilon-normalized `tmp_out` contract as split-KV. The shared
@@ -189,8 +189,11 @@ enablement or performance claims in #715:
    and multiple query rows. The existing verification kernel already shares
    KV across rows; compare against it while preserving causal masks and
    controlling register pressure. A larger gain is possible, not established.
-6. **Cross-device staging:** P64/P128 threadgroup K/V staging is in the
-   producer. On an M5 Pro its isolated effect is small because L2 already
-   coalesces the repeated loads; a smaller-L2 device may show more. Keep
-   the occupancy rule that dispatch reserves staging memory only for
-   P64/P128, and re-measure before treating staging as a cross-device win.
+6. **Cross-device staging:** threadgroup K/V staging for the P64/P128
+   producer was implemented and measured (two controlled ablations on an
+   M5 Pro): a net cost at the 32/8 geometry and noise-level at 16/2, so
+   it is removed from the producer. The long-context regime, where the
+   KV working set exceeds L2 and staging does pay, needs a GQA-owned
+   P512 specialization first. Devices with a smaller L2 may land
+   elsewhere on the short-tier trade-off; re-implement and re-measure
+   there before treating staging as a cross-device win.

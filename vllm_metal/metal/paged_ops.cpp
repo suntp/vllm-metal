@@ -862,17 +862,7 @@ static void dispatch_paged_attention_v2_online(
     array g_max_logits =
         make_temp(Shape{total_q_tokens, num_heads, gqa_num_partitions}, float32);
 
-    // Binds mirror paged_attention_gqa_decode's signature. P64/P128 stage a
-    // 16-token K+V tile (bs32 is two tiles). P256/P512 declare the buffer
-    // but STAGE_KV is compiled out; a non-zero length here still counts
-    // against occupancy, so those specializations pass 0.
     enc.set_compute_pipeline_state(gkernel);
-    size_t gqa_stage_bytes = 0;
-    if (gqa_partition_size <= 128) {
-      gqa_stage_bytes =
-          static_cast<size_t>(16) * head_size * 2 * query.itemsize();
-    }
-    enc.set_threadgroup_memory_length((gqa_stage_bytes + 15) & ~size_t(15), 0);
     enc.set_output_array(g_exp_sums, 0);
     enc.set_output_array(g_max_logits, 1);
     enc.set_output_array(g_tmp_out, 2);
