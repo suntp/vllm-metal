@@ -24,13 +24,8 @@ BLOCK_SIZE = 16
 
 
 def _interleaved_table(n_blocks: int) -> list[int]:
-    """Run-of-2, skip-1 pattern produced by hybrid GDN block interleave."""
-    table: list[int] = []
-    b = 3
-    while len(table) < n_blocks:
-        table += [b, b + 1]
-        b += 3
-    return table[:n_blocks]
+    """Non-contiguous logical pages within a compact physical allocation."""
+    return np.random.default_rng(715).permutation(n_blocks).tolist()
 
 
 def _assert_close(out: mx.array, ref: mx.array, dtype: mx.Dtype) -> None:
@@ -244,8 +239,7 @@ def _run_primitive(
     for s in range(num_seqs):
         if interleaved:
             table = [
-                b + s * (n_blocks_needed * 3 + 4)
-                for b in _interleaved_table(n_blocks_needed)
+                b + s * n_blocks_needed for b in _interleaved_table(n_blocks_needed)
             ]
         else:
             table = list(range(s * n_blocks_needed, (s + 1) * n_blocks_needed))
@@ -482,12 +476,13 @@ def test_private_gqa_partition_is_local_to_lazy_primitive():
 
 def test_core_count_override_restores_hardware_detection() -> None:
     ops = get_ops()
+    original = ops.detected_gpu_core_count()
     ops._override_detected_gpu_core_count_for_test(7)
     try:
         assert ops.detected_gpu_core_count() == 7
     finally:
         _restore_test_gpu_cores()
-    assert ops.detected_gpu_core_count() > 0
+    assert ops.detected_gpu_core_count() == original
 
 
 def test_core_count_override_changes_default_routing() -> None:
@@ -507,17 +502,42 @@ def test_core_count_override_changes_default_routing() -> None:
         )
         _assert_fallback()
         _assert_close(out, ref, mx.bfloat16)
+        ops._override_detected_gpu_core_count_for_test(10)
+        out, ref = _run_primitive(
+            [2000],
+            mx.bfloat16,
+            interleaved=False,
+            seed=41,
+            num_decode_requests=1,
+        )
+        assert _dispatch_family() == "gqa_decode"
+        _assert_close(out, ref, mx.bfloat16)
     finally:
         _restore_test_gpu_cores()
-    out, ref = _run_primitive(
-        [2000],
-        mx.bfloat16,
-        interleaved=False,
-        seed=41,
-        num_decode_requests=1,
+
+
+@pytest.mark.parametrize("partition", [64, 128, 256])
+def test_forced_partition_rejects_oversized_reducer(partition):
+    """A small cache can represent a long logical history without a huge allocation."""
+    ops = get_ops()
+    n = 1048577
+    query = mx.ones((1, 16, 128), mx.float16)
+    key = mx.ones((1, 16, 2, 128), mx.float16)
+    value = mx.full(key.shape, 2, mx.float16)
+    table = mx.zeros((1, (n + 15) // 16), mx.int32)
+    lengths = mx.array([n], mx.int32)
+    out = mx.array(0)
+    with pytest.raises(ValueError, match="threadgroup memory limit"):
+        ops._gqa_paged_attention_for_test(
+            query, key, value, 128**-0.5, table, lengths, 16, n, partition, out
+        )
+    # A larger partition fits the same history and still computes every token.
+    ops._gqa_paged_attention_for_test(
+        query, key, value, 128**-0.5, table, lengths, 16, n, 512, out
     )
-    assert _dispatch_family() == "gqa_decode"
-    _assert_close(out, ref, mx.bfloat16)
+    mx.eval(out)
+    assert ops.last_gqa_partition_size() == 512
+    np.testing.assert_allclose(np.array(out), 2, atol=2e-3)
 
 
 def test_unknown_core_count_keeps_measured_shape_on_baseline() -> None:

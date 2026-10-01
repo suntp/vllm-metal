@@ -193,6 +193,12 @@ static std::string paged_reduce_kernel_name(
       + "_nt256_nsl32_ps" + std::to_string(partition_size);
 }
 
+static size_t paged_reduce_threadgroup_bytes(int64_t num_partitions) {
+  // Two FP32 statistics per partition; Metal requires 16-byte alignment.
+  return (static_cast<size_t>(num_partitions) * 2 * sizeof(float) + 15) &
+      ~size_t(15);
+}
+
 static int gqa_decode_partition_size(int num_heads, int num_kv_heads,
                                       int head_size, int max_seq_len,
                                       int gpu_cores) {
@@ -614,14 +620,15 @@ static void dispatch_paged_attention_v2_reduce(
         "(got " +
         std::to_string(head_size) + ")");
   }
+  const size_t reduce_shmem = paged_reduce_threadgroup_bytes(max_num_partitions);
+  const size_t capacity = d.mtl_device()->maxThreadgroupMemoryLength();
+  if (reduce_shmem > capacity ||
+      rkernel->staticThreadgroupMemoryLength() > capacity - reduce_shmem) {
+    throw std::invalid_argument(
+        "paged attention reduction exceeds the device threadgroup memory limit");
+  }
   enc.set_compute_pipeline_state(rkernel);
-  // Metal requires setThreadgroupMemoryLength to be a multiple of 16 bytes
-  // (odd partition counts would yield 8 mod 16 and trip the API-validation
-  // layer).  The kernel reads exactly 2*num_partitions floats; the padding
-  // is never touched.
-  size_t reduce_shmem =
-      static_cast<size_t>(2 * max_num_partitions) * sizeof(float);
-  enc.set_threadgroup_memory_length((reduce_shmem + 15) & ~size_t(15), 0);
+  enc.set_threadgroup_memory_length(reduce_shmem, 0);
   enc.set_output_array(out, 0);
   enc.set_input_array(exp_sums, 1);
   enc.set_input_array(max_logits, 2);
@@ -841,7 +848,9 @@ static void dispatch_paged_attention_v2_online(
       && dtype_ok && query.dtype() == value_cache.dtype()
       && !use_turboquant && softcap <= 0.f && sinks == nullptr
       && sliding_window < 0 && gqa_page_size
-      && gqa_partition_size > 0;
+      && gqa_partition_size > 0
+      && paged_reduce_threadgroup_bytes(gqa_partitions) <=
+          d.mtl_device()->maxThreadgroupMemoryLength();
   if (gqa_decode) {
     const int gqa_num_partitions = static_cast<int>(gqa_partitions);
     const int gqa_group = num_heads / num_kv_heads;
@@ -2321,6 +2330,14 @@ NB_MODULE(_paged_ops, m) {
               max_seq_len <= 0 ||
               max_seq_len > static_cast<int64_t>(tables.shape(1)) * block_size) {
             throw std::invalid_argument("GQA test entry requires one supported decode row");
+          }
+          const int64_t num_partitions =
+              (static_cast<int64_t>(max_seq_len) + partition_size - 1) /
+              partition_size;
+          if (paged_reduce_threadgroup_bytes(num_partitions) >
+              metal::device(Device::gpu).mtl_device()->maxThreadgroupMemoryLength()) {
+            throw std::invalid_argument(
+                "GQA test partition exceeds the device threadgroup memory limit");
           }
           auto cu = array({0, 1}, int32);
           auto result = paged_attention_primitive_fn(

@@ -15,9 +15,6 @@ as [FA3 split selection](https://github.com/Dao-AILab/flash-attention/blob/main/
 and [ROCm partition choices](https://github.com/vllm-project/vllm/blob/main/csrc/rocm/attention.cu),
 not an equivalent cost model. FA3 also favors fewer splits near its estimated
 best efficiency; this implementation does not adopt its wave-efficiency model.
-A P1024 tier was evaluated but did not consistently beat P512 across the
-tested workloads, so P512 is the largest shipped tier. Some very-long-context
-P1024 measurements improved; this is not a claim that P1024 always loses.
 
 ## Automatic eligibility and partition selection
 
@@ -61,27 +58,23 @@ block16. Translated page IDs address their kernel-sized subpages even when
 upstream K/V storage remains unreshaped.
 
 The GQA producer walks pages rather than tokens. Lane 0 preloads the next
-block-table entry and `simd_shuffle` broadcasts it; a 4-token inner step
-overlaps independent QK dots with K/V latency. Every tier reads K/V
-straight from device memory: at the short-context lengths where the small
-tiers are selected the working set is L2-resident, and threadgroup
-staging of those tiers measured as a net cost at 32/8 and noise-level at
-16/2 on this device, so it is omitted here (see follow-ups). Online
-softmax stays in registers.
+valid block-table entry and `simd_shuffle` broadcasts it within each SIMD
+group. A 4-token inner step computes independent QK dots and combines their
+online-softmax update; a scalar remainder handles the final 1-3 tokens.
+Every tier reads K/V directly, without threadgroup staging or barriers.
+Online-softmax state stays in registers.
 
 The producer writes the same log2-space `(max, exp-sum)` plus
 epsilon-normalized `tmp_out` contract as split-KV. The shared
 `paged_attention_v2_reduce` therefore merges GQA partials unchanged:
-this path never modifies the reduce, so the established split-KV decode
-paths (multi-request, TurboQuant, sinks, every head size) keep their
-existing behavior and numerics byte-for-byte.
+the GQA producer does not require a separate reduction algorithm.
 
 Every eligible call additionally requires:
 
 - One pure-decode request, with `num_decode_requests` equal to 1 or omitted.
 - A verification window of at most 1.
 - Matching FP16/BF16 query, key-cache and value-cache types.
-- A kernel page size allowed above.
+- A kernel page size allowed above and sufficient reducer shared memory.
 - No TurboQuant, attention sinks, logit soft-capping or sliding window.
 - A known, positive GPU core count.
 
@@ -122,9 +115,11 @@ make missing writes observable even in a long context.
 The 1056-token upstream-page case also exercises the real block-table
 translation and unreshaped K/V storage: the block32 kernel addresses each
 translated page with its 32-token stride.
-Staged-path tests cover a 32-token kernel page (two 16-token tiles),
-partial last pages with `n_tok` in `{1,5,6,7,13,15}`, and the group-6
-round-robin used by 24/4/256.
+Remainder tests cover block16/block32 pages and final page lengths that
+exercise both the 4-token loop and the scalar tail. Long-context page
+tables use a bounded permutation to avoid inflating the physical cache.
+Resource-limit tests reject oversized forced partitions before Metal
+encoding, then check that a larger partition computes the same history.
 `tests/test_attention_sdpa.py` checks that the environment switch and scheduler
 decode count reach the primitive.
 
@@ -189,11 +184,6 @@ enablement or performance claims in #715:
    and multiple query rows. The existing verification kernel already shares
    KV across rows; compare against it while preserving causal masks and
    controlling register pressure. A larger gain is possible, not established.
-6. **Cross-device staging:** threadgroup K/V staging for the P64/P128
-   producer was implemented and measured (two controlled ablations on an
-   M5 Pro): a net cost at the 32/8 geometry and noise-level at 16/2, so
-   it is removed from the producer. The long-context regime, where the
-   KV working set exceeds L2 and staging does pay, needs a GQA-owned
-   P512 specialization first. Devices with a smaller L2 may land
-   elsewhere on the short-tier trade-off; re-implement and re-measure
-   there before treating staging as a cross-device win.
+6. **Cooperative K/V loading:** evaluate shared staging against direct
+   loads on each device, accounting for cache reuse, synchronization and
+   occupancy. Context length alone does not establish a benefit.

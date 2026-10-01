@@ -2074,7 +2074,7 @@ inline uint32_t gqa_broadcast_page_id(device const uint32_t *bt, int page,
 //
 // One threadgroup per (PARTITION_SIZE-token partition, kv head, sequence);
 // each simdgroup owns one query head of the GQA group. Co-locating these
-// heads improves KV cache locality.
+// heads can improve KV cache locality; each simdgroup issues its own K/V loads.
 //
 // The producer walks pages, not tokens: PARTITION_SIZE is a multiple of
 // BLOCK_SIZE so the partition start is page-aligned. Lane 0 preloads the
@@ -2082,10 +2082,8 @@ inline uint32_t gqa_broadcast_page_id(device const uint32_t *bt, int page,
 // same entry rather than staging the table in threadgroup memory. Full
 // pages run a 4-token inner step so independent QK dots overlap K/V
 // latency; a 1-3 token tail covers the last partial page. Every tier
-// reads K/V straight from device memory: at the short-context lengths
-// where the small tiers are selected the working set is L2-resident, so
-// threadgroup staging measured as a net cost (its barriers outweigh the
-// redundant reads they remove) and lives in a long-context follow-up.
+// reads K/V straight from device memory, without threadgroup staging or
+// barriers. Online-softmax state stays in registers.
 // Dispatch still accounts for the shape and device rather than context
 // length alone.
 //
