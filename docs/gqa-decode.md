@@ -140,10 +140,34 @@ The library-availability check loads all 24 active GQA specializations and
 their matching reducers even when the reported core count is unavailable.
 Validate the positive path on a capable GPU before reporting GQA coverage.
 
-`last_paged_dispatch()` records the last family selected in the process. It
-is suitable for serial tests and isolated worker checks; it is not
-per-request telemetry for concurrent serving. Evaluate the operation before
-reading it, because MLX builds graphs lazily.
+Dispatch diagnostics are disabled by default. The ordinary dispatch path
+reads one relaxed atomic flag and returns without writing diagnostic state.
+Serial tests and isolated benchmark workers explicitly enable recording:
+
+```python
+import mlx.core as mx
+from vllm_metal.metal import get_ops
+
+ops = get_ops()
+mx.synchronize()  # Toggle only while evaluation is idle.
+previous = ops._set_paged_dispatch_diagnostics(True)
+try:
+    # Run and evaluate the attention operation in this process.
+    ...
+    family = ops.last_paged_dispatch()
+    partition = ops.last_gqa_partition_size()
+finally:
+    mx.synchronize()
+    ops._set_paged_dispatch_diagnostics(previous)
+```
+
+Enable recording in the worker that executes attention, before its measured
+requests; enabling it only in the HTTP client does not observe the worker.
+Both toggles clear the last observation. While disabled, the getters return
+an empty family and partition zero. Recording changes neither routing nor
+attention computation. These are process-wide diagnostics, not per-request
+telemetry for concurrent serving. Evaluate the operation before reading its
+record, because MLX builds graphs lazily.
 
 For performance validation, rebuild native artifacts from the tested
 revision and use the real `vllm serve` process topology. Record the model,

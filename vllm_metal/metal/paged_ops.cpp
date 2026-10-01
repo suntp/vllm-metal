@@ -50,9 +50,21 @@ enum class PagedDispatch {
 };
 static std::atomic<PagedDispatch> g_last_dispatch{PagedDispatch::None};
 static std::atomic<int> g_last_gqa_partition{0};
+static std::atomic<bool> g_dispatch_diagnostics_enabled{false};
 inline void record_paged_dispatch(PagedDispatch family, int gqa_partition = 0) {
+  if (!g_dispatch_diagnostics_enabled.load(std::memory_order_relaxed)) return;
   g_last_dispatch.store(family, std::memory_order_relaxed);
   g_last_gqa_partition.store(gqa_partition, std::memory_order_relaxed);
+}
+
+static bool set_paged_dispatch_diagnostics(bool enabled) {
+  // Call only while evaluation is idle. Clear stale observations on both
+  // transitions so a disabled observer cannot report a previous request.
+  const bool previous =
+      g_dispatch_diagnostics_enabled.exchange(enabled, std::memory_order_relaxed);
+  g_last_dispatch.store(PagedDispatch::None, std::memory_order_relaxed);
+  g_last_gqa_partition.store(0, std::memory_order_relaxed);
+  return previous;
 }
 // Split only after eight KV partitions amortize the extra dispatch.
 constexpr int kMixedDecodeMinPartitions = 8;
@@ -2067,6 +2079,12 @@ NB_MODULE(_paged_ops, m) {
         &override_detected_gpu_core_count_for_test, nb::arg("cores"),
         "Test-only. A non-negative count replaces IORegistry detection; "
         "-1 restores hardware detection. Production routing must not call this.");
+  m.def("_set_paged_dispatch_diagnostics", &set_paged_dispatch_diagnostics,
+        nb::arg("enabled"),
+        "Private process-wide diagnostic opt-in; disabled by default. "
+        "Call with evaluation idle, in the worker that executes attention. "
+        "Clears the last family/partition and returns the previous enabled state. "
+        "This does not change attention routing or numerical computation.");
   m.def("gqa_decode_partition_size", &gqa_decode_partition_size,
         nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
         nb::arg("max_seq_len"), nb::arg("gpu_cores"),
@@ -2074,7 +2092,8 @@ NB_MODULE(_paged_ops, m) {
         "Functional dispatch checks also apply.");
   m.def("last_gqa_partition_size", []() {
     return g_last_gqa_partition.load(std::memory_order_relaxed);
-  }, "Partition selected by the most recent paged eval, or zero for a fallback. "
+  }, "Partition selected by the most recent recorded paged eval, or zero "
+     "when disabled, cleared or on a fallback. "
      "Process-wide diagnostic; not a request trace or routing input.");
   m.def("gqa_decode_shape_eligible", &gqa_decode_shape_eligible,
         nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
@@ -2454,11 +2473,11 @@ NB_MODULE(_paged_ops, m) {
         return names[static_cast<size_t>(
             g_last_dispatch.load(std::memory_order_relaxed))];
       },
-      "Dispatch family chosen by the most recent paged_attention_primitive "
+      "Dispatch family chosen by the most recent recorded paged_attention_primitive "
       "eval (\"gqa_decode\", \"per_token_ps0\", \"per_token_ps512\", "
       "\"window_ps0\", \"window_ps512\", \"nax_prefill\", "
       "\"tiled_prefill\", \"mixed_prefill_decode\"). Diagnostic surface for routing tests; empty "
-      "before the first eval.");
+      "when diagnostics are disabled, cleared or before the first recorded eval.");
 
   m.def("gdn_linear_attention",
         [](nb::handle q, nb::handle k, nb::handle v,

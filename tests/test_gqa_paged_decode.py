@@ -10,6 +10,9 @@ fallback paths against attention references; timing is deliberately excluded.
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -56,6 +59,17 @@ def _restore_test_gpu_cores() -> None:
     ops._override_detected_gpu_core_count_for_test(-1)
     if ops.detected_gpu_core_count() <= 0:
         ops._override_detected_gpu_core_count_for_test(10)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _enable_dispatch_diagnostics():
+    ops = get_ops()
+    previous = ops._set_paged_dispatch_diagnostics(True)
+    try:
+        yield
+    finally:
+        mx.synchronize()
+        ops._set_paged_dispatch_diagnostics(previous)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -356,6 +370,63 @@ def _run_primitive(
         ).reshape(out.shape)
     mx.eval(ref)
     return out, ref
+
+
+def test_dispatch_diagnostics_are_disabled_in_a_fresh_process() -> None:
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from vllm_metal.metal import get_ops; "
+            "ops = get_ops(); "
+            "assert ops._set_paged_dispatch_diagnostics(False) is False; "
+            "assert ops.last_paged_dispatch() == ''; "
+            "assert ops.last_gqa_partition_size() == 0",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.mark.parametrize("gqa_disabled", [False, True])
+def test_dispatch_diagnostics_require_opt_in(gqa_disabled) -> None:
+    ops = get_ops()
+    mx.synchronize()
+    previous = ops._set_paged_dispatch_diagnostics(False)
+    kwargs = {
+        "kv_lens": [_eligible_context(minimum=64)],
+        "dtype": mx.bfloat16,
+        "interleaved": True,
+        "seed": 715,
+        "gqa_disabled": gqa_disabled,
+    }
+    try:
+        unrecorded, reference = _run_primitive(**kwargs)
+        assert ops.last_paged_dispatch() == ""
+        assert ops.last_gqa_partition_size() == 0
+        assert ops._set_paged_dispatch_diagnostics(True) is False
+        recorded, _ = _run_primitive(**kwargs)
+        if gqa_disabled:
+            _assert_fallback()
+            assert ops.last_gqa_partition_size() == 0
+        else:
+            assert ops.last_paged_dispatch() == "gqa_decode"
+            assert ops.last_gqa_partition_size() == 64
+        _assert_close(unrecorded, reference, mx.bfloat16)
+        np.testing.assert_array_equal(
+            np.array(unrecorded.astype(mx.float32)),
+            np.array(recorded.astype(mx.float32)),
+        )
+        assert ops._set_paged_dispatch_diagnostics(False) is True
+        assert ops.last_paged_dispatch() == ""
+        assert ops.last_gqa_partition_size() == 0
+        _run_primitive(**kwargs)
+        assert ops.last_paged_dispatch() == ""
+        assert ops.last_gqa_partition_size() == 0
+    finally:
+        mx.synchronize()
+        ops._set_paged_dispatch_diagnostics(previous)
 
 
 def test_gqa_decode_kernel_is_in_default_library() -> None:
