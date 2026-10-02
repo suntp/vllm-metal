@@ -61,7 +61,7 @@ from vllm_metal.attention.impls.turboquant_prefill import (
 from vllm_metal.attention.impls.varlen_rope_compat import (
     apply_attention_rope,
 )
-from vllm_metal.metal import get_ops
+from vllm_metal.metal import get_ops, paged_attention_capabilities
 from vllm_metal.metal.constants import KERNEL_BLOCK_SIZES
 
 logger = init_logger(__name__)
@@ -994,7 +994,21 @@ def sdpa_forward(
         # Whole-batch decode routing belongs to the ordinary cache path. TQ
         # uses its own sub-batch metadata and stays outside native decode split.
         paged_kwargs: dict[str, int | mx.array] = dict(mm_kwargs)
-        if bool(getattr(ops, "supports_decode_routing_metadata", lambda: False)()):
+        if ctx.paged_native_capabilities is None:
+            ctx.paged_native_capabilities = paged_attention_capabilities(ops)
+        capabilities = ctx.paged_native_capabilities
+        # Omit the new keyword on the default path for older native builds.
+        if ctx.gqa_disabled:
+            if capabilities["gqa_disable"]:
+                paged_kwargs["gqa_disabled"] = True
+            elif capabilities["gqa_decode"]:
+                # Never silently ignore a kill switch on an unrecognized GQA build.
+                raise RuntimeError(
+                    "Loaded native GQA build does not advertise disable support; "
+                    "rebuild the vllm-metal native extension."
+                )
+            # Pre-GQA native builds already use the established attention path.
+        if capabilities["decode_routing_metadata"]:
             paged_kwargs.update(
                 num_decode_requests=ctx.num_decode_requests,
                 num_decode_tokens=ctx.num_decode_tokens,

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Numerical and cache-layout coverage for the private P256/P512 GQA kernels.
 
-Tests force each specialization without GPU core detection. Public paged
-attention still uses the established kernels; automatic routing is separate.
+Tests force each specialization without GPU core detection. Production
+selection and fallback are covered separately in test_gqa_decode_routing.py.
 """
 
 from __future__ import annotations
@@ -16,6 +16,16 @@ import pytest
 
 from tools.attention_bench_utils import attention_tolerances, ref_paged_attn
 from vllm_metal.metal import get_ops
+
+# The native dispatcher owns the supported domain. Parametrize the positive
+# matrices from that table, while routing tests keep independent boundary and
+# rejection expectations. A missing table must fail rather than skip coverage.
+GQA_CONFIG = get_ops()._gqa_decode_config_for_test()
+GQA_GEOMETRIES = tuple(tuple(row) for row in GQA_CONFIG["geometries"])
+GQA_PARTITIONS = tuple(sorted(GQA_CONFIG["partitions"]))
+GQA_SIMD_GROUPS_PER_CORE = GQA_CONFIG["simd_groups_per_core"]
+assert GQA_GEOMETRIES and GQA_PARTITIONS
+assert len(GQA_GEOMETRIES) == len(set(GQA_GEOMETRIES))
 
 NUM_QUERY_HEADS = 32
 NUM_KV_HEADS = 8
@@ -266,7 +276,7 @@ def test_dispatch_diagnostics_are_disabled_in_a_fresh_process() -> None:
     )
 
 
-@pytest.mark.parametrize("test_partition", [None, 256, 512])
+@pytest.mark.parametrize("test_partition", [None, *GQA_PARTITIONS])
 def test_dispatch_diagnostics_require_opt_in(test_partition) -> None:
     ops = get_ops()
     mx.synchronize()
@@ -315,18 +325,9 @@ def test_gqa_decode_kernel_is_in_default_library() -> None:
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("part", [256, 512])
+@pytest.mark.parametrize("part", GQA_PARTITIONS)
 @pytest.mark.parametrize("tail", [False, True])
-@pytest.mark.parametrize(
-    "q,kv,head,block",
-    [
-        (32, 8, 128, 16),
-        (24, 4, 256, 16),
-        (16, 2, 128, 16),
-        (16, 2, 256, 16),
-        (16, 2, 256, 32),
-    ],
-)
+@pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
 def test_gqa_kernel_numerics_without_core_detection(
     dtype, part, tail, q, kv, head, block
 ):
@@ -348,16 +349,9 @@ def test_gqa_kernel_numerics_without_core_detection(
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("part", [256, 512])
+@pytest.mark.parametrize("part", GQA_PARTITIONS)
 @pytest.mark.parametrize("n_tok", [1, 5, 6, 7, 13, 15])
-@pytest.mark.parametrize(
-    "q,kv,head,block",
-    [
-        (24, 4, 256, 16),  # G=6 geometry.
-        (16, 2, 256, 32),  # block32: the last page spans two 16-token groups.
-        (16, 2, 128, 16),
-    ],
-)
+@pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
 def test_gqa_partial_page_tails(dtype, part, n_tok, q, kv, head, block):
     """Partition remainder pages, including n_tok % 4 != 0."""
     # One full partition plus a last page of n_tok tokens; the tail falls
@@ -476,17 +470,14 @@ def test_forced_partition_rejects_oversized_reducer(partition):
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("test_partition", [256, 512])
+@pytest.mark.parametrize("test_partition", GQA_PARTITIONS)
 @pytest.mark.parametrize(
     "q_heads,kv_heads,head,block_size",
-    [
-        (32, 8, 128, 16),
-        (24, 4, 256, 16),
-        (24, 4, 256, 784),
-        (16, 2, 256, 16),
-        (16, 2, 256, 32),
-        (16, 2, 256, 1056),  # Actual hybrid scheduler-page translation.
-    ],
+    GQA_GEOMETRIES
+    + tuple(
+        (q, kv, head, {16: 784, 32: 1056}[block])
+        for q, kv, head, block in GQA_GEOMETRIES
+    ),
 )
 def test_gqa_reads_upstream_views_after_writes_and_block_copy(
     dtype, test_partition, q_heads, kv_heads, head, block_size
@@ -616,19 +607,10 @@ def test_gqa_reads_upstream_views_after_writes_and_block_copy(
         _assert_close(out, ref, dtype)
 
 
-@pytest.mark.parametrize(
-    "q,kv,head,block_size",
-    [
-        (32, 8, 128, 16),
-        (24, 4, 256, 16),
-        (16, 2, 128, 16),
-        (16, 2, 256, 16),
-        (16, 2, 256, 32),
-    ],
-)
+@pytest.mark.parametrize("q,kv,head,block_size", GQA_GEOMETRIES)
 @pytest.mark.parametrize("n", [131071, 131072, 131073, 196608, 262144, 262145])
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("part", [256, 512])
+@pytest.mark.parametrize("part", GQA_PARTITIONS)
 @pytest.mark.slow
 def test_each_geometry_at_long_context(q, kv, head, block_size, n, dtype, part):
     """Opt-in long-context matrix; regular CI covers every specialization above."""
@@ -650,14 +632,14 @@ def test_each_geometry_at_long_context(q, kv, head, block_size, n, dtype, part):
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("n", [1024, 32769])
-def test_private_kernels_do_not_enable_production_routing(dtype, n):
+def test_private_kernels_do_not_change_production_routing(dtype, n):
     ops = get_ops()
-    assert ops.paged_attention_capabilities() == {
-        "gqa_decode": False,
-        "gqa_disable": False,
-        "decode_routing_metadata": True,
-    }
     out, ref = _run_primitive([n], dtype, interleaved=True, seed=715)
-    _assert_fallback()
-    assert ops.last_gqa_partition_size() == 0
+    expected = (ops.last_paged_dispatch(), ops.last_gqa_partition_size())
+    _run_primitive([n], dtype, interleaved=True, seed=715, test_partition=256)
+    repeated, _ = _run_primitive([n], dtype, interleaved=True, seed=715)
+    assert (ops.last_paged_dispatch(), ops.last_gqa_partition_size()) == expected
     _assert_close(out, ref, dtype)
+    np.testing.assert_array_equal(
+        np.array(out.astype(mx.float32)), np.array(repeated.astype(mx.float32))
+    )

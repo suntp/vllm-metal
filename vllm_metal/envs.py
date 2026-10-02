@@ -121,6 +121,7 @@ if TYPE_CHECKING:
     VLLM_METAL_NATIVE_SAMPLING: bool = False
     VLLM_METAL_MLA_KERNEL: bool = False
     VLLM_METAL_DISABLE_NAX: bool = False
+    VLLM_METAL_DISABLE_GQA_DECODE: bool = False
     VLLM_METAL_TQ_PREFILL: str = "auto"
     VLLM_METAL_TQ_PREFILL_MAX_MIB: int | str = "auto"
     VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
@@ -181,6 +182,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAL_MLA_KERNEL": _bool("VLLM_METAL_MLA_KERNEL", False),
     # Emergency override for automatic M5 NAX prefill attention.
     "VLLM_METAL_DISABLE_NAX": _bool("VLLM_METAL_DISABLE_NAX", False),
+    # Emergency override for the GQA-shared flash-decode dispatch gate
+    # (issue #713): force long-context decode back to the established
+    # per-token / split-KV kernels. Mainly a benchmarking/A-B escape
+    # hatch so controlled comparisons can run under the server topology.
+    "VLLM_METAL_DISABLE_GQA_DECODE": _bool("VLLM_METAL_DISABLE_GQA_DECODE", False),
     # TQ materialized prefill: auto enables only when NAX is available;
     # 1 explicitly opts into tiled prefill on older GPUs, 0 disables it.
     "VLLM_METAL_TQ_PREFILL": _choice("VLLM_METAL_TQ_PREFILL", "auto", TQ_PREFILL_MODES),
