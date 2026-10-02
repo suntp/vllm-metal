@@ -14,6 +14,9 @@
 
 using namespace metal;
 
+// Shared normalization contract for split-KV producers and their reducer.
+constant constexpr float kPagedAttentionSoftmaxEpsilon = 1e-6f;
+
 // ========================================== Generic vector types
 // NOTE: Vec<T, VEC_SIZE> is declared in utils.metal.
 // Specializations for char are in turboquant.metal.
@@ -1277,7 +1280,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
     }
 
     // Final normalization: O = O / l
-    const float inv_l = 1.f / (warp_l + 1e-6f);
+    const float inv_l = 1.f / (warp_l + kPagedAttentionSoftmaxEpsilon);
 
     device T *out_ptr =
         out + q_token_idx * num_heads * max_num_partitions * HEAD_SIZE +
@@ -1805,7 +1808,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
       }
 
       // Final normalization: O = O / l
-      const float inv_l = 1.f / (warp_l[r] + 1e-6f);
+      const float inv_l = 1.f / (warp_l[r] + kPagedAttentionSoftmaxEpsilon);
 
       device T *out_ptr =
           out + out_row * num_heads * max_num_partitions * HEAD_SIZE +
@@ -1984,7 +1987,8 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
     global_exp_sum += exp2(sinks[head_idx] * M_LOG2E_F - max_logit);
   }
 
-  const float inv_global_exp_sum = 1.0f / (global_exp_sum + 1e-6f);
+  const float inv_global_exp_sum =
+      1.0f / (global_exp_sum + kPagedAttentionSoftmaxEpsilon);
 
   // ========================================================================
   // Aggregate tmp_out to out.
@@ -2053,6 +2057,202 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
       }
       out_ptr[i] = T(acc);
     }
+  }
+}
+
+inline uint32_t gqa_broadcast_page_id(device const uint32_t *bt, int page,
+                                      uint lane) {
+  uint32_t page_id = 0;
+  if (lane == 0) {
+    page_id = bt[page];
+  }
+  return simd_shuffle(page_id, 0);
+}
+
+// ---------------------------------------------------------------------------
+// GQA-shared flash-decode pass for pure-decode batches.
+//
+// One threadgroup per (PARTITION_SIZE-token partition, kv head, sequence);
+// each simdgroup owns one query head of the GQA group. Co-locating these
+// heads can improve KV cache locality; each simdgroup issues its own K/V loads.
+//
+// The producer walks pages, not tokens: PARTITION_SIZE is a multiple of
+// BLOCK_SIZE so the partition start is page-aligned. Lane 0 preloads the
+// next page_id and simd_shuffle broadcasts it; each simdgroup reloads the
+// same entry rather than staging the table in threadgroup memory. Full
+// pages run a 4-token inner step so independent QK dots overlap K/V
+// latency; a 1-3 token tail covers the last partial page. Every tier
+// reads K/V straight from device memory, without threadgroup staging or
+// barriers. Online-softmax state stays in registers.
+// Dispatch still accounts for the shape and device rather than context
+// length alone.
+//
+// Partials are written in the exact contract paged_attention_v2_reduce
+// consumes: log2-space running (max, exp-sum) stats plus the
+// epsilon-normalised partial at tmp_out[token, head, partition, :], so the
+// existing reduce pass merges them unchanged.  Engaged only for pure-decode
+// batches without TurboQuant/FP8/sinks/softcap/sliding-window (dispatch gate
+// in paged_ops.cpp); everything else keeps the established paths.
+template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
+[[kernel]] void paged_attention_gqa_decode(
+    device float *exp_sums [[buffer(0)]], device float *max_logits [[buffer(1)]],
+    device T *tmp_out [[buffer(2)]], device const T *q [[buffer(3)]],
+    device const T *k_cache [[buffer(4)]], device const T *v_cache [[buffer(5)]],
+    const constant int &num_kv_heads [[buffer(8)]],
+    const constant float &scale [[buffer(9)]],
+    device const uint32_t *block_tables [[buffer(11)]],
+    device const uint32_t *context_lens [[buffer(12)]],
+    const constant int &max_num_blocks_per_seq [[buffer(13)]],
+    const constant int &q_stride [[buffer(15)]],
+    const constant int &kv_block_stride [[buffer(16)]],
+    const constant int &kv_head_stride [[buffer(17)]],
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 tg_per_grid [[threadgroups_per_grid]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  static_assert(HEAD_SIZE % 32 == 0, "one lane-strided slice per lane");
+  static_assert(PARTITION_SIZE % BLOCK_SIZE == 0,
+                "partition start is page-aligned");
+  constexpr int SLICE = HEAD_SIZE / 32;  // elements per lane
+  const int partition_idx = tg_pos.x;
+  const int kv_head_idx = tg_pos.y;
+  const int seq_idx = tg_pos.z;
+  const int context_len = static_cast<int>(context_lens[seq_idx]);
+  const int t0 = partition_idx * PARTITION_SIZE;
+  if (t0 >= context_len) {
+    // The reduce reads only ceil(context_len / PARTITION_SIZE) partitions,
+    // so stats for later partitions are never consumed (same early-out as
+    // the partitioned per-token kernel).
+    return;
+  }
+  const int t_end = min(t0 + PARTITION_SIZE, context_len);
+
+  const int group = tptg.x / 32;  // query heads per kv head (GQA group)
+  const int head_idx = kv_head_idx * group + static_cast<int>(sg);
+  const int num_heads = num_kv_heads * group;
+  const int max_num_partitions = tg_per_grid.x;
+  const int64_t kv_token_stride =
+      static_cast<int64_t>(num_kv_heads) * kv_head_stride;
+
+  // Lane-strided query slice, loaded once.
+  device const T *q_ptr =
+      q + seq_idx * q_stride + head_idx * HEAD_SIZE + lane * SLICE;
+  float qv[SLICE];
+#pragma unroll
+  for (int i = 0; i < SLICE; i++) {
+    qv[i] = float(q_ptr[i]);
+  }
+
+  device const uint32_t *bt =
+      block_tables + seq_idx * max_num_blocks_per_seq;
+
+  // Online softmax in log2 space (v2_reduce contract): folding log2(e) into
+  // the scale turns every exp into a 1-instruction exp2 on Apple GPUs.
+  float m = -FLT_MAX;
+  float l = 0.f;
+  float acc[SLICE] = {0.f};
+  const float log2e_scale = scale * M_LOG2E_F;
+  const int page0 = t0 / BLOCK_SIZE;
+  const int page_end = (t_end + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  uint32_t page_id = gqa_broadcast_page_id(bt, page0, lane);
+  uint32_t next_page_id = page_id;
+  if (page0 + 1 < page_end) {
+    next_page_id = gqa_broadcast_page_id(bt, page0 + 1, lane);
+  }
+  for (int page = page0; page < page_end; page++) {
+    const uint32_t cur_page = page_id;
+    page_id = next_page_id;
+    if (page + 2 < page_end) {
+      next_page_id = gqa_broadcast_page_id(bt, page + 2, lane);
+    }
+    const int tok0 = page * BLOCK_SIZE;
+    const int tok1 = min(tok0 + BLOCK_SIZE, t_end);
+    const int64_t page_kv = static_cast<int64_t>(cur_page) * kv_block_stride +
+                            kv_head_idx * kv_head_stride;
+    const int64_t page_base =
+        page_kv + static_cast<int64_t>(lane) * SLICE;
+    int t = tok0;
+    for (; t + 4 <= tok1; t += 4) {
+      const int64_t r0 = page_base + (t - tok0) * kv_token_stride;
+      const int64_t r1 = r0 + kv_token_stride;
+      const int64_t r2 = r1 + kv_token_stride;
+      const int64_t r3 = r2 + kv_token_stride;
+      device const T *k0 = k_cache + r0;
+      device const T *k1 = k_cache + r1;
+      device const T *k2 = k_cache + r2;
+      device const T *k3 = k_cache + r3;
+      float d0 = 0.f;
+      float d1 = 0.f;
+      float d2 = 0.f;
+      float d3 = 0.f;
+#pragma unroll
+      for (int i = 0; i < SLICE; i++) {
+        d0 += qv[i] * float(k0[i]);
+        d1 += qv[i] * float(k1[i]);
+        d2 += qv[i] * float(k2[i]);
+        d3 += qv[i] * float(k3[i]);
+      }
+      const float s0 = simd_sum(d0) * log2e_scale;
+      const float s1 = simd_sum(d1) * log2e_scale;
+      const float s2 = simd_sum(d2) * log2e_scale;
+      const float s3 = simd_sum(d3) * log2e_scale;
+      // Joint max is the same online-softmax identity as four serial
+      // updates. exp2(-FLT_MAX - s) == 0 under -fno-fast-math, so the
+      // first-iteration rescale needs no guard.
+      const float m_new = max(m, max(max(s0, s1), max(s2, s3)));
+      const float alpha = exp2(m - m_new);
+      const float p0 = exp2(s0 - m_new);
+      const float p1 = exp2(s1 - m_new);
+      const float p2 = exp2(s2 - m_new);
+      const float p3 = exp2(s3 - m_new);
+      l = l * alpha + p0 + p1 + p2 + p3;
+      device const T *v0 = v_cache + r0;
+      device const T *v1 = v_cache + r1;
+      device const T *v2 = v_cache + r2;
+      device const T *v3 = v_cache + r3;
+#pragma unroll
+      for (int i = 0; i < SLICE; i++) {
+        acc[i] = acc[i] * alpha + p0 * float(v0[i]) + p1 * float(v1[i]) +
+                 p2 * float(v2[i]) + p3 * float(v3[i]);
+      }
+      m = m_new;
+    }
+    for (; t < tok1; t++) {
+      const int64_t row = page_base + (t - tok0) * kv_token_stride;
+      device const T *krow = k_cache + row;
+      float dot = 0.f;
+#pragma unroll
+      for (int i = 0; i < SLICE; i++) {
+        dot += qv[i] * float(krow[i]);
+      }
+      const float s = simd_sum(dot) * log2e_scale;
+      const float m_new = max(m, s);
+      const float alpha = exp2(m - m_new);
+      const float p = exp2(s - m_new);
+      l = l * alpha + p;
+      device const T *vrow = v_cache + row;
+#pragma unroll
+      for (int i = 0; i < SLICE; i++) {
+        acc[i] = acc[i] * alpha + p * float(vrow[i]);
+      }
+      m = m_new;
+    }
+  }
+
+  const int64_t pidx =
+      (static_cast<int64_t>(seq_idx) * num_heads + head_idx) *
+          max_num_partitions +
+      partition_idx;
+  if (lane == 0) {
+    max_logits[pidx] = m;
+    exp_sums[pidx] = l;
+  }
+  device T *out_ptr = tmp_out + pidx * HEAD_SIZE + lane * SLICE;
+  const float inv_l = 1.f / (l + kPagedAttentionSoftmaxEpsilon);
+#pragma unroll
+  for (int i = 0; i < SLICE; i++) {
+    out_ptr[i] = T(acc[i] * inv_l);
   }
 }
 
@@ -2254,3 +2454,53 @@ instantiate_paged_attention_v1(half, char, uchar, 32);
 instantiate_paged_attention_v2(float, char, uchar, 32);
 instantiate_paged_attention_v2(bfloat16_t, char, uchar, 32);
 instantiate_paged_attention_v2(half, char, uchar, 32);
+
+// Compile only the dispatch domain: head128/256 with block16, plus the
+// head256 block32 view used by the 16q/2kv hybrid geometry, in FP16/BF16.
+#define instantiate_gqa_decode_inner(type, head_size, block_size,            \
+                                     partition_size)                         \
+  template [[host_name("paged_attention_gqa_decode_" #type "_hs" #head_size  \
+                       "_bs" #block_size "_ps" #partition_size)]]            \
+  [[kernel]] void paged_attention_gqa_decode<type, head_size, block_size,    \
+                                             partition_size>(                \
+      device float *exp_sums [[buffer(0)]],                                  \
+      device float *max_logits [[buffer(1)]], device type *tmp_out           \
+      [[buffer(2)]],                                                         \
+      device const type *q [[buffer(3)]],                                    \
+      device const type *k_cache [[buffer(4)]],                              \
+      device const type *v_cache [[buffer(5)]],                              \
+      const constant int &num_kv_heads [[buffer(8)]],                        \
+      const constant float &scale [[buffer(9)]],                             \
+      device const uint32_t *block_tables [[buffer(11)]],                    \
+      device const uint32_t *context_lens [[buffer(12)]],                    \
+      const constant int &max_num_blocks_per_seq [[buffer(13)]],             \
+      const constant int &q_stride [[buffer(15)]],                           \
+      const constant int &kv_block_stride [[buffer(16)]],                    \
+      const constant int &kv_head_stride [[buffer(17)]],                     \
+      uint3 tg_pos [[threadgroup_position_in_grid]],                         \
+      uint3 tg_per_grid [[threadgroups_per_grid]],                           \
+      uint3 tptg [[threads_per_threadgroup]],                                \
+      uint sg [[simdgroup_index_in_threadgroup]],                            \
+      uint lane [[thread_index_in_simdgroup]]);
+
+#define instantiate_gqa_decode(type, partition_size)                         \
+  instantiate_gqa_decode_inner(type, 128, 16, partition_size);               \
+  instantiate_gqa_decode_inner(type, 256, 16, partition_size);               \
+  instantiate_gqa_decode_inner(type, 256, 32, partition_size);
+
+instantiate_gqa_decode(bfloat16_t, VLLM_METAL_PARTITION_SIZE);
+instantiate_gqa_decode(half, VLLM_METAL_PARTITION_SIZE);
+
+// Smaller GQA partitions and matching reducers for the default selector.
+// Established per-token and split-KV kernels remain at their original size.
+instantiate_gqa_decode(bfloat16_t, 256);
+instantiate_gqa_decode(half, 256);
+
+#define instantiate_gqa_small_reduce(type, partition_size)                    \
+  instantiate_paged_attention_v2_reduce_inner(type, 128, 256, 32,            \
+                                              partition_size);              \
+  instantiate_paged_attention_v2_reduce_inner(type, 256, 256, 32,            \
+                                              partition_size);
+
+instantiate_gqa_small_reduce(bfloat16_t, 256);
+instantiate_gqa_small_reduce(half, 256);

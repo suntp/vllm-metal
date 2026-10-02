@@ -9,6 +9,15 @@ import mlx.core as mx
 import numpy as np
 
 
+def attention_tolerances(
+    dtype: mx.Dtype, *, float32_tolerance: float = 1e-3
+) -> tuple[float, float]:
+    """Shared paged-attention atol/rtol; FP32 oracles may request tighter bounds."""
+    if dtype == mx.float32:
+        return float32_tolerance, float32_tolerance
+    return {mx.bfloat16: (3e-2, 2e-2), mx.float16: (1.5e-2, 2e-2)}[dtype]
+
+
 def package_versions(*names: str) -> dict[str, str | None]:
     """Record versions without requiring every distribution to be installed."""
     versions: dict[str, str | None] = {}
