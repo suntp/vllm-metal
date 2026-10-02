@@ -385,6 +385,37 @@ def test_private_gqa_entry_rejects_unshipped_partitions(part):
         _run_primitive([65], mx.float16, interleaved=False, seed=0, test_partition=part)
 
 
+@pytest.mark.parametrize("cache", ["key", "value"])
+@pytest.mark.parametrize(
+    "query_dtype,cache_dtype",
+    [(mx.float16, mx.bfloat16), (mx.bfloat16, mx.float16), (mx.float16, mx.float32)],
+)
+def test_private_gqa_entry_rejects_mismatched_cache_dtype(
+    cache, query_dtype, cache_dtype
+):
+    query = mx.zeros((1, 32, 128), dtype=query_dtype)
+    key = mx.zeros((2, 16, 8, 128), dtype=query_dtype)
+    value = mx.zeros(key.shape, dtype=query_dtype)
+    if cache == "key":
+        key = key.astype(cache_dtype)
+    else:
+        value = value.astype(cache_dtype)
+    # Rejection must happen before a lazy kernel can reinterpret either cache.
+    with pytest.raises(ValueError, match="requires one supported decode row"):
+        get_ops()._gqa_paged_attention_for_test(
+            query,
+            key,
+            value,
+            128**-0.5,
+            mx.array([[0, 1]], dtype=mx.int32),
+            mx.array([17], dtype=mx.int32),
+            16,
+            17,
+            256,
+            mx.array(0),
+        )
+
+
 def test_private_gqa_partition_is_local_to_lazy_primitive():
     """Building another node must not change a pending node or production routing."""
     ops = get_ops()
@@ -598,7 +629,9 @@ def test_gqa_reads_upstream_views_after_writes_and_block_copy(
 @pytest.mark.parametrize("n", [131071, 131072, 131073, 196608, 262144, 262145])
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("part", [256, 512])
+@pytest.mark.slow
 def test_each_geometry_at_long_context(q, kv, head, block_size, n, dtype, part):
+    """Opt-in long-context matrix; regular CI covers every specialization above."""
     out, ref = _run_primitive(
         [n],
         dtype,

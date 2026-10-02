@@ -15,7 +15,12 @@ def attention_tolerances(
     """Shared paged-attention atol/rtol; FP32 oracles may request tighter bounds."""
     if dtype == mx.float32:
         return float32_tolerance, float32_tolerance
-    return {mx.bfloat16: (3e-2, 2e-2), mx.float16: (1.5e-2, 2e-2)}[dtype]
+    try:
+        return {mx.bfloat16: (3e-2, 2e-2), mx.float16: (1.5e-2, 2e-2)}[dtype]
+    except KeyError:
+        raise ValueError(
+            f"Unsupported attention dtype {dtype}; expected float16, bfloat16 or float32"
+        ) from None
 
 
 def package_versions(*names: str) -> dict[str, str | None]:

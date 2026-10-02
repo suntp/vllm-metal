@@ -572,13 +572,6 @@ static void dispatch_paged_attention_v2_reduce(
       rname, lib, rhash,
       {{&use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)},
        {&use_tq_fc, MTL::DataType::DataTypeBool, NS::UInteger(50)}});
-  if (use_tq_fc && head_size != 64 && head_size != 128 && head_size != 256 &&
-      head_size != 512) {
-    throw std::invalid_argument(
-        "TurboQuant paged reduce requires head_size in {64, 128, 256, 512} "
-        "(got " +
-        std::to_string(head_size) + ")");
-  }
   const size_t reduce_shmem = paged_reduce_threadgroup_bytes(max_num_partitions);
   const size_t capacity = d.mtl_device()->maxThreadgroupMemoryLength();
   if (reduce_shmem > capacity ||
@@ -793,7 +786,8 @@ static void dispatch_paged_attention_v2_online(
   const bool gqa_decode =
       pure_decode && window_seqlen_q <= 1 && gqa_single_request
       && (query.dtype() == float16 || query.dtype() == bfloat16)
-      && dtype_ok && query.dtype() == value_cache.dtype()
+      && query.dtype() == key_cache.dtype()
+      && query.dtype() == value_cache.dtype()
       && !use_turboquant && softcap <= 0.f && sinks == nullptr
       && sliding_window < 0 && gqa_page_size
       && gqa_partition_size > 0

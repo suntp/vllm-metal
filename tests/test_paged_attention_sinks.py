@@ -33,6 +33,7 @@ from __future__ import annotations
 import mlx.core as mx
 import pytest
 
+from tools.attention_bench_utils import attention_tolerances
 from vllm_metal.metal import get_ops
 
 HEAD_SIZE = 128
@@ -42,13 +43,6 @@ GPT_OSS_NUM_Q_HEADS = 64
 GPT_OSS_NUM_KV_HEADS = 8
 GPT_OSS_PREFILL_CTX = 64
 GPT_OSS_PREFILL_LEN = 64
-
-# Matched to the repo's existing paged-attention parity tolerances.
-_TOLERANCES = {
-    mx.bfloat16: (3e-2, 2e-2),
-    mx.float16: (1.5e-2, 2e-2),
-    mx.float32: (1e-3, 1e-3),
-}
 
 
 def _sinks(num_q_heads: int, value: float | None = None) -> mx.array:
@@ -175,7 +169,7 @@ def _run_prefill(
 
 
 def _assert_close(got: mx.array, ref: mx.array, dtype: mx.Dtype) -> None:
-    atol, rtol = _TOLERANCES[dtype]
+    atol, rtol = attention_tolerances(dtype)
     assert mx.allclose(got, ref, atol=atol, rtol=rtol), (
         f"max abs diff {float(mx.max(mx.abs(got - ref))):.3e} exceeds atol={atol}"
     )

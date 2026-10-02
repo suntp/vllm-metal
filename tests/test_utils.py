@@ -9,8 +9,13 @@ from unittest.mock import Mock
 import mlx.core as mx
 import pytest
 
-from tools.attention_bench_utils import package_versions
+from tools.attention_bench_utils import attention_tolerances, package_versions
 from vllm_metal.utils import get_model_download_path, set_wired_limit
+
+
+def test_attention_tolerances_reject_unsupported_dtype():
+    with pytest.raises(ValueError, match="expected float16, bfloat16 or float32"):
+        attention_tolerances(mx.int32)
 
 
 def test_benchmark_versions_allow_missing_distributions(monkeypatch):
