@@ -68,6 +68,163 @@ def test_batch_planner_requires_known_cores(cores):
     )
 
 
+@pytest.mark.parametrize(
+    "cores,q,kv,head,batch,entry,promotion",
+    [
+        (10, 32, 8, 128, 3, 1024, 2048),
+        (10, 24, 4, 256, 4, 1024, 2048),
+        (10, 16, 2, 128, 5, 1280, 2560),
+        (20, 32, 8, 128, 5, 1280, 2560),
+        (20, 24, 4, 256, 7, 1024, 2048),
+        (20, 16, 2, 256, 10, 1280, 2560),
+    ],
+)
+def test_cross_device_batch_boundaries(cores, q, kv, head, batch, entry, promotion):
+    # Fixed expectations independent of the planner, including integer rounding
+    # at the first batch admitted above the former unsplit-grid veto.
+    for length, expected in (
+        (entry - 1, 0),
+        (entry, 256),
+        (promotion - 1, 256),
+        (promotion, 512),
+    ):
+        assert (
+            get_ops().gqa_decode_batch_partition_size(
+                q, kv, head, [length] * batch, cores
+            )
+            == expected
+        )
+
+
+def test_reduce_offsets_cross_int32_boundary_without_large_buffers():
+    import re
+    from pathlib import Path
+
+    import vllm_metal.metal
+
+    # Compile the production reducer's offset helper, not a copied expression.
+    # This exercises Metal integer promotion using only a few output elements.
+    source = (
+        Path(vllm_metal.metal.__file__).parent / "kernels_v2/pagedattention.metal"
+    ).read_text()
+    helper = re.search(r"inline int64_t paged_attention_reduce_offset\([^}]+\}", source)
+    assert helper is not None
+    rows = [
+        (1023, 31, 32, 512, 128),
+        (1024, 0, 32, 512, 128),
+        (2048, 0, 32, 512, 128),
+        (1024, 0, 32, 512, 1),  # FP32 statistics offset.
+        (1024, 0, 32, 1, 128),  # Final output offset.
+    ]
+    probe = mx.fast.metal_kernel(
+        name="test_paged_reduce_offsets",
+        input_names=["args"],
+        output_names=["offsets"],
+        header=helper.group(),
+        source="""
+            uint i = thread_position_in_grid.x;
+            offsets[i] = paged_attention_reduce_offset(
+                args[5*i], args[5*i+1], args[5*i+2], args[5*i+3], args[5*i+4]);
+        """,
+    )
+    actual = probe(
+        inputs=[mx.array(rows, mx.int32)],
+        grid=(len(rows), 1, 1),
+        threadgroup=(len(rows), 1, 1),
+        output_shapes=[(len(rows),)],
+        output_dtypes=[mx.int64],
+    )[0]
+    assert actual.tolist() == [2147418112, 2147483648, 4294967296, 16777216, 4194304]
+
+
+def test_forward_context_reorder_and_membership_survive_deferred_evaluation(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    import mlx.nn as nn
+
+    from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+    from vllm_metal.attention.context import clear_context, get_context, prepare_grouped
+    from vllm_metal.attention.impls.sdpa import sdpa_forward
+
+    monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", "0")
+    get_ops()._override_detected_gpu_core_count_for_test(10)
+    q, kv, head, block = 32, 8, 128, 16
+    past = [1023, 1535, 2047, 3071]
+    counts = [(n + 2 + block - 1) // block for n in past]
+    pages, cursor = [], 0
+    for count in counts:
+        pages.append(list(range(cursor, cursor + count)))
+        cursor += count
+    cache = MetalPagedKVCache(
+        num_layers=1,
+        num_kv_heads=kv,
+        head_dim=head,
+        num_blocks=cursor,
+        block_size=block,
+        dtype=mx.float16,
+    )
+    # Zero Q/K makes the oracle a plain mean. Distinct per-request histories
+    # and large new values expose row mixups, stale lengths and missing writes.
+    cache.key_caches[0] = mx.zeros_like(cache.key_caches[0])
+    values = np.zeros((cursor, block, kv, head), np.float16)
+    histories = []
+    for rid, length in enumerate(past):
+        history = [float(rid + 1 + (i % 5)) for i in range(length)]
+        histories.append(history)
+        for pos, value in enumerate(history):
+            values[pages[rid][pos // block], pos % block] = value
+    cache.value_caches[0] = mx.array(values)
+    mx.eval(cache.key_caches[0], cache.value_caches[0])
+    inner = SimpleNamespace(
+        n_heads=q,
+        n_kv_heads=kv,
+        head_dim=head,
+        scale=head**-0.5,
+        q_proj=nn.Linear(1, q * head, bias=False),
+        k_proj=nn.Linear(1, kv * head, bias=False),
+        v_proj=nn.Linear(1, kv * head, bias=False),
+        rope=lambda x, offset=0: x,
+        o_proj=lambda x: x,
+    )
+    inner.q_proj.weight = mx.zeros((q * head, 1), mx.float16)
+    inner.k_proj.weight = mx.zeros((kv * head, 1), mx.float16)
+    inner.v_proj.weight = mx.ones((kv * head, 1), mx.float16)
+    pending = []
+    try:
+        for step, ids in enumerate(([0, 1, 2], [2, 3, 0])):
+            prepare_grouped([([pages[rid]], past[rid]) for rid in ids], [], (block,))
+            ctx = get_context()
+            assert ctx is not None
+            new_values = [float(1000 + 100 * rid + step * 10) for rid in ids]
+            output, _ = sdpa_forward(
+                inner,
+                mx.array(new_values, mx.float16).reshape(1, len(ids), 1),
+                ctx,
+                cache,
+                layer_idx=0,
+            )
+            expected = []
+            for rid, value in zip(ids, new_values, strict=True):
+                histories[rid].append(value)
+                expected.append(np.mean(histories[rid], dtype=np.float64))
+                past[rid] += 1
+            pending.append((output, expected, 256 if step == 0 else 512))
+        clear_context()
+        # Building the second graph/context must not change the first. Resolve
+        # in reverse order, as allowed by the scatter dependency graph.
+        for output, expected, partition in reversed(pending):
+            mx.eval(output)
+            assert get_ops().last_gqa_partition_size() == partition
+            reference = np.broadcast_to(np.array(expected)[:, None], (3, q * head))
+            np.testing.assert_allclose(
+                np.array(output).reshape(3, -1), reference, atol=0.004, rtol=0.002
+            )
+    finally:
+        clear_context()
+
+
 @pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
 @pytest.mark.parametrize("length", [1, 1536, 8192, 10752, 21248, 42496, 262145])
 def test_batch_planner_preserves_single_request(q, kv, head, block, length):

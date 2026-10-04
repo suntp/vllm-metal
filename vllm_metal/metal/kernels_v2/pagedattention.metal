@@ -1830,6 +1830,15 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
   }
 }
 
+// Large ragged batches can exceed 2^31 partial elements while every individual
+// dimension and the reducer's threadgroup workspace still fit. Widen before
+// multiplying, including the one-partition copy path for short rows.
+inline int64_t paged_attention_reduce_offset(
+    int query_token, int head, int num_heads, int partitions, int head_size) {
+  return (static_cast<int64_t>(query_token) * num_heads + head) *
+      partitions * head_size;
+}
+
 template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
           int PARTITION_SIZE = 0>
 [[kernel]] void paged_attention_v2_reduce(
@@ -1860,6 +1869,11 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   const uint32_t context_len = context_lens[seq_idx];
   const int effective_context_len = (int)context_len - q_len + q_pos_in_seq + 1;
   const int num_partitions = DIVIDE_ROUND_UP(effective_context_len, PARTITION_SIZE);
+  const int64_t out_offset = paged_attention_reduce_offset(
+      q_token_idx, head_idx, num_heads, 1, HEAD_SIZE);
+  const int64_t stats_offset = paged_attention_reduce_offset(
+      q_token_idx, head_idx, num_heads, max_num_partitions, 1);
+  const int64_t partial_offset = stats_offset * HEAD_SIZE;
 
   // ========================================================================
   // Workspace declarations (function scope — Metal requires threadgroup
@@ -1886,11 +1900,8 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   // writes tmp_out in the rotated (un-FWHT'd) domain for PARTITION_SIZE>0.
   // ========================================================================
   if (num_partitions == 1 && !use_sinks) {
-    device T *out_ptr =
-        out + q_token_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
-    const device T *tmp_out_ptr =
-        tmp_out + q_token_idx * num_heads * max_num_partitions * HEAD_SIZE +
-        head_idx * max_num_partitions * HEAD_SIZE;
+    device T *out_ptr = out + out_offset;
+    const device T *tmp_out_ptr = tmp_out + partial_offset;
 
     if (use_turboquant) {
       // Warp 0 owns the entire HEAD_SIZE vector as a lane-strided register
@@ -1927,9 +1938,7 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   // Load max logits to shared memory.
   threadgroup float *shared_max_logits =
       reinterpret_cast<threadgroup float *>(shared_mem);
-  const device float *max_logits_ptr =
-      max_logits + q_token_idx * num_heads * max_num_partitions +
-      head_idx * max_num_partitions;
+  const device float *max_logits_ptr = max_logits + stats_offset;
   float max_logit = -FLT_MAX;
   for (int i = thread_position_in_threadgroup.x; i < num_partitions;
        i += threads_per_threadgroup.x) {
@@ -1967,9 +1976,7 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   // Load rescaled exp sums to shared memory.
   threadgroup float *shared_exp_sums = reinterpret_cast<threadgroup float *>(
       shared_mem + sizeof(float) * num_partitions);
-  const device float *exp_sums_ptr = exp_sums +
-                                     q_token_idx * num_heads * max_num_partitions +
-                                     head_idx * max_num_partitions;
+  const device float *exp_sums_ptr = exp_sums + stats_offset;
   float global_exp_sum = 0.0f;
   for (int i = thread_position_in_threadgroup.x; i < num_partitions;
        i += threads_per_threadgroup.x) {
@@ -2008,11 +2015,8 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   // vector, and (c) the number of FWHTs per kernel drops from
   // O(num_partitions) to 1.
   // ========================================================================
-  const device T *tmp_out_ptr =
-      tmp_out + q_token_idx * num_heads * max_num_partitions * HEAD_SIZE +
-      head_idx * max_num_partitions * HEAD_SIZE;
-  device T *out_ptr =
-      out + q_token_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
+  const device T *tmp_out_ptr = tmp_out + partial_offset;
+  device T *out_ptr = out + out_offset;
 
   if (use_turboquant) {
     // Stage weighted partial sums into `combined[]` in fp32.
