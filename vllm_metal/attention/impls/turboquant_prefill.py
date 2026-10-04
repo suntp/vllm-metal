@@ -11,6 +11,7 @@ from vllm.logger import init_logger
 
 from vllm_metal.attention.caches.turboquant import (
     FWHT_SUPPORTED_HEAD_DIMS,
+    QUANT_PARAMS,
     prefill_bytes_per_token,
 )
 from vllm_metal.attention.context import PagedAttentionContext
@@ -27,8 +28,8 @@ logger = init_logger(__name__)
 # See tools/benchmark/tq_lane_verify.py's production-path crossover sweep.
 _TQ_MIN_PREFILL_TOKENS = 128
 _TQ_MIN_QUERIES_PER_KV_HEAD = 256
-# The hd128 crossover was measured only for these complete head geometries.
-# Keep short histories and unmeasured geometries on the original policy.
+# The hd128 crossover was measured for signed K8/V3 and these head geometries.
+# Keep other formats, short histories and unmeasured shapes on the old policy.
 _TQ_HD128_CALIBRATED_GEOMETRIES = frozenset(
     {(8, 2, 128), (8, 8, 128), (32, 8, 128), (16, 2, 128)}
 )
@@ -42,17 +43,24 @@ def min_prefill_tokens(
     head_dim: int,
     *,
     context_len: int | None = None,
+    key_quant_type: str | None = None,
+    value_bits: int | None = None,
 ) -> int:
     """Minimum new queries for a geometry and total visible KV context.
 
-    An unspecified context retains the original policy. For a fixed geometry,
-    the threshold never increases with context; workspace sizing relies on
-    the threshold at max_model_len being the smallest that a step can use.
+    An unspecified context or format retains the original policy. For a fixed
+    geometry and format, the threshold never increases with context; workspace
+    sizing relies on the threshold at max_model_len being the smallest used.
     """
+    key_format = QUANT_PARAMS.get(key_quant_type or "")
     if (
         context_len is not None
         and context_len >= _TQ_HD128_MIN_CONTEXT
         and (num_query_heads, num_kv_heads, head_dim) in _TQ_HD128_CALIBRATED_GEOMETRIES
+        and key_format is not None
+        and key_format["bits"] == 8
+        and key_format["signed"]
+        and value_bits == 3
     ):
         return _TQ_HD128_MIN_PREFILL_TOKENS
     return max(
@@ -119,6 +127,8 @@ def workspace_upper_bound(
     num_kv_heads: int,
     head_dim: int,
     block_size: int,
+    key_quant_type: str | None = None,
+    value_bits: int | None = None,
 ) -> int:
     """Conservative per-layer cap, including independent histories and split copies.
 
@@ -129,7 +139,12 @@ def workspace_upper_bound(
     """
     queries = min(max_num_batched_tokens, max_num_seqs * max_model_len)
     minimum = min_prefill_tokens(
-        num_query_heads, num_kv_heads, head_dim, context_len=max_model_len
+        num_query_heads,
+        num_kv_heads,
+        head_dim,
+        context_len=max_model_len,
+        key_quant_type=key_quant_type,
+        value_bits=value_bits,
     )
     if max_model_len < minimum:
         return 0
@@ -175,6 +190,9 @@ def _turboquant_prefill_plan(
     num_query_heads: int,
     num_kv_heads: int,
     head_dim: int,
+    *,
+    key_quant_type: str | None = None,
+    value_bits: int | None = None,
 ) -> _TurboQuantPrefillPlan | None:
     """Plan bounded materialization using the existing CPU scheduler metadata.
 
@@ -190,7 +208,12 @@ def _turboquant_prefill_plan(
         raise ValueError("TurboQuant prefill requires cumulative query lengths")
     min_tokens = tuple(
         min_prefill_tokens(
-            num_query_heads, num_kv_heads, head_dim, context_len=context_len
+            num_query_heads,
+            num_kv_heads,
+            head_dim,
+            context_len=context_len,
+            key_quant_type=key_quant_type,
+            value_bits=value_bits,
         )
         for context_len in ctx.context_lens
     )

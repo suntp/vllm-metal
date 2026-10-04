@@ -125,8 +125,10 @@ required before enabling tiled prefill by default on M1–M4.
 Eligibility uses the **new query tokens in the current scheduler chunk**:
 The default minimum is
 `max(128, head_dim // 2, ceil(256 * num_kv_heads / num_query_heads))`.
-For hd128 with Q/KV heads 8/2, 8/8, 32/8 or 16/2 and total visible KV context
-at least 8192, the calibrated minimum is 64. Each request uses its own context
+For signed K8 (`q8_0` or its equivalent `int8`) with V3 (`q3_0`), hd128,
+Q/KV heads 8/2, 8/8, 32/8 or 16/2 and total visible KV context at least 8192,
+the calibrated minimum is 64. Other K/V encodings retain the default formula,
+including unsigned `uint8` keys. Each request uses its own context
 and threshold; the cached prefix counts toward context but not new query tokens.
 The lane supports single/multiple requests, mixed prefill/decode batches, and
 prefix caching on or off. After a prefix hit, only the uncached suffix contributes
@@ -254,13 +256,15 @@ FP16/BF16 and 8K/32K contexts, with the same K8/V3 comparison:
 | 32/8 (Qwen3-4B) | 6.30–8.29× | 7.80–9.54× | 8.86–10.22× |
 | 16/2 (MiniCPM5-2B) | 4.09–5.38× | 4.89–6.16× | 7.44–10.44× |
 
-Admission uses 64 new query tokens only for hd128 with Q/KV heads 8/2, 8/8,
-32/8 or 16/2 and a total visible KV context of at least 8192 tokens. Shorter
-contexts and all other geometries retain the original
+Admission uses 64 new query tokens only for signed K8/V3, hd128 with Q/KV
+heads 8/2, 8/8, 32/8 or 16/2 and total visible KV context of at least 8192
+tokens. FP16/BF16 in these tables describes activation precision, not additional
+K/V encodings. Shorter contexts, other K/V encodings and other geometries retain the original
 `max(128, head_dim // 2, ceil(256 * KV_heads / Q_heads))` threshold. The context
 condition is evaluated per request, so mixed batches may contain both policies.
-The workspace cap uses the minimum threshold reachable up to `max_model_len`,
-including the extra independent histories admitted by the lower cutoff.
+The workspace cap uses the same encoding-aware policy and the minimum threshold
+reachable up to `max_model_len`, including the extra independent histories
+admitted by the lower cutoff.
 Default hardware rollout is unchanged: M3 still requires
 `VLLM_METAL_TQ_PREFILL=1`. Contexts above 32K were not calibrated, and ordinary
 workspace rejection still applies before materialization.

@@ -926,6 +926,8 @@ def sdpa_forward(
                 q_3d.shape[1],
                 cache_kv_heads,
                 q_3d.shape[2],
+                key_quant_type=kv_cache.k_quant,
+                value_bits=kv_cache.v_bits,
             )
 
         if plan is None:

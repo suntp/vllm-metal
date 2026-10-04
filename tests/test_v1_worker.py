@@ -279,6 +279,47 @@ class TestWorkerRunnerBoundaryDelegation:
 
 
 class TestPagedAttentionPlanDiagnostics:
+    @pytest.mark.parametrize(
+        "key_format,value_format,histories",
+        [
+            ("q8_0", "q3_0", 3),
+            ("int8", "q3_0", 3),
+            ("uint8", "q3_0", 1),
+            ("q4_0", "q3_0", 1),
+            ("q8_0", "q4_0", 1),
+        ],
+    )
+    def test_tq_format_controls_startup_reservation(
+        self, monkeypatch, key_format, value_format, histories
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_TQ_PREFILL", "1")
+        monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "auto")
+        monkeypatch.setattr(
+            "vllm_metal.v1.cache_policy.get_config",
+            lambda: MetalConfig(
+                mlx_device="gpu",
+                turboquant=True,
+                k_quant=key_format,
+                v_quant=value_format,
+            ),
+        )
+        runner = make_stub_runner(
+            num_kv_heads=2,
+            head_dim=128,
+            kv_cache_dtype=mx.bfloat16,
+            scheduler_config=SimpleNamespace(
+                max_num_seqs=4, max_num_batched_tokens=193
+            ),
+        )
+        runner.model_config.max_model_len = 8192
+        runner.model_config.get_num_attention_heads = lambda _: 8
+        # A 193-query step can hold three 64-token prefills or one 128-token
+        # prefill. The startup cap must cover that many independent histories,
+        # with metadata/routing overhead smaller than one additional history.
+        history_bytes = 8192 * 2 * 128 * 4
+        allowance = runner.tq_prefill_workspace_bytes
+        assert histories * history_bytes < allowance < (histories + 1) * history_bytes
+
     @pytest.mark.parametrize("length,sequences", [(512, 1), (4096, 4), (131072, 1)])
     def test_tq_auto_reservation_covers_history_and_stays_fixed(
         self, monkeypatch, length, sequences

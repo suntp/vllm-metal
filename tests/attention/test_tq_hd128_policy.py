@@ -8,11 +8,102 @@ import numpy as np
 import pytest
 
 from tools.benchmark.tq_prefill_case import build_case
+from vllm_metal.attention.caches.turboquant import QUANT_PARAMS, V_QUANT_PARAMS
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls import sdpa
 from vllm_metal.attention.impls import turboquant_prefill as policy
 
 CALIBRATED = [(8, 2, 128), (8, 8, 128), (32, 8, 128), (16, 2, 128)]
+
+
+@pytest.mark.parametrize("key_format", [None, *QUANT_PARAMS])
+@pytest.mark.parametrize("value_bits", [None, 2, 3, 4, 5, 8])
+def test_only_measured_encoding_and_its_alias_use_lower_threshold(
+    key_format, value_bits
+):
+    expected = 64 if key_format in ("q8_0", "int8") and value_bits == 3 else 128
+    assert (
+        policy.min_prefill_tokens(
+            32,
+            8,
+            128,
+            context_len=8192,
+            key_quant_type=key_format,
+            value_bits=value_bits,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "key_format,value_format,calibrated",
+    [
+        ("q8_0", "q3_0", True),
+        ("int8", "q3_0", True),
+        ("uint8", "q3_0", False),
+        ("q4_0", "q3_0", False),
+        ("q8_0", "q4_0", False),
+    ],
+)
+@pytest.mark.parametrize("queries", [63, 64, 65, 128])
+def test_format_gate_reaches_production_forward(
+    key_format, value_format, calibrated, queries, force_tiled_prefill
+):
+    case = build_case(
+        qlens=(queries,),
+        context_lens=(8192,),
+        k_quant=key_format,
+        v_quant=value_format,
+    )
+    with patch.object(
+        sdpa, "materialize_turboquant_pages", wraps=sdpa.materialize_turboquant_pages
+    ) as materialize:
+        assert_parity(case)
+    assert materialize.call_count == int(queries >= (64 if calibrated else 128))
+
+
+def test_plan_cache_separates_formats_only_when_admission_changes():
+    case = build_case(qlens=(64,), context_lens=(8192,))
+    calibrated = plan_for(case)
+    assert calibrated is not None
+    assert plan_for(case, key_quant_type="uint8") is None
+    assert plan_for(case, value_bits=4) is None
+    assert plan_for(case, key_quant_type="int8") is calibrated
+    assert plan_for(case) is calibrated
+
+
+@pytest.mark.parametrize(
+    "key_format,value_format", [("q8_0", "q3_0"), ("q4_0", "q3_0"), ("q8_0", "q4_0")]
+)
+def test_format_aware_workspace_covers_selected_independent_histories(
+    key_format, value_format
+):
+    # A 193-query step can admit three K8/V3 histories, but only one under
+    # the old threshold. Verify the cap against actual plan arrays and routing.
+    minimum = 64 if (key_format, value_format) == ("q8_0", "q3_0") else 128
+    bits = V_QUANT_PARAMS[value_format]["bits"]
+    allowance = policy.workspace_upper_bound(
+        max_model_len=8192,
+        max_num_seqs=4,
+        max_num_batched_tokens=193,
+        num_query_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+        block_size=16,
+        key_quant_type=key_format,
+        value_bits=bits,
+    )
+    case = build_case(
+        qlens=(minimum, 64, 1),
+        context_lens=(8192, 8192, 8192),
+        k_quant=key_format,
+        v_quant=value_format,
+    )
+    case.ctx.tq_prefill_workspace_bytes = allowance
+    plan = plan_for(case)
+    assert plan is not None
+    assert plan.prefill.seq_lens.size == (2 if minimum == 64 else 1)
+    assert plan.workspace_bytes <= allowance
 
 
 @pytest.fixture(autouse=True)
@@ -36,7 +127,7 @@ def assert_parity(case):
     )
 
 
-def plan_for(case):
+def plan_for(case, **format_override):
     meta = sdpa._kernel_metadata(
         case.ctx,
         None,
@@ -52,6 +143,10 @@ def plan_for(case):
         case.inner.n_heads,
         case.inner.n_kv_heads,
         case.inner.head_dim,
+        **dict(
+            {"key_quant_type": case.cache.k_quant, "value_bits": case.cache.v_bits},
+            **format_override,
+        ),
     )
 
 
@@ -62,7 +157,12 @@ def test_policy_changes_only_at_long_context_boundary(geometry, context_len):
         128, geometry[2] // 2, (256 * geometry[1] + geometry[0] - 1) // geometry[0]
     )
     expected = 64 if context_len is not None and context_len >= 8192 else old
-    assert policy.min_prefill_tokens(*geometry, context_len=context_len) == expected
+    assert (
+        policy.min_prefill_tokens(
+            *geometry, context_len=context_len, key_quant_type="q8_0", value_bits=3
+        )
+        == expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -78,7 +178,12 @@ def test_policy_changes_only_at_long_context_boundary(geometry, context_len):
 )
 def test_unmeasured_geometry_keeps_original_policy(geometry, expected):
     for context_len in (None, 8191, 8192, 32768):
-        assert policy.min_prefill_tokens(*geometry, context_len=context_len) == expected
+        assert (
+            policy.min_prefill_tokens(
+                *geometry, context_len=context_len, key_quant_type="q8_0", value_bits=3
+            )
+            == expected
+        )
 
 
 @pytest.mark.parametrize("geometry", CALIBRATED)
@@ -176,6 +281,8 @@ def test_workspace_reserves_three_new_candidates_and_decode(geometry, block_size
         num_kv_heads=nkv,
         head_dim=hd,
         block_size=block_size,
+        key_quant_type="q8_0",
+        value_bits=3,
     )
     ctx = PagedAttentionContext(
         slot_mapping=[],
@@ -185,7 +292,17 @@ def test_workspace_reserves_three_new_candidates_and_decode(geometry, block_size
         tq_prefill_workspace_bytes=allowance,
     )
     meta = sdpa._kernel_metadata(ctx, 0, [], tables, block_size)
-    plan = policy._turboquant_prefill_plan(ctx, meta, tables, block_size, nq, nkv, hd)
+    plan = policy._turboquant_prefill_plan(
+        ctx,
+        meta,
+        tables,
+        block_size,
+        nq,
+        nkv,
+        hd,
+        key_quant_type="q8_0",
+        value_bits=3,
+    )
     assert plan is not None and plan.fallback is not None
     assert plan.prefill.seq_lens.tolist() == [length] * 3
     assert plan.fallback.seq_lens.tolist() == [length]
@@ -249,7 +366,9 @@ def test_plan_key_tracks_per_sequence_policy():
     with patch.object(
         policy,
         "min_prefill_tokens",
-        side_effect=lambda *_, context_len: 128 if context_len >= 8192 else 64,
+        side_effect=lambda *_, context_len, **_kwargs: (
+            128 if context_len >= 8192 else 64
+        ),
     ):
         reversed_plan = plan_for(case)
     # Both policies have a minimum of 64, but select different request rows.
@@ -270,6 +389,8 @@ def test_workspace_bound_is_monotonic_at_context_transition(geometry):
             num_kv_heads=nkv,
             head_dim=hd,
             block_size=16,
+            key_quant_type="q8_0",
+            value_bits=3,
         )
         for length in (8191, 8192, 8193, 32768)
     ]

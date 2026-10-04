@@ -192,3 +192,50 @@ def test_comparison_never_overwrites_existing_evidence(tmp_path, monkeypatch, ca
     assert exc.value.code == 2
     assert "already exists" in capsys.readouterr().err
     assert evidence.read_text() == '{"validation_error": "previous evidence"}'
+
+
+@pytest.mark.parametrize("failure", ["model", "tokenizer", "git"])
+def test_main_restores_planner_when_initialization_fails(monkeypatch, failure):
+    import vllm
+
+    from vllm_metal import metal
+    from vllm_metal.attention.caches import turboquant
+    from vllm_metal.attention.impls import sdpa
+
+    original = sdpa._turboquant_prefill_plan
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            assert sdpa._turboquant_prefill_plan is not original
+            if failure == "model":
+                raise RuntimeError("injected model failure")
+            self.llm_engine = SimpleNamespace(
+                vllm_config=SimpleNamespace(
+                    model_config=SimpleNamespace(
+                        hf_config=SimpleNamespace(to_dict=lambda: {}), dtype="bfloat16"
+                    )
+                )
+            )
+
+        def get_tokenizer(self):
+            if failure == "tokenizer":
+                raise RuntimeError("injected tokenizer failure")
+            return object()
+
+    def fail_git(*args, **kwargs):
+        raise RuntimeError("injected git failure")
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    monkeypatch.setattr(vllm, "LLM", FakeLLM)
+    monkeypatch.setattr(
+        metal, "get_ops", lambda: SimpleNamespace(nax_ready=lambda: True)
+    )
+    monkeypatch.setattr(turboquant, "prefill_workspace_bytes", lambda: 1)
+    monkeypatch.setattr(bench.subprocess, "check_output", fail_git)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["tq_e2e_arm.py", "--model", "unused", "--prefix-probe", "--compare-policies"],
+    )
+    with pytest.raises(RuntimeError, match=f"injected {failure} failure"):
+        bench.main()
+    assert sdpa._turboquant_prefill_plan is original

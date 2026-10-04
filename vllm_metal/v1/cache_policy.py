@@ -220,7 +220,8 @@ class ModelCachePolicy:
     @cached_property
     def tq_prefill_workspace_bytes(self) -> int:
         """Resolve one reservation before KV sizing and reuse it during serving."""
-        if not self._use_turboquant(get_config()):
+        config = get_config()
+        if not self._use_turboquant(config):
             return 0
         runner = self._runner
         cap = None
@@ -247,6 +248,8 @@ class ModelCachePolicy:
                     num_kv_heads=runner.num_kv_heads,
                     head_dim=runner.head_dim,
                     block_size=runner.cache_config.block_size,
+                    key_quant_type=config.k_quant,
+                    value_bits=V_QUANT_PARAMS[config.v_quant]["bits"],
                 )
         return prefill_workspace_bytes(max_bytes=cap)
 

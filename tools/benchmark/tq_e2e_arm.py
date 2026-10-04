@@ -50,7 +50,13 @@ PARA = (
 
 
 def old_min_prefill_tokens(
-    num_query_heads, num_kv_heads, head_dim, *, context_len=None
+    num_query_heads,
+    num_kv_heads,
+    head_dim,
+    *,
+    context_len=None,
+    key_quant_type=None,
+    value_bits=None,
 ):
     """The exact production policy before the PR #990 crossover calibration."""
     return max(
@@ -283,6 +289,18 @@ def main():
 
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
+    from vllm_metal.attention.impls import sdpa
+
+    original_planner = sdpa._turboquant_prefill_plan
+    try:
+        return _run(args)
+    finally:
+        # Include model/tokenizer setup and metadata collection in the same
+        # lifetime as measurement; callers may reuse this Python process.
+        sdpa._turboquant_prefill_plan = original_planner
+
+
+def _run(args):
     import mlx.core as mx
     import numpy as np
     from vllm import LLM, SamplingParams
@@ -295,7 +313,7 @@ def main():
 
     original_planner = sdpa._turboquant_prefill_plan
     new_policy = tq_prefill.min_prefill_tokens
-    policy_uses_context = "context_len" in inspect.signature(new_policy).parameters
+    policy_parameters = inspect.signature(new_policy).parameters
     dispatch = {}
     step_contexts = []
     active_arm = args.arm
@@ -307,12 +325,17 @@ def main():
         dispatch["workspace_limit_bytes"] = planner_args[1].tq_prefill_workspace_bytes
         geometry = planner_args[4:7]
         old_threshold = old_min_prefill_tokens(*geometry)
-        new_thresholds = [
-            new_policy(*geometry, context_len=context_len)
-            if policy_uses_context
-            else new_policy(*geometry)
-            for context_len in planner_args[0].context_lens
-        ]
+        new_thresholds = []
+        for context_len in planner_args[0].context_lens:
+            policy_kwargs = dict(kwargs, context_len=context_len)
+            new_thresholds.append(
+                new_policy(
+                    *geometry,
+                    **{
+                        k: v for k, v in policy_kwargs.items() if k in policy_parameters
+                    },
+                )
+            )
         policy = old_min_prefill_tokens if active_arm == "old-policy" else new_policy
         thresholds = (
             [old_threshold] * len(new_thresholds)
@@ -428,29 +451,23 @@ def main():
     if args.prefix_probe and args.prefix_tokens is not None:
         max_prompt = args.prefix_tokens + max(args.query_tokens)
     t0 = time.perf_counter()
-    try:
-        # This is a controlled admission-policy comparison: reserve the larger
-        # old/new cap once, before cache sizing, and share that exact KV budget.
-        # Hardware opt-in and the user's workspace ceiling still apply.
-        reservation_policy = (
-            shared_reservation_policy(new_policy)
-            if args.compare_policies
-            else new_policy
+    # This is a controlled admission-policy comparison: reserve the larger
+    # old/new cap once, before cache sizing, and share that exact KV budget.
+    # Hardware opt-in and the user's workspace ceiling still apply.
+    reservation_policy = (
+        shared_reservation_policy(new_policy) if args.compare_policies else new_policy
+    )
+    with prefill_policy(tq_prefill, reservation_policy):
+        llm = LLM(
+            model=os.path.expanduser(args.model),
+            max_model_len=max_prompt + args.max_tokens,
+            max_num_batched_tokens=args.batch_tokens,
+            max_num_seqs=len(args.query_tokens) if args.mixed_prefix_probe else 1,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            enable_prefix_caching=args.prefix_probe,
+            disable_log_stats=False,
+            **kwargs,
         )
-        with prefill_policy(tq_prefill, reservation_policy):
-            llm = LLM(
-                model=os.path.expanduser(args.model),
-                max_model_len=max_prompt + args.max_tokens,
-                max_num_batched_tokens=args.batch_tokens,
-                max_num_seqs=len(args.query_tokens) if args.mixed_prefix_probe else 1,
-                gpu_memory_utilization=args.gpu_memory_utilization,
-                enable_prefix_caching=args.prefix_probe,
-                disable_log_stats=False,
-                **kwargs,
-            )
-    except BaseException:
-        sdpa._turboquant_prefill_plan = original_planner
-        raise
     load_s = time.perf_counter() - t0
     tokenizer = llm.get_tokenizer()
     arms = ["tq-reference", "tq"] if args.arm == "paired" else [args.arm]
@@ -839,7 +856,6 @@ def main():
         metadata["validation_error"] = f"{type(exc).__name__}: {exc}"
         raise
     finally:
-        sdpa._turboquant_prefill_plan = original_planner
         if args.output:
             args.output.write_text(
                 json.dumps(
