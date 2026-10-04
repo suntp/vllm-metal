@@ -78,6 +78,11 @@ from vllm_metal.v1.decode_pipeline import (
     SamplingShape,
     SchedulerStepShape,
 )
+from vllm_metal.v1.draft_model_proposer import (
+    DraftDims,
+    DraftModelProposer,
+    resolve_draft_dims,
+)
 from vllm_metal.v1.gemma4_mtp import (
     Gemma4MTPAssistantRuntime,
     Gemma4MTPAssistantSource,
@@ -122,12 +127,6 @@ from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
 if TYPE_CHECKING:
     from vllm_metal.patches.aux_hidden_states import AuxHiddenStateCapture
-
-    # Kept out of the runtime import graph: draft_model_proposer.py pulls in
-    # mlx_lm's model loader at module scope, which should only load when
-    # draft_model speculative decoding is actually configured (see the lazy
-    # runtime import in __init__ and in install_drafter).
-    from vllm_metal.v1.draft_model_proposer import DraftDims
 
 logger = init_logger(__name__)
 
@@ -407,15 +406,11 @@ class MetalModelRunner:
         self._gemma4_mtp_assistant: Gemma4MTPAssistantRuntime | None = None
         self._drafter: MetalProposer | None = None
         self._aux_capture: AuxHiddenStateCapture | None = None
-        # Resolved eagerly (config-only, no weights) so `ModelCachePolicy`
-        # can size a scheduler-visible KV-cache group for the draft model
-        # before `determine_available_memory()`/`get_kv_cache_spec()` run.
-        # The draft's MLX weights load later, in `install_drafter`.
+        # Cache planning needs the draft shape before weights load.
+        # The paged cache binds after planning.
         self._draft_dims: DraftDims | None = None
         spec = vllm_config.speculative_config
         if spec is not None and spec.uses_draft_model():
-            from vllm_metal.v1.draft_model_proposer import resolve_draft_dims
-
             self._draft_dims = resolve_draft_dims(spec, vllm_config.parallel_config)
         self.encoder_cache: EncoderCache | None = None
 
@@ -682,13 +677,28 @@ class MetalModelRunner:
             self._model_lifecycle.install_pooling_backend()
 
         spec = self.vllm_config.speculative_config
-        if spec is not None and spec.method == "dflash":
+        if spec is not None and spec.method in ("dflash", "dspark"):
             from vllm_metal.v1.dflash_proposer import DFlashProposer
+            from vllm_metal.v1.dspark_proposer import DSparkProposer
 
             # Load before memory profiling so draft weights count against the
             # same device budget. Cache views bind after scheduler planning.
-            self._drafter = DFlashProposer.build(self)
+            proposer = DFlashProposer if spec.method == "dflash" else DSparkProposer
+            self._drafter = proposer.build(self)
             self._aux_capture = self._drafter.target_capture(self._forward_model)
+        elif spec is not None and spec.uses_draft_model():
+            self._drafter = DraftModelProposer.build(
+                speculative_config=spec,
+                parallel_config=self.vllm_config.parallel_config,
+                controller=self._spec_decode_controller,
+                model_adapter=self._model_adapter,
+                max_model_len=spec.draft_model_config.max_model_len,
+                max_num_seqs=self.scheduler_config.max_num_seqs,
+                block_size=self.cache_config.block_size,
+                allow_deferred_zero_k_ingest=(
+                    not self.vllm_config.cache_config.enable_prefix_caching
+                ),
+            )
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self._lora.add_adapter(lora_request)
@@ -904,9 +914,16 @@ class MetalModelRunner:
         mx.clear_cache()
         cache_before = mx.get_cache_memory()
         dummy_tokens = mx.zeros((1, warmup_len), dtype=mx.int32)
-        mx.eval(*self._dummy_forward_outputs(dummy_tokens))
+        target_outputs = self._dummy_forward_outputs(dummy_tokens)
+        mx.eval(*target_outputs)
+        retain_target_outputs = self._aux_capture is None
+        if not retain_target_outputs:
+            # DFlash profiles its captured target forward below.
+            del target_outputs
         if self._drafter is not None:
             self._drafter.profile_warmup(self, dummy_tokens)
+        if retain_target_outputs:
+            del target_outputs
         # The vision encoder runs outside the text forward; profile it too so
         # the buffer-cache cap covers one encoder pass (the runner encodes
         # features one adapter call per step, so one maximal feature is the
@@ -1092,48 +1109,28 @@ class MetalModelRunner:
         )
 
     def install_drafter(self, *, num_blocks: int, block_size: int) -> None:
-        """Construct the polymorphic drafter once the paged cache is ready.
-
-        One factory for both speculative methods, keyed on the speculative
-        method. Gemma4 MTP uses the in-model assistant loaded in
-        ``ModelLifecycle`` (read lazily by the proposer); draft-model SD loads
-        its own model + a paged cache sized to the target's ``num_blocks`` —
-        which is why this runs after the paged backend exists. A configured but
-        unsupported method fails loud rather than silently degrading to plain
-        decode (which would look like a drafter that never accepts anything).
-        """
+        """Install or bind the configured drafter after cache planning."""
         spec = self.vllm_config.speculative_config
         if spec is None:
             return
         if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
             self._drafter = Gemma4MTPProposer(self)
-        elif spec.method == "dflash":
-            from vllm_metal.v1.dflash_proposer import DFlashProposer
+        elif spec.method in ("dflash", "dspark"):
+            from vllm_metal.v1.block_draft_proposer import BlockDraftProposer
 
             if (
-                not isinstance(self._drafter, DFlashProposer)
+                not isinstance(self._drafter, BlockDraftProposer)
                 or self._drafter.cache is None
             ):
-                raise RuntimeError("DFlash was not loaded and bound to scheduler KV")
+                raise RuntimeError(
+                    f"{spec.method} was not loaded and bound to scheduler KV"
+                )
         elif spec.uses_draft_model():
-            allow_deferred_zero_k_ingest = (
-                not self.vllm_config.cache_config.enable_prefix_caching
-            )
-
-            from vllm_metal.v1.draft_model_proposer import DraftModelProposer
-
-            # The scheduler owns both committed and lookahead draft blocks.
-            self._drafter = DraftModelProposer.build(
-                speculative_config=spec,
-                parallel_config=self.vllm_config.parallel_config,
-                controller=self._spec_decode_controller,
-                model_adapter=self._model_adapter,
+            drafter = cast(DraftModelProposer, self._drafter)
+            drafter.bind_paged_cache(
                 num_blocks=num_blocks,
-                max_model_len=spec.draft_model_config.max_model_len,
-                max_num_seqs=self.scheduler_config.max_num_seqs,
                 block_size=block_size,
-                dtype=self.kv_cache_dtype,
-                allow_deferred_zero_k_ingest=allow_deferred_zero_k_ingest,
+                dtype=cast(mx.Dtype, self.kv_cache_dtype),
             )
         elif spec.method == "ngram":
             from vllm_metal.v1.ngram_proposer import NgramProposer
@@ -1147,7 +1144,7 @@ class MetalModelRunner:
         else:
             raise NotImplementedError(
                 f"Speculative method {spec.method!r} is not supported on Metal "
-                "(supported: Gemma4 MTP, draft_model, ngram, dflash)."
+                "(supported: Gemma4 MTP, draft_model, ngram, dflash, dspark)."
             )
 
     def get_draft_model_stats(self) -> dict[str, int] | None:

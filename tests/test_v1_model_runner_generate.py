@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from unittest.mock import Mock
+from weakref import ref
 
 import mlx.core as mx
 import numpy as np
@@ -33,6 +34,7 @@ from vllm_metal.attention.caches.state_cache import PagedStateCache
 from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 from vllm_metal.distributed.pipeline import PipelineGroup
+from vllm_metal.v1.draft_model_proposer import DraftModelProposer
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
 from vllm_metal.v1.proposer import Gemma4MTPProposer
 from vllm_metal.v1.sampling_batch import _SamplingResult
@@ -136,6 +138,45 @@ def test_gemma4_mtp_config_installs_gemma4_proposer() -> None:
     runner.install_drafter(num_blocks=1, block_size=16)
 
     assert isinstance(runner._drafter, Gemma4MTPProposer)
+
+
+def test_draft_model_loads_before_cache_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposer = Mock(spec=DraftModelProposer)
+    build = Mock(return_value=proposer)
+    monkeypatch.setattr(
+        "vllm_metal.v1.draft_model_proposer.DraftModelProposer.build", build
+    )
+    spec = SimpleNamespace(
+        method="draft_model",
+        uses_draft_model=lambda: True,
+        draft_model_config=SimpleNamespace(max_model_len=128),
+    )
+    runner = make_stub_runner(
+        model_config=SimpleNamespace(runner_type="generate", hf_config=None),
+        scheduler_config=SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=8),
+        _model_lifecycle=SimpleNamespace(
+            load=Mock(),
+            install_decode_dispatch=Mock(),
+        ),
+    )
+    runner.vllm_config.speculative_config = spec
+    runner.kv_cache_dtype = mx.float16
+
+    runner.load_model()
+
+    assert runner._drafter is proposer
+    build.assert_called_once()
+    proposer.bind_paged_cache.assert_not_called()
+
+    runner.install_drafter(num_blocks=9, block_size=32)
+
+    proposer.bind_paged_cache.assert_called_once_with(
+        num_blocks=9,
+        block_size=32,
+        dtype=mx.float16,
+    )
 
 
 class TestDrafterReleaseOnLifecycle:
@@ -2824,20 +2865,39 @@ class TestDummyForwardOutputsPPRouting:
 
 
 class TestProfileRunDrafterWarmup:
-    """``profile_run`` must warm the drafter's buffers in the measured peak."""
-
-    def test_profile_run_calls_drafter_profile_warmup(
-        self, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize(
+        ("captures_target", "expected_retained"),
+        [(False, True), (True, False)],
+    )
+    def test_profile_run_uses_drafter_target_output_lifetime(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        captures_target: bool,
+        expected_retained: bool,
     ) -> None:
+        class _Output:
+            pass
+
+        output_refs = []
+
+        def target_outputs(_tokens):
+            output = _Output()
+            output_refs.append(ref(output))
+            return [output]
+
+        warmups = []
+
+        def profile_warmup(warmed_runner, tokens) -> None:
+            warmups.append((warmed_runner, tokens, output_refs[0]() is not None))
+
         runner = make_stub_runner(
             scheduler_config=SimpleNamespace(max_num_batched_tokens=4)
         )
-        runner._dummy_forward_outputs = Mock(return_value=[])
-        warmups: list[tuple[object, mx.array]] = []
-        runner._drafter = SimpleNamespace(
-            profile_warmup=lambda r, tokens: warmups.append((r, tokens))
-        )
+        runner._dummy_forward_outputs = target_outputs
+        runner._drafter = SimpleNamespace(profile_warmup=profile_warmup)
+        runner._aux_capture = object() if captures_target else None
         cache_readings = iter([100, 180])
+        monkeypatch.setattr(mr.mx, "eval", lambda *_: None)
         monkeypatch.setattr(mr.mx, "clear_cache", lambda: None)
         monkeypatch.setattr(mr.mx, "get_cache_memory", lambda: next(cache_readings))
         monkeypatch.setattr(mr.mx, "set_cache_limit", lambda _n: None)
@@ -2845,11 +2905,12 @@ class TestProfileRunDrafterWarmup:
         runner.profile_run()
 
         assert len(warmups) == 1
-        warmed_runner, tokens = warmups[0]
+        warmed_runner, tokens, target_retained = warmups[0]
         assert warmed_runner is runner
-        # The drafter profiles the same max-batched-tokens warmup shape.
         assert tokens.shape == (1, 4)
         assert tokens.dtype == mx.int32
+        assert target_retained is expected_retained
+        assert output_refs[0]() is None
 
     def test_skips_encoder_profiling_when_multimodal_cannot_run(self) -> None:
         # No mm inputs and no explicit-positions requirement: an mm step can

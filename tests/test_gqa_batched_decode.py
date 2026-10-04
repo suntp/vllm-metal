@@ -288,7 +288,7 @@ def test_batched_shared_prefix_and_strided_scheduler_pages(
     dtype, partition, q, kv, head, cache_block
 ):
     from tests.test_gqa_paged_decode import _grouped_paged_reference
-    from vllm_metal.attention.impls.sdpa import _build_block_tables
+    from vllm_metal.attention.block_tables import build_block_tables
 
     ops = get_ops()
     length = 2 * cache_block + 3
@@ -321,7 +321,7 @@ def test_batched_shared_prefix_and_strided_scheduler_pages(
         value,
         mx.array(slots, mx.int64),
     )
-    tables, block = _build_block_tables(pages, cache_block)
+    tables, block = build_block_tables(pages, cache_block)
     query = mx.ones((2, q, head), dtype)
     out = mx.array(0)
     ops._gqa_paged_attention_for_test(

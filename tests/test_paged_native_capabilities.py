@@ -27,11 +27,20 @@ def test_structured_capabilities_are_normalized():
     query.assert_called_once_with()
 
 
-def test_missing_binding_fails_loudly():
-    # The query is part of the required extension ABI. A build without it
-    # fails loudly here rather than guessing at older capability probes.
-    with pytest.raises(AttributeError):
+def test_missing_binding_directs_to_a_rebuild():
+    # Unstamped artifacts can still load, so a missing binding points at the
+    # remedy rather than surfacing a bare AttributeError.
+    with pytest.raises(RuntimeError, match="rebuild.*native extension"):
         paged_attention_capabilities(SimpleNamespace())
+
+
+def test_binding_errors_are_not_reported_as_missing():
+    query = MagicMock(side_effect=AttributeError("binding failed"))
+
+    with pytest.raises(AttributeError, match="binding failed"):
+        paged_attention_capabilities(
+            SimpleNamespace(paged_attention_capabilities=query)
+        )
 
 
 def test_missing_capabilities_fail_closed():
