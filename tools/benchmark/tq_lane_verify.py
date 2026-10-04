@@ -14,6 +14,9 @@ Other suites retain normal routing, including fallbacks.
     PYTHONPATH=. python tools/benchmark/tq_lane_verify.py --suite crossover
     PYTHONPATH=. python tools/benchmark/tq_lane_verify.py --suite crossover-hd128
     PYTHONPATH=. python tools/benchmark/tq_lane_verify.py --suite crossover-hd128 --tiled
+    # Override hd128 geometry and include fresh prompts with context 0:
+    PYTHONPATH=. python tools/benchmark/tq_lane_verify.py --suite crossover-hd128 \\
+        --head-pairs 32:8 16:2 --query-tokens 127 128 129 --context-tokens 0 256 --tiled
     PYTHONPATH=. python tools/benchmark/tq_lane_verify.py --suite long
     PYTHONPATH=. python tools/benchmark/tq_lane_verify.py --suite geometry --tiled
 """
@@ -151,7 +154,26 @@ def measure(label, kwargs, reps, warmup, *, force_materialization=False):
     mx.clear_cache()
 
 
-def cases(suite):
+def head_pair(value):
+    """Parse an attention geometry as Q:KV, rejecting unsupported ratios."""
+    try:
+        n_heads, n_kv_heads = (int(part) for part in value.split(":"))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "head pairs must use Q:KV, e.g. 32:8"
+        ) from error
+    if n_heads < 1 or n_kv_heads < 1 or n_heads % n_kv_heads:
+        raise argparse.ArgumentTypeError(
+            "head pairs require positive Q and KV with Q divisible by KV"
+        )
+    return n_heads, n_kv_heads
+
+
+def cases(suite, *, head_pairs=None, query_tokens=None, context_tokens=None):
+    if suite != "crossover-hd128" and (
+        head_pairs is not None or query_tokens is not None or context_tokens is not None
+    ):
+        raise ValueError("matrix overrides require crossover-hd128")
     common = {"head_dim": 256, "n_heads": 24, "n_kv_heads": 4}
     if suite == "crossover":
         for qlen, context in [
@@ -170,15 +192,23 @@ def cases(suite):
                 dict(common, qlens=(qlen,), context_lens=(context,)),
             )
     elif suite == "crossover-hd128":
-        for n_kv_heads in [2, 8]:
+        geometries = head_pairs if head_pairs is not None else [(8, 2), (8, 8)]
+        lengths = (
+            query_tokens
+            if query_tokens is not None
+            else [16, 32, 64, 96, 128, 192, 256, 512]
+        )
+        contexts = context_tokens if context_tokens is not None else [8192, 32768]
+        for n_heads, n_kv_heads in geometries:
             for dtype in [mx.float16, mx.bfloat16]:
-                for context in [8192, 32768]:
-                    for qlen in [16, 32, 64, 96, 128, 192, 256, 512]:
+                for context_tokens in contexts:
+                    for qlen in lengths:
+                        context = context_tokens or qlen
                         yield (
-                            f"d128-q8-kv{n_kv_heads}-{dtype}-q{qlen}-ctx{context}",
+                            f"d128-q{n_heads}-kv{n_kv_heads}-{dtype}-q{qlen}-ctx{context}",
                             {
                                 "head_dim": 128,
-                                "n_heads": 8,
+                                "n_heads": n_heads,
                                 "n_kv_heads": n_kv_heads,
                                 "dtype": dtype,
                                 "qlens": (qlen,),
@@ -228,9 +258,41 @@ def main():
     ap.add_argument("--reps", type=int, default=7)
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--tiled", action="store_true")
+    ap.add_argument(
+        "--head-pairs",
+        type=head_pair,
+        nargs="+",
+        help="Q:KV head counts for crossover-hd128 (default: 8:2 8:8)",
+    )
+    ap.add_argument(
+        "--query-tokens",
+        type=int,
+        nargs="+",
+        help="query lengths for crossover-hd128 (at least 2 and at most each context)",
+    )
+    ap.add_argument(
+        "--context-tokens",
+        type=int,
+        nargs="+",
+        help="total context lengths for crossover-hd128; 0 means fresh prompts",
+    )
     args = ap.parse_args()
     if args.reps < 1 or args.warmup < 0:
         ap.error("reps must be positive and warmup must be nonnegative")
+    if args.suite != "crossover-hd128" and (
+        args.head_pairs is not None
+        or args.query_tokens is not None
+        or args.context_tokens is not None
+    ):
+        ap.error("matrix overrides require --suite crossover-hd128")
+    if args.query_tokens is not None and any(qlen < 2 for qlen in args.query_tokens):
+        ap.error("--query-tokens must be at least 2")
+    if args.context_tokens is not None and any(ctx < 0 for ctx in args.context_tokens):
+        ap.error("--context-tokens must be nonnegative; 0 means fresh prompts")
+    contexts = args.context_tokens if args.context_tokens is not None else [8192, 32768]
+    max_query = max(args.query_tokens) if args.query_tokens is not None else 512
+    if any(0 < context < max_query for context in contexts):
+        ap.error("positive --context-tokens must be at least the largest query length")
     ops = get_ops()
     if args.tiled:
         os.environ["VLLM_METAL_TQ_PREFILL"] = "1"
@@ -247,7 +309,12 @@ def main():
         flush=True,
     )
     try:
-        for label, kwargs in cases(args.suite):
+        for label, kwargs in cases(
+            args.suite,
+            head_pairs=args.head_pairs,
+            query_tokens=args.query_tokens,
+            context_tokens=args.context_tokens,
+        ):
             measure(
                 label,
                 kwargs,

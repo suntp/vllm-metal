@@ -27,10 +27,34 @@ logger = init_logger(__name__)
 # See tools/benchmark/tq_lane_verify.py's production-path crossover sweep.
 _TQ_MIN_PREFILL_TOKENS = 128
 _TQ_MIN_QUERIES_PER_KV_HEAD = 256
+# The hd128 crossover was measured only for these complete head geometries.
+# Keep short histories and unmeasured geometries on the original policy.
+_TQ_HD128_CALIBRATED_GEOMETRIES = frozenset(
+    {(8, 2, 128), (8, 8, 128), (32, 8, 128), (16, 2, 128)}
+)
+_TQ_HD128_MIN_CONTEXT = 8192
+_TQ_HD128_MIN_PREFILL_TOKENS = 64
 
 
-def min_prefill_tokens(num_query_heads: int, num_kv_heads: int, head_dim: int) -> int:
-    """Amortize materialization across query rows and grouped query heads."""
+def min_prefill_tokens(
+    num_query_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    *,
+    context_len: int | None = None,
+) -> int:
+    """Minimum new queries for a geometry and total visible KV context.
+
+    An unspecified context retains the original policy. For a fixed geometry,
+    the threshold never increases with context; workspace sizing relies on
+    the threshold at max_model_len being the smallest that a step can use.
+    """
+    if (
+        context_len is not None
+        and context_len >= _TQ_HD128_MIN_CONTEXT
+        and (num_query_heads, num_kv_heads, head_dim) in _TQ_HD128_CALIBRATED_GEOMETRIES
+    ):
+        return _TQ_HD128_MIN_PREFILL_TOKENS
     return max(
         _TQ_MIN_PREFILL_TOKENS,
         # Wide-head tiled prefill needs more rows to amortize materialization.
@@ -104,7 +128,9 @@ def workspace_upper_bound(
     round histories to a full scheduler page to cover every translated view.
     """
     queries = min(max_num_batched_tokens, max_num_seqs * max_model_len)
-    minimum = min_prefill_tokens(num_query_heads, num_kv_heads, head_dim)
+    minimum = min_prefill_tokens(
+        num_query_heads, num_kv_heads, head_dim, context_len=max_model_len
+    )
     if max_model_len < minimum:
         return 0
     candidates = min(max_num_seqs, queries // minimum)
@@ -160,22 +186,31 @@ def _turboquant_prefill_plan(
     workspace_limit = meta.tq_prefill_workspace_bytes
     if not workspace_limit:
         return None
-    min_tokens = min_prefill_tokens(num_query_heads, num_kv_heads, head_dim)
+    if ctx.cu_seqlens is None:
+        raise ValueError("TurboQuant prefill requires cumulative query lengths")
+    min_tokens = tuple(
+        min_prefill_tokens(
+            num_query_heads, num_kv_heads, head_dim, context_len=context_len
+        )
+        for context_len in ctx.context_lens
+    )
     key = (
         cache_block_size,
-        min_tokens,
         num_query_heads,
         num_kv_heads,
         head_dim,
         workspace_limit,
+        *min_tokens,
     )
     if key in meta.tq_prefill_plans:
         return meta.tq_prefill_plans[key]
-    if ctx.cu_seqlens is None:
-        raise ValueError("TurboQuant prefill requires cumulative query lengths")
     cu_seqlens = ctx.cu_seqlens
     lengths = [b - a for a, b in zip(cu_seqlens[:-1], cu_seqlens[1:], strict=True)]
-    candidates = [i for i, length in enumerate(lengths) if length >= min_tokens]
+    candidates = [
+        i
+        for i, (length, minimum) in enumerate(zip(lengths, min_tokens, strict=True))
+        if length >= minimum
+    ]
     if not candidates:
         meta.tq_prefill_plans[key] = None
         return None
