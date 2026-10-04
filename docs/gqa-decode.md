@@ -35,10 +35,10 @@ use the same empirical budget of 33 SIMD groups per core. Select the largest
 established path. Flooring each length separately avoids counting partial
 tails as complete work or treating short requests as copies of the longest.
 
-For multiple requests, also require `Q * request_count < 8 * C`. This is the
-existing split-KV unsplit-grid budget: retain the established route once the
-batch itself supplies that parallelism. It is a conservative admission rule,
-not a claim that grouping can never help a larger batch.
+The same complete-partition budget applies across batch sizes. The GQA
+planner does not reject a batch solely because its unsplit query-head grid
+exceeds a core-count threshold. The established per-token fallback retains
+its own split-KV policy.
 
 The single-request decision is unchanged: each partition starts at
 `P * ceil(33 * C / Q)`. Admission and promotion share one rule, with no
@@ -60,9 +60,8 @@ The budget is shared by both partitions; it has no per-model exceptions.
 
 For example, two `32/8/128` requests on that GPU start P256 at 5,376 tokens
 each and P512 at 10,752 each. Lengths `[1, 10752]` instead select P256:
-the short request supplies no complete partition. Ten such query-head groups
-already meet the unsplit-grid budget, so a ten-request batch keeps its
-established route regardless of context length.
+the short request supplies no complete partition. Ten `32/8/128` requests
+start P256 at 1,280 tokens each and P512 at 2,560 each on that GPU.
 
 Only complete partitions count toward selection. The producer, temporary
 buffers and reducer still use `ceil(KV_length / P)` so the final partial
@@ -252,9 +251,9 @@ interchangeable with serving results.
 These are directions for evaluation after this scoped change, not additional
 enablement or performance claims of this two-tier routing policy:
 
-1. **High-concurrency decode:** evaluate grouping when the unsplit batch
-   already fills the current occupancy budget. Such batches retain their
-   established route; low-concurrency results do not establish their benefit.
+1. **GQA without split-KV:** evaluate a grouped kernel that writes its final
+   output directly, independently of context partitioning. Measure its
+   tradeoff against P256/P512 at larger batch sizes.
 2. **Mixed prefill/decode:** integrate with the decode prefix split by merged
    [#851](https://github.com/vllm-project/vllm-metal/pull/851), after validating
    multi-request decode. Preserve row offsets, page tables and the prefill

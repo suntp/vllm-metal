@@ -199,7 +199,6 @@ static_assert(kPartitionSize == 512,
               "GQA partition list assumes the established 512-token split");
 constexpr std::array<int, 2> kGqaPartitionSizes = {512, 256};
 constexpr int64_t kGqaSimdGroupsPerCore = 33;
-constexpr int64_t kDecodeThreadgroupsPerCore = 8;
 
 static std::string gqa_decode_kernel_name(
     const std::string& dtype, int head_size, int block_size, int partition_size) {
@@ -262,10 +261,6 @@ static int gqa_decode_batch_partition_size(
   if (context_lens.size() == 1)
     return gqa_decode_partition_size(num_heads, context_lens[0], gpu_cores);
 
-  // Keep the established path once the unsplit batch already supplies the
-  // split-KV occupancy budget. More concurrency need not benefit from splitting.
-  const int64_t base_grid = static_cast<int64_t>(num_heads) * context_lens.size();
-  if (base_grid >= kDecodeThreadgroupsPerCore * gpu_cores) return 0;
   for (int p : kGqaPartitionSizes) {
     int64_t full_partitions = 0;
     for (int length : context_lens) full_partitions += length / p;
@@ -293,7 +288,7 @@ static int gqa_decode_batch_plan_for_shape(
 // partitions are the sweet spot, so a fixed size + a wider gate is simpler and
 // just as fast.)
 static int min_decode_grid() {
-  static const int v = gpu_core_count() * kDecodeThreadgroupsPerCore;
+  static const int v = gpu_core_count() * 8;
   return v;
 }
 

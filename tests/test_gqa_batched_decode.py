@@ -42,7 +42,14 @@ def _diagnostics_and_cores():
         ([1, 10752], 256),  # max(length) * batch would wrongly promote to 512.
         ([1, 21504], 512),
         ([65536] * 9, 512),
-        ([65536] * 10, 0),  # The unsplit grid already fills the split budget.
+        ([65536] * 10, 512),  # Batch size alone must not veto long GQA decode.
+        ([1279] * 10, 0),
+        ([1280] * 10, 256),
+        ([2559] * 10, 256),
+        ([2560] * 10, 512),
+        ([255] * 128, 0),  # Partial tails do not become complete partitions.
+        ([256] * 64, 256),
+        ([512] * 64, 512),
         ([], 0),
         ([0, 21504], 0),
         ([-1, 21504], 0),
@@ -157,8 +164,10 @@ def test_batch_gate_keeps_excluded_routes(kwargs):
     _assert_close(out, ref, mx.float16)
 
 
-@pytest.mark.parametrize("cores", [0, 4])
-def test_unknown_or_saturated_batch_uses_established_path(cores):
+@pytest.mark.parametrize("cores,expected_partition", [(0, 0), (4, 512)])
+def test_batch_uses_known_core_budget_without_unsplit_grid_veto(
+    cores, expected_partition
+):
     get_ops()._override_detected_gpu_core_count_for_test(cores)
     lengths = [1536, 1793]
     out, ref = _run_primitive(
@@ -170,8 +179,34 @@ def test_unknown_or_saturated_batch_uses_established_path(cores):
         num_decode_tokens=2,
         gqa_context_lens=lengths,
     )
-    _assert_fallback()
+    if expected_partition:
+        assert _dispatch_family() == "gqa_decode"
+        assert get_ops().last_gqa_partition_size() == expected_partition
+        assert get_ops().last_gqa_num_requests() == 2
+    else:
+        _assert_fallback()
     _assert_close(out, ref, mx.float16)
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_production_dispatch_above_legacy_split_budget(dtype):
+    lengths = [3072 + 17 * i for i in range(10)]
+    out, ref = _run_primitive(
+        lengths,
+        dtype,
+        interleaved=True,
+        seed=1041,
+        num_query_heads=32,
+        num_kv_heads=8,
+        head_size=128,
+        num_decode_requests=len(lengths),
+        num_decode_tokens=len(lengths),
+        gqa_context_lens=lengths,
+    )
+    assert _dispatch_family() == "gqa_decode"
+    assert get_ops().last_gqa_partition_size() == 512
+    assert get_ops().last_gqa_num_requests() == len(lengths)
+    _assert_close(out, ref, dtype)
 
 
 @pytest.mark.parametrize("lengths", [[1], [0, 1024], [-1, 1024], [1024, 1025]])
