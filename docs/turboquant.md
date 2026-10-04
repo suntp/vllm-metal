@@ -259,7 +259,8 @@ FP16/BF16 and 8K/32K contexts, with the same K8/V3 comparison:
 Admission uses 64 new query tokens only for signed K8/V3, hd128 with Q/KV
 heads 8/2, 8/8, 32/8 or 16/2 and total visible KV context of at least 8192
 tokens. FP16/BF16 in these tables describes activation precision, not additional
-K/V encodings. Shorter contexts, other K/V encodings and other geometries retain the original
+K/V encodings. Shorter contexts, other K/V encodings and other geometries
+retain the original
 `max(128, head_dim // 2, ceil(256 * KV_heads / Q_heads))` threshold. The context
 condition is evaluated per request, so mixed batches may contain both policies.
 The workspace cap uses the same encoding-aware policy and the minimum threshold
@@ -511,20 +512,14 @@ vllm bench serve --model /path/to/model --served-model-name tq-prefill \
 The client reports median TTFT and throughput over the full HTTP workload,
 including server queueing. These differ from the in-process TTFT probe above.
 
-For the hd128 admission-policy comparison, keep the lane enabled in both
-services and change only the admission rule: the old formula above versus
-the current context-aware policy. Use prefix caching, `--max-num-seqs 1`,
-`--max-num-batched-tokens 2048`, `--max-model-len 8328`, and
-`--enable-prompt-tokens-details`. Reset the prefix cache between cases, seed
-8193 input token IDs with one output token, then stream the same 8192-token
-prefix plus 32/64/96/128 new tokens through `/v1/completions` with eight output
-tokens, `temperature=0`, `ignore_eos=true` and `return_token_ids=true`.
-Require `usage.prompt_tokens_details.cached_tokens == 8192` and the expected
-worker-side query lengths and layer admission. Count real returned token IDs
-and verify output equality. Warm each service, exchange the old/new service
-order, and keep the same workspace allowance and KV capacity. This is a
-single-request prefix-reuse latency comparison; concurrency needs its own
-controlled serving workload.
+For the hd128 admission-policy comparison, use the
+[HTTP reproduction package](https://gist.github.com/suntp/31fb918815b34ecf48313ea2087bed1e).
+It provides a parameterized client and worker observer, the exact old-policy
+switch, original serving records and a script that verifies the published
+results. Both services keep the lane enabled and use the same model and
+capacity, with exact 8K prefix hits and returned-token validation. Download the
+package and follow its README; the in-process probe above does not replace
+this HTTP comparison.
 
 For teacher-forced perplexity, use a fixed corpus and score the same windows in
 both paths. This isolates the prefill implementation:
