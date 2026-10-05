@@ -203,3 +203,19 @@ class KVCacheStorage:
         indices = mx.array(ids, dtype=mx.int32)
         for i, page in enumerate(self.pages):
             self.pages[i] = get_ops().gdn_state_scatter(page, page, indices, zero=True)
+
+    def scatter_rows(self, rows: Sequence[mx.array], block_ids: Sequence[int]) -> None:
+        """Scatter ``rows[i]`` into page ``i`` at the ``block_ids`` slots.
+
+        One entry in ``rows`` per page, as the KV offloading worker's loads
+        provide. An MLX index-assign on a page view would never reach the
+        backing buffer, so the write goes through the native scatter like
+        ``copy_blocks`` does.
+        """
+        if not rows:
+            return
+        from vllm_metal.metal import get_ops
+
+        dst = mx.array(block_ids, dtype=mx.int32)
+        for i, page_rows in enumerate(rows):
+            self.pages[i] = get_ops().gdn_state_scatter(self.pages[i], page_rows, dst)

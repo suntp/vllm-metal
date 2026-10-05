@@ -369,6 +369,22 @@ class TestPrepareSDPAQKV:
         mx.eval(keys, values)
         assert bool(mx.all(keys == values).item())
 
+    def test_k_eq_v_fallback_when_v_proj_is_none(self) -> None:
+        # Arrange — DiffusionGemma full-attention layers keep v_proj = None
+        inner = _make_inner(with_v_proj=False)
+        inner.v_proj = None
+        ctx = _make_ctx(_SEQ_LEN)
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+
+        # Act
+        _, keys, values, _, _ = prepare_sdpa_qkv(
+            inner, x, ctx, _N_HEADS, _N_KV_HEADS, shared_kv=None
+        )
+
+        # Assert — a None v_proj takes the K-eq-V path instead of calling None
+        mx.eval(keys, values)
+        assert bool(mx.all(keys == values).item())
+
     def test_qkv_proj_path_splits_phi_style_packed_projection(self) -> None:
         # Arrange — Phi3/Phi4-style attention uses a single qkv_proj linear.
         inner = _make_qkv_inner()
@@ -1464,6 +1480,7 @@ class TestBidirectionalDispatch:
         repeat: int = 1,
         dtype: mx.Dtype = mx.float16,
         ops: object | None = None,
+        window_at_block_start: bool = False,
     ):
         cache = self._cache(dtype)
         # One decode row (17 cached tokens) and a 2-row prefill at positions 0..1.
@@ -1472,6 +1489,7 @@ class TestBidirectionalDispatch:
         assert ctx is not None
         ctx.segment_bidi_ranges = ranges
         ctx.bidi_layer_kinds = kinds
+        ctx.bidi_window_at_block_start = window_at_block_start
         inner = SimpleNamespace(
             n_heads=_N_HEADS,
             n_kv_heads=_N_KV_HEADS,
@@ -1541,6 +1559,19 @@ class TestBidirectionalDispatch:
         assert spy.calls[-1].mm_prefix_ranges.tolist() == [[-1, -1], [0, 1], [0, 1]]
         _, spy, _ = self._run(frozenset({"full"}), ranges, 1)
         assert spy.calls[-1].mm_prefix_ranges is None
+
+    def test_block_anchored_window_recomputes_sliding_layers_only(self) -> None:
+        """DiffusionGemma's canvas: the kernel windows per row, so sliding
+        layers recompute; full layers have no window and keep the kernel."""
+        kinds, ranges = frozenset({"sliding", "full"}), [None, [(0, 2)]]
+        bidi, spy, ctx = self._run(kinds, ranges, 1, window_at_block_start=True)
+        assert bidi.call_count == 1
+        assert bidi.call_args.kwargs["window"] == 1024
+        assert spy.calls[-1].mm_prefix_ranges is None
+        assert ctx.mm_prefix_rows_built is False
+        bidi, spy, _ = self._run(kinds, ranges, 0, window_at_block_start=True)
+        assert bidi.call_count == 0
+        assert spy.calls[-1].mm_prefix_ranges.tolist() == [[-1, -1], [0, 1], [0, 1]]
 
     def test_float32_cache_falls_back_to_recompute(self) -> None:
         """The tiled kernel has no float32 instantiation (the recompute path)."""

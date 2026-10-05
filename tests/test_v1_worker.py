@@ -28,8 +28,15 @@ from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT  # noqa: E402
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.config import MetalConfig
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
+from vllm_metal.utils import CommitProbe  # noqa: E402
+from vllm_metal.v1 import worker as worker_mod  # noqa: E402
 from vllm_metal.v1.cache_policy import (  # noqa: E402
+    KV_COMMIT_SAMPLE_BYTES,
+    KV_COMMIT_SWAP_TOLERANCE_DIVISOR,
+    KV_COMMIT_SWAP_TOLERANCE_FLOOR_BYTES,
     WorkerCachePlanner,
+    kv_pool_bytes_after_probe,
+    kv_swap_tolerance_bytes,
 )
 from vllm_metal.v1.worker import MetalWorker  # noqa: E402
 
@@ -115,7 +122,9 @@ def _make_worker(model_runner: object) -> MetalWorker:
         gpu_memory_utilization=0.92,
         num_gpu_blocks_override=None,
     )
-    worker.vllm_config = SimpleNamespace(cache_config=worker.cache_config)
+    worker.vllm_config = SimpleNamespace(
+        cache_config=worker.cache_config, kv_transfer_config=None
+    )
     return worker
 
 
@@ -279,6 +288,47 @@ class TestWorkerRunnerBoundaryDelegation:
 
 
 class TestPagedAttentionPlanDiagnostics:
+    @pytest.mark.parametrize(
+        "key_format,value_format,histories",
+        [
+            ("q8_0", "q3_0", 3),
+            ("int8", "q3_0", 3),
+            ("uint8", "q3_0", 1),
+            ("q4_0", "q3_0", 1),
+            ("q8_0", "q4_0", 1),
+        ],
+    )
+    def test_tq_format_controls_startup_reservation(
+        self, monkeypatch, key_format, value_format, histories
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_TQ_PREFILL", "1")
+        monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "auto")
+        monkeypatch.setattr(
+            "vllm_metal.v1.cache_policy.get_config",
+            lambda: MetalConfig(
+                mlx_device="gpu",
+                turboquant=True,
+                k_quant=key_format,
+                v_quant=value_format,
+            ),
+        )
+        runner = make_stub_runner(
+            num_kv_heads=2,
+            head_dim=128,
+            kv_cache_dtype=mx.bfloat16,
+            scheduler_config=SimpleNamespace(
+                max_num_seqs=4, max_num_batched_tokens=193
+            ),
+        )
+        runner.model_config.max_model_len = 8192
+        runner.model_config.get_num_attention_heads = lambda _: 8
+        # A 193-query step can hold three 64-token prefills or one 128-token
+        # prefill. The startup cap must cover that many independent histories,
+        # with metadata/routing overhead smaller than one additional history.
+        history_bytes = 8192 * 2 * 128 * 4
+        allowance = runner.tq_prefill_workspace_bytes
+        assert histories * history_bytes < allowance < (histories + 1) * history_bytes
+
     @pytest.mark.parametrize("length,sequences", [(512, 1), (4096, 4), (131072, 1)])
     def test_tq_auto_reservation_covers_history_and_stays_fixed(
         self, monkeypatch, length, sequences
@@ -511,3 +561,423 @@ class TestHybridPlanGuard:
 
         with pytest.raises(RuntimeError, match="HybridPagedAttentionRuntime"):
             planner.setup_paged_attention(overhead=0)
+
+
+class TestShutdownClosesConnectorStep:
+    """The connector step must end before the transfer group is torn down."""
+
+    def test_step_closes_before_kv_transfer_shutdown(self, monkeypatch) -> None:
+        order: list[str] = []
+        runner = SimpleNamespace(
+            finish_kv_connector_step=lambda: order.append("close"),
+        )
+        worker = _make_worker(runner)
+        worker._metal_profiler = None
+        monkeypatch.setattr(
+            worker_mod, "ensure_kv_transfer_shutdown", lambda: order.append("shutdown")
+        )
+        monkeypatch.setattr(worker_mod, "has_kv_transfer_group", lambda: True)
+
+        MetalWorker.shutdown(worker)
+
+        assert order == ["close", "shutdown"]
+
+    def test_shutdown_survives_a_runner_without_the_hook(self, monkeypatch) -> None:
+        """STT runners have no connector step; shutdown must not care."""
+        calls: list[str] = []
+        worker = _make_worker(SimpleNamespace())
+        worker._metal_profiler = None
+        monkeypatch.setattr(
+            worker_mod, "ensure_kv_transfer_shutdown", lambda: calls.append("shutdown")
+        )
+
+        monkeypatch.setattr(worker_mod, "has_kv_transfer_group", lambda: True)
+
+        MetalWorker.shutdown(worker)
+
+        assert calls == ["shutdown"]
+
+    def test_shutdown_without_a_transfer_group_is_upstream(self, monkeypatch) -> None:
+        """Without the offloading connector no connector teardown runs."""
+        calls: list[str] = []
+        runner = SimpleNamespace(
+            finish_kv_connector_step=lambda: calls.append("close"),
+        )
+        worker = _make_worker(runner)
+        worker._metal_profiler = None
+        monkeypatch.setattr(
+            worker_mod, "ensure_kv_transfer_shutdown", lambda: calls.append("shutdown")
+        )
+        monkeypatch.setattr(worker_mod, "has_kv_transfer_group", lambda: False)
+
+        MetalWorker.shutdown(worker)
+
+        assert calls == []
+
+
+class TestKVConnectorLifecycle:
+    """initialize_from_config wires the connector around KV cache creation.
+
+    The connector exists before ``initialize_kv_cache``, as on GPUWorker. The
+    ``KVCacheStorage`` is allocated inside ``initialize_kv_cache``, so it is
+    registered only after it.
+    """
+
+    def _worker(
+        self,
+        monkeypatch,
+        kv_transfer_config: object,
+        *,
+        has_group: bool,
+        runner_has_hook: bool = True,
+    ) -> tuple[MetalWorker, list[str]]:
+        calls: list[str] = []
+        monkeypatch.setattr(
+            worker_mod,
+            "ensure_kv_transfer_initialized",
+            lambda *_: calls.append("connector"),
+        )
+        monkeypatch.setattr(worker_mod, "has_kv_transfer_group", lambda: has_group)
+        runner = SimpleNamespace(initialize_kv_cache=lambda _cfg: calls.append("init"))
+        if runner_has_hook:
+            runner.register_kv_connector_caches = lambda: calls.append("register")
+        worker = _make_worker(runner)
+        worker.vllm_config.kv_transfer_config = kv_transfer_config
+        return worker, calls
+
+    def _kv_cache_config(self) -> SimpleNamespace:
+        return SimpleNamespace(kv_cache_layout=None)
+
+    def test_no_transfer_config_only_initializes_the_cache(self, monkeypatch) -> None:
+        worker, calls = self._worker(monkeypatch, None, has_group=False)
+        MetalWorker.initialize_from_config(worker, self._kv_cache_config())
+        assert calls == ["init"]
+
+    def test_inert_transfer_config_skips_the_guard(self, monkeypatch) -> None:
+        inert = SimpleNamespace(kv_connector=None)
+        worker, calls = self._worker(monkeypatch, inert, has_group=False)
+        MetalWorker.initialize_from_config(worker, self._kv_cache_config())
+        assert calls == ["init"]
+
+    def test_other_connector_sees_upstream_worker(self, monkeypatch) -> None:
+        """A non-offload connector gets none of the offload wiring."""
+        nixl = SimpleNamespace(kv_connector="NixlConnector")
+        worker, calls = self._worker(monkeypatch, nixl, has_group=False)
+        MetalWorker.initialize_from_config(worker, self._kv_cache_config())
+        assert calls == ["init"]
+
+    def test_connector_registers_storage_after_allocation(self, monkeypatch) -> None:
+        configured = SimpleNamespace(kv_connector="MetalOffloadingConnector")
+        worker, calls = self._worker(monkeypatch, configured, has_group=True)
+        MetalWorker.initialize_from_config(worker, self._kv_cache_config())
+        assert calls == ["connector", "init", "register"]
+
+    def test_unsupported_model_fails_before_the_kv_cache(self, monkeypatch) -> None:
+        """The connector checks the KV cache groups at construction, so an
+        unsupported model fails before the KV cache is allocated."""
+        from vllm.distributed.kv_transfer.kv_connector.factory import (
+            KVConnectorFactory,
+        )
+        from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
+
+        configured = SimpleNamespace(
+            kv_connector="MetalOffloadingConnector",
+            kv_connector_module_path="vllm_metal.v1.kv_offload.connector",
+            engine_id="test",
+        )
+        worker, calls = self._worker(monkeypatch, configured, has_group=True)
+        worker.vllm_config.scheduler_config = SimpleNamespace(
+            disable_hybrid_kv_cache_manager=False
+        )
+        monkeypatch.setattr(
+            worker_mod,
+            "ensure_kv_transfer_initialized",
+            lambda vllm_config, kv_cache_config: KVConnectorFactory.create_connector(
+                vllm_config, KVConnectorRole.WORKER, kv_cache_config
+            ),
+        )
+        group = SimpleNamespace(kv_cache_spec=None, layer_names=["layer0"])
+        kv_cache_config = SimpleNamespace(
+            kv_cache_layout=None, kv_cache_groups=[group, group]
+        )
+        with pytest.raises(NotImplementedError, match="2 groups"):
+            MetalWorker.initialize_from_config(worker, kv_cache_config)
+        assert calls == []
+
+    def test_stt_runner_rejects_offloading(self, monkeypatch) -> None:
+        configured = SimpleNamespace(kv_connector="MetalOffloadingConnector")
+        worker, _ = self._worker(
+            monkeypatch, configured, has_group=True, runner_has_hook=False
+        )
+        with pytest.raises(NotImplementedError, match="STT"):
+            MetalWorker.initialize_from_config(worker, self._kv_cache_config())
+
+    def test_handshake_metadata_is_none_without_a_connector(self, monkeypatch) -> None:
+        monkeypatch.setattr(worker_mod, "has_kv_transfer_group", lambda: False)
+        worker = _make_worker(SimpleNamespace())
+        assert worker.get_kv_connector_handshake_metadata() is None
+
+
+# The planner's budget before the commit probe: 10 GB * 0.5 - 2 GB weights -
+# 0.1 GB overhead. The reserve the probe holds back is max(1 GiB, 10 GB / 16).
+_PLANNED_KV_BUDGET = 2_900_000_000
+_PROBE_RESERVE = 1 << 30
+
+
+class TestCommitProbeBudget:
+    """The startup probe tells the machine's answer without capping the plan.
+
+    The pool is allocated lazily, so without the probe a plan the machine
+    cannot hold stays invisible until a request writes a block -- a swap storm
+    or a jetsam kill mid-generation instead of an answer at load time.
+    """
+
+    def _plan(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        free_bytes: int,
+        swap_out_bytes: int = 0,
+        per_block_bytes: int = 1_000_000,
+        turboquant_workspace: int = 0,
+    ):
+        worker = _make_worker(
+            SimpleNamespace(
+                is_hybrid=False,
+                tq_prefill_workspace_bytes=turboquant_workspace,
+            )
+        )
+        worker.cache_config.gpu_memory_utilization = 0.5
+        worker.get_cache_block_size_bytes = MagicMock(return_value=per_block_bytes)
+        planner = WorkerCachePlanner(worker)
+        monkeypatch.setattr(
+            WorkerCachePlanner, "_metal_limit_bytes", lambda self: 10_000_000_000
+        )
+        monkeypatch.setattr(
+            WorkerCachePlanner, "get_model_memory_usage", lambda self: 2_000_000_000
+        )
+        monkeypatch.setattr(
+            "vllm_metal.v1.cache_policy.get_config",
+            lambda: MetalConfig(
+                mlx_device="gpu", turboquant=bool(turboquant_workspace)
+            ),
+        )
+        monkeypatch.setenv("VLLM_METAL_KV_COMMIT_PROBE", "1")
+
+        def fake_probe(nbytes: int) -> CommitProbe:
+            assert nbytes == min(_PLANNED_KV_BUDGET, KV_COMMIT_SAMPLE_BYTES)
+            return CommitProbe(
+                probed_bytes=nbytes,
+                swap_out_before=1_000,
+                swap_out_after=1_000 + swap_out_bytes,
+                available_before=free_bytes,
+                available_after=free_bytes,
+                seconds=0.01,
+            )
+
+        monkeypatch.setattr("vllm_metal.v1.cache_policy.probe_commit", fake_probe)
+        return planner._paged_attention_plan(overhead=100_000_000)
+
+    def test_pool_that_fits_free_memory_is_left_alone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        plan = self._plan(monkeypatch, free_bytes=8 << 30)
+
+        assert plan.kv_budget == _PLANNED_KV_BUDGET
+        assert plan.num_blocks == 2_900
+
+    def test_busy_machine_keeps_the_capacity_it_was_given(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Free memory below the plan is reported, not charged to capacity.
+
+        The pool backs blocks as requests use them, so an idle pool never needs
+        the blocks the plan allows; shrinking to today's free memory would hand
+        back exactly the capacity the lazy allocation exists to keep.
+        """
+        caplog.set_level("WARNING", logger="vllm_metal.v1.cache_policy")
+
+        plan = self._plan(monkeypatch, free_bytes=2 << 30)
+
+        assert plan.kv_budget == _PLANNED_KV_BUDGET
+        assert plan.num_blocks == 2_900
+        assert "larger than this machine's free memory" in caplog.text
+
+    def test_a_machine_that_pages_is_charged_to_capacity(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Paging to back the sample is the machine saying it has no headroom."""
+        caplog.set_level("WARNING", logger="vllm_metal.v1.cache_policy")
+        over_tolerance = kv_swap_tolerance_bytes(KV_COMMIT_SAMPLE_BYTES) + 1
+
+        plan = self._plan(
+            monkeypatch,
+            free_bytes=2 << 30,
+            swap_out_bytes=over_tolerance,
+        )
+
+        # Free memory less the reserve, kept to the byte: vLLM picks its own
+        # grouped layout from the budget it is handed.
+        assert plan.kv_budget == (2 << 30) - _PROBE_RESERVE
+        # The count-based path still gets whole blocks of the dense estimate.
+        assert plan.num_blocks == 1_073
+        assert plan.per_block_bytes == 1_000_000
+        assert plan.fraction == 0.5
+        assert "sized down" in caplog.text
+
+    def test_reclaimed_swap_does_not_hide_new_paging(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Occupancy can fall while the kernel is paging.
+
+        A probe that measured swap *occupancy* would read flat here: the kernel
+        swapped the sample out and reclaimed an equal amount elsewhere. The
+        cumulative counter is what says the machine paged.
+        """
+        caplog.set_level("WARNING", logger="vllm_metal.v1.cache_policy")
+        over_tolerance = kv_swap_tolerance_bytes(KV_COMMIT_SAMPLE_BYTES) + 1
+
+        plan = self._plan(
+            monkeypatch,
+            free_bytes=2 << 30,
+            swap_out_bytes=over_tolerance,
+        )
+
+        assert plan.kv_budget == (2 << 30) - _PROBE_RESERVE
+        assert "sized down" in caplog.text
+
+    def test_capacity_survives_a_fit_below_one_dense_block(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A positive fit under the dense estimate is still a budget.
+
+        vLLM chooses the real (grouped) layout from the bytes it is handed, and
+        the dense per-block estimate here is larger than the whole fit, so
+        rounding to it would hand vLLM nothing at all.
+        """
+        plan = self._plan(
+            monkeypatch,
+            free_bytes=2 << 30,
+            swap_out_bytes=kv_swap_tolerance_bytes(KV_COMMIT_SAMPLE_BYTES) + 1,
+            per_block_bytes=2 << 30,
+        )
+
+        assert plan.kv_budget == (2 << 30) - _PROBE_RESERVE
+        assert plan.num_blocks == 0
+
+    def test_engine_workspace_is_carved_out_of_the_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Retained workspace is not part of what is free for the pool.
+
+        The TurboQuant prefill workspace is reserved before sizing and kept for
+        the life of the server, so a cap that spends all of free memory on KV
+        would put the engine's own workspace back into swap.
+        """
+        workspace = 1 << 30
+
+        plan = self._plan(
+            monkeypatch,
+            free_bytes=3 << 30,
+            swap_out_bytes=kv_swap_tolerance_bytes(KV_COMMIT_SAMPLE_BYTES) + 1,
+            turboquant_workspace=workspace,
+        )
+
+        # Without the carve-out the cap would be 2 GiB (free less the reserve),
+        # which is above the 1.7 GiB plan; with it the pool gets 1 GiB.
+        assert plan.kv_budget == (3 << 30) - _PROBE_RESERVE - workspace
+
+    def test_background_paging_is_not_pressure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Other processes paging out a few MB must not cost the pool capacity."""
+        plan = self._plan(monkeypatch, free_bytes=2 << 30, swap_out_bytes=8 << 20)
+
+        assert plan.kv_budget == _PLANNED_KV_BUDGET
+
+    def test_probe_can_be_switched_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        worker = _make_worker(SimpleNamespace(is_hybrid=False))
+        worker.cache_config.gpu_memory_utilization = 0.5
+        worker.get_cache_block_size_bytes = MagicMock(return_value=1_000_000)
+        planner = WorkerCachePlanner(worker)
+        monkeypatch.setattr(
+            WorkerCachePlanner, "_metal_limit_bytes", lambda self: 10_000_000_000
+        )
+        monkeypatch.setattr(
+            WorkerCachePlanner, "get_model_memory_usage", lambda self: 2_000_000_000
+        )
+        monkeypatch.setenv("VLLM_METAL_KV_COMMIT_PROBE", "0")
+        monkeypatch.setattr(
+            "vllm_metal.v1.cache_policy.probe_commit",
+            lambda nbytes: pytest.fail("probe ran while switched off"),
+        )
+
+        plan = planner._paged_attention_plan(overhead=100_000_000)
+
+        assert plan.kv_budget == _PLANNED_KV_BUDGET
+        assert plan.num_blocks == 2_900
+
+
+class TestKvPoolBytesAfterProbe:
+    """The probe's arithmetic, where a plan starts costing capacity."""
+
+    _TOLERANCE = kv_swap_tolerance_bytes(512 << 20)
+
+    @staticmethod
+    def _probe(available_before: int, probed_bytes: int, swap_out_bytes: int):
+        return CommitProbe(
+            probed_bytes=probed_bytes,
+            swap_out_before=0,
+            swap_out_after=swap_out_bytes,
+            available_before=available_before,
+            available_after=available_before,
+            seconds=0.0,
+        )
+
+    def _fit(
+        self, plan: int, probe: CommitProbe, *, future_reserved_bytes: int = 0
+    ) -> int:
+        return kv_pool_bytes_after_probe(
+            plan,
+            probe,
+            reserve_bytes=1 << 30,
+            future_reserved_bytes=future_reserved_bytes,
+            swap_tolerance_bytes=self._TOLERANCE,
+        )
+
+    def test_free_memory_short_of_the_plan_is_not_a_reason_to_shrink(self) -> None:
+        assert self._fit(6 << 30, self._probe(2 << 30, 512 << 20, 0)) == 6 << 30
+
+    def test_paging_beyond_the_tolerance_caps_at_free_memory(self) -> None:
+        probe = self._probe(3 << 30, 512 << 20, self._TOLERANCE + 1)
+
+        assert self._fit(6 << 30, probe) == (3 << 30) - (1 << 30)
+
+    def test_future_reservations_are_not_available_to_the_pool(self) -> None:
+        probe = self._probe(4 << 30, 512 << 20, self._TOLERANCE + 1)
+
+        assert self._fit(6 << 30, probe, future_reserved_bytes=2 << 30) == 1 << 30
+
+    def test_paging_inside_the_tolerance_is_noise(self) -> None:
+        probe = self._probe(2 << 30, 512 << 20, self._TOLERANCE)
+
+        assert self._fit(6 << 30, probe) == 6 << 30
+
+    def test_a_cap_never_goes_negative(self) -> None:
+        """Free memory below the reserve leaves no pool, not a negative one."""
+        probe = self._probe(1 << 29, 512 << 20, self._TOLERANCE + 1)
+
+        assert self._fit(6 << 30, probe, future_reserved_bytes=2 << 30) == 0
+
+
+class TestSwapTolerance:
+    """The tolerance floor, where a fraction of a small probe rounds to nothing."""
+
+    def test_a_small_probe_still_tolerates_background_paging(self) -> None:
+        assert kv_swap_tolerance_bytes(1 << 20) == KV_COMMIT_SWAP_TOLERANCE_FLOOR_BYTES
+
+    def test_a_large_probe_scales_with_its_size(self) -> None:
+        assert (
+            kv_swap_tolerance_bytes(512 << 20)
+            == (512 << 20) // KV_COMMIT_SWAP_TOLERANCE_DIVISOR
+        )

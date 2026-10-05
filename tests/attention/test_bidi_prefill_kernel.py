@@ -199,6 +199,50 @@ def test_block_rows_are_recomputed_with_the_bidirectional_mask(window) -> None:
     assert ctx.bidi_logged is True
 
 
+@pytest.mark.parametrize("canvas", [32, 200])
+def test_decoder_canvas_window_is_anchored_at_the_block_start(canvas) -> None:
+    """DiffusionGemma: every canvas row sees the last ``window - 1`` committed
+    keys plus the whole canvas, even with a canvas longer than the window.
+
+    The canvas is the whole query, so every row is recomputed and the kernel
+    output underneath is irrelevant.
+    """
+    window, b0 = 128, 400
+    b1 = b0 + canvas
+    n, seq_len = canvas, b1
+    key_cache, value_cache, query, table = _setup(5, n=n, seq_len=seq_len)
+    out = mx.zeros((n, HEADS, HD), dtype=DTYPE)
+    ctx = _ctx(n, seq_len, [(b0, b1)])
+    ctx.bidi_window_at_block_start = True
+    got = apply_bidirectional_segments(
+        out,
+        query,
+        key_cache,
+        value_cache,
+        block_tables=table,
+        block_size=BLOCK,
+        cu_seqlens=[0, n],
+        context_lens=[seq_len],
+        ctx=ctx,
+        window=window,
+        scale=HD**-0.5,
+        head_dim=HD,
+        softcap=0.0,
+        sinks=None,
+        turboquant=False,
+    )
+    mx.eval(got)
+    k_lo = b0 - (window - 1)
+    row_table = table[0].tolist()
+    ref = _ref_attention(
+        np.array(query.astype(mx.float32)),
+        _rows(key_cache, row_table, k_lo, b1),
+        _rows(value_cache, row_table, k_lo, b1),
+        np.ones((n, b1 - k_lo), dtype=bool),
+    )
+    np.testing.assert_allclose(np.array(got), ref, atol=1.5e-2, rtol=1e-2)
+
+
 def test_block_head_in_context_is_read_from_the_cache() -> None:
     """Prefix-hit shape: the block starts below q_lo, only its tail is recomputed."""
     n, seq_len, window = 64, 300, 128

@@ -13,6 +13,16 @@ from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
 )
+from vllm.distributed.kv_transfer import (
+    ensure_kv_transfer_initialized,
+    ensure_kv_transfer_shutdown,
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorHandshakeMetadata,
+)
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.tasks import SupportedTask
@@ -32,7 +42,7 @@ from vllm_metal.config import get_config
 from vllm_metal.distributed import PipelineGroup
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.utils import set_wired_limit
-from vllm_metal.v1.cache_policy import WorkerCachePlanner
+from vllm_metal.v1.cache_policy import WorkerCachePlanner, uses_metal_offloading
 
 if TYPE_CHECKING:
     from vllm_metal.profiler.wrapper import MetalProfilerWrapper
@@ -248,7 +258,41 @@ class MetalWorker(WorkerBase):
         # layout through the config.
         if kv_cache_config.kv_cache_layout is not None:
             record_kv_cache_layout(self.cache_config, kv_cache_config.kv_cache_layout)
+
+        if not uses_metal_offloading(self.vllm_config):
+            self.model_runner.initialize_kv_cache(kv_cache_config)
+            return
+
+        # Create the worker-side connector before the KV cache, as
+        # GPUWorker.initialize_from_config does. It refuses unsupported models.
+        ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
+        if not hasattr(self.model_runner, "register_kv_connector_caches"):
+            raise NotImplementedError(
+                "KV offloading is not supported for STT models on Metal."
+            )
+        # initialize_kv_cache allocates the KVCacheStorage, so the connector
+        # can only be handed it now.
+        self.model_runner.register_kv_connector_caches()
+
+    def get_kv_connector_handshake_metadata(
+        self,
+    ) -> dict[tuple[int, int], KVConnectorHandshakeMetadata] | None:
+        """Return KV connector handshake metadata keyed by (pp_rank, tp_rank).
+
+        Called by the engine core whenever a KV connector is configured.
+        Follows ``GPUWorker``; the offloading connector returns ``None``.
+        """
+        if not has_kv_transfer_group():
+            return None
+
+        connector = get_kv_transfer_group()
+        if (metadata := connector.get_handshake_metadata()) is None:
+            return None
+
+        pp_rank = get_pp_group().rank_in_group
+        tp_rank = get_tp_group().rank_in_group
+        return {(pp_rank, tp_rank): metadata}
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         """Warm up the model for inference."""
@@ -398,6 +442,23 @@ class MetalWorker(WorkerBase):
 
     def shutdown(self) -> None:
         """Shutdown the worker and cleanup resources."""
+        if has_kv_transfer_group():
+            # Close any open connector step first. If execute_model opened one
+            # and sample_tokens never ran, its exit path still needs the
+            # transfer group that ensure_kv_transfer_shutdown drops.
+            runner = getattr(self, "model_runner", None)
+            finish_step = getattr(runner, "finish_kv_connector_step", None)
+            if finish_step is not None:
+                try:
+                    finish_step()
+                except Exception:
+                    logger.exception("Closing the KV connector step failed; continuing")
+            try:
+                ensure_kv_transfer_shutdown()
+            except Exception:
+                # Never let connector teardown block profiler or model cleanup.
+                logger.exception("KV transfer shutdown failed; continuing")
+
         if self._metal_profiler is not None:
             self._metal_profiler.shutdown()
             self._metal_profiler = None

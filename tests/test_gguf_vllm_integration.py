@@ -396,13 +396,17 @@ def test_remote_reference_grammar() -> None:
         assert not GGUFEngineIntegration.is_remote_gguf_reference(ref), ref
 
 
-def test_remote_load_source_downloads_one_matching_gguf(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("quant", ["Q8_0", "Q5_0", "Q5_1"])
+def test_remote_load_source_downloads_one_matching_gguf(
+    tmp_path, monkeypatch, quant: str
+) -> None:
+    monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", False)
     weight_snapshot = tmp_path / "weights"
     config_snapshot = tmp_path / "config"
     tokenizer_snapshot = tmp_path / "tokenizer"
     for directory in (weight_snapshot, config_snapshot, tokenizer_snapshot):
         directory.mkdir()
-    gguf_path = weight_snapshot / "Qwen3-0.6B-Q8_0.gguf"
+    gguf_path = weight_snapshot / f"Qwen3-0.6B-{quant}.gguf"
     gguf_path.write_text("dummy")
     list_calls: list[dict[str, object]] = []
     calls: list[dict[str, object]] = []
@@ -431,6 +435,7 @@ def test_remote_load_source_downloads_one_matching_gguf(tmp_path, monkeypatch) -
         download_dir=str(tmp_path / "cache"), ignore_patterns=["*.md"]
     )
     model_config = _remote_gguf_model_config(
+        model_weights=f"Qwen/Qwen3-0.6B-GGUF:{quant}",
         tokenizer="Qwen/Qwen3-0.6B-Tokenizer",
         revision="rev-a",
         tokenizer_revision="tok-rev",
@@ -553,7 +558,7 @@ def test_remote_load_source_rejects_unsupported_qtype_before_download(
 
     assert str(excinfo.value) == (
         "Remote GGUF qtype 'Q4_K_M' is not supported by vllm-metal; "
-        "supported qtypes: BF16, F16, F32, Q4_0, Q4_1, Q8_0."
+        "supported qtypes: BF16, F16, F32, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0."
     )
 
 

@@ -246,6 +246,11 @@ class GGUFMLXQuantizedTensor:
         return codes, d, d * -128
 
     @staticmethod
+    def _split_nibbles(nibbles: mx.array) -> mx.array:
+        """Split packed nibble bytes along the last axis into low then high codes."""
+        return mx.concatenate([nibbles & 0x0F, nibbles >> 4], axis=-1)
+
+    @staticmethod
     def _parse_q4_0(blocks: mx.array) -> tuple[mx.array, mx.array, mx.array]:
         """Split 18-byte Q4_0 blocks (fp16 ``d``, 16 nibble bytes).
 
@@ -253,8 +258,7 @@ class GGUFMLXQuantizedTensor:
         in its high nibble; ``w = d*(q-8)``, so ``scale = d`` and ``bias = -8*d``.
         """
         d = blocks[:, 0:2].view(mx.float16)
-        nibbles = blocks[:, 2:18]
-        codes = mx.concatenate([nibbles & 0x0F, nibbles >> 4], axis=1)
+        codes = GGUFMLXQuantizedTensor._split_nibbles(blocks[:, 2:18])
         return codes, d, d * -8
 
     @staticmethod
@@ -266,8 +270,7 @@ class GGUFMLXQuantizedTensor:
         """
         d = blocks[:, 0:2].view(mx.float16)
         m = blocks[:, 2:4].view(mx.float16)
-        nibbles = blocks[:, 4:20]
-        codes = mx.concatenate([nibbles & 0x0F, nibbles >> 4], axis=1)
+        codes = GGUFMLXQuantizedTensor._split_nibbles(blocks[:, 4:20])
         return codes, d, m
 
     @staticmethod
@@ -278,7 +281,8 @@ class GGUFMLXQuantizedTensor:
         ``bias = -16*d``.
         """
         d = blocks[:, 0:2].view(mx.float16)
-        codes = GGUFMLXQuantizedTensor._join_fifth_bits(blocks[:, 6:22], blocks[:, 2:6])
+        low = GGUFMLXQuantizedTensor._split_nibbles(blocks[:, 6:22])
+        codes = GGUFMLXQuantizedTensor._join_fifth_bits(low, blocks[:, 2:6])
         return codes, d, d * -16
 
     @staticmethod
@@ -290,17 +294,17 @@ class GGUFMLXQuantizedTensor:
         """
         d = blocks[:, 0:2].view(mx.float16)
         m = blocks[:, 2:4].view(mx.float16)
-        codes = GGUFMLXQuantizedTensor._join_fifth_bits(blocks[:, 8:24], blocks[:, 4:8])
+        low = GGUFMLXQuantizedTensor._split_nibbles(blocks[:, 8:24])
+        codes = GGUFMLXQuantizedTensor._join_fifth_bits(low, blocks[:, 4:8])
         return codes, d, m
 
     @staticmethod
-    def _join_fifth_bits(nibbles: mx.array, qh: mx.array) -> mx.array:
-        """Combine Q4_0-ordered nibbles with the fifth bits packed in ``qh``.
+    def _join_fifth_bits(low: mx.array, qh: mx.array) -> mx.array:
+        """Add the fifth bits packed in ``qh`` to the 4-bit codes ``low``.
 
         ``qh`` holds the 4 bytes of a little-endian ``uint32`` whose bit ``i``
         is element ``i``'s fifth bit, i.e. bit ``i % 8`` of byte ``i // 8``.
         """
-        low = mx.concatenate([nibbles & 0x0F, nibbles >> 4], axis=1)
         byte_bits = mx.arange(8, dtype=mx.uint8)
         high = ((qh[:, :, None] >> byte_bits) & 1).reshape(qh.shape[0], 32)
         return low | (high << 4)
@@ -361,9 +365,8 @@ class GGUFMLXQuantizedTensor:
         """Split 128 nibble bytes into (n, 8, 32) codes; chunk ``j`` of 32
         bytes carries group ``2j`` low and group ``2j+1`` high."""
         n_blocks = nibble_bytes.shape[0]
-        nibbles = nibble_bytes.reshape(n_blocks, 4, 1, 32)
-        halves = mx.concatenate([nibbles & 0x0F, nibbles >> 4], axis=2)
-        return halves.reshape(n_blocks, 8, 32)
+        chunks = nibble_bytes.reshape(n_blocks, 4, 32)
+        return GGUFMLXQuantizedTensor._split_nibbles(chunks).reshape(n_blocks, 8, 32)
 
     @staticmethod
     def _pack_codes_le(codes: mx.array, bits: int) -> mx.array:

@@ -12,6 +12,7 @@ Key contracts:
 """
 
 from collections.abc import Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from importlib.metadata import entry_points
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeAlias, cast
@@ -20,6 +21,11 @@ import mlx.core as mx
 import numpy as np
 import torch
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer import (
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
+from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -37,12 +43,16 @@ from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     DraftTokenIds,
+    KVConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
 )
 from vllm.v1.sample.logits_processor import LOGITSPROCS_GROUP
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.worker.kv_connector_model_runner_mixin import (
+    KVConnectorModelRunnerMixin,
+)
 
 from vllm_metal import envs
 from vllm_metal.attention.context import (
@@ -78,6 +88,7 @@ from vllm_metal.v1.decode_pipeline import (
     SamplingShape,
     SchedulerStepShape,
 )
+from vllm_metal.v1.diffusion import DiffusionGemmaRuntime, validate_diffusion_model
 from vllm_metal.v1.draft_model_proposer import (
     DraftDims,
     DraftModelProposer,
@@ -316,8 +327,8 @@ def text_path_selective_logits_allowed(is_vlm: bool, adapter: Any | None) -> boo
     declares ``text_path_selective_logits_ok``: its text batches run the
     plain text path on the very object ``runner.model`` refers to, so the
     bit-exactness probe in ``supports_selective_logits`` applies.  The mm
-    forward never requests selected rows, so the flag affects text batches
-    only.
+    forward selects rows only when the adapter also provides
+    ``call_lm_hidden_states``.
     """
     if not is_vlm:
         return True
@@ -356,6 +367,11 @@ class MetalModelRunner:
 
     Implements the vLLM v1 model runner interface for Apple Silicon.
     """
+
+    # Class-level defaults so stub runners built via __new__ are safe on
+    # paths that check connector state.
+    _kv_connector_stack: ExitStack | None = None
+    _kv_connector_output: KVConnectorOutput | None = None
 
     def __init__(self, vllm_config: VllmConfig):
         """Initialize model runner.
@@ -405,6 +421,12 @@ class MetalModelRunner:
         )
         self._gemma4_mtp_assistant: Gemma4MTPAssistantRuntime | None = None
         self._drafter: MetalProposer | None = None
+        # Block-diffusion LMs run their own step protocol (v1/diffusion.py).
+        self._diffusion: DiffusionGemmaRuntime | None = (
+            DiffusionGemmaRuntime(self)
+            if getattr(self.model_config, "is_diffusion", False)
+            else None
+        )
         self._aux_capture: AuxHiddenStateCapture | None = None
         # Cache planning needs the draft shape before weights load.
         # The paged cache binds after planning.
@@ -426,6 +448,10 @@ class MetalModelRunner:
         self._sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
 
         self._draft_token_ids: DraftTokenIds | None = None
+        # KV connector step context, held open across the execute_model /
+        # sample_tokens split (see _kv_connector_start_step).
+        self._kv_connector_stack: ExitStack | None = None
+        self._kv_connector_output: KVConnectorOutput | None = None
 
         # Paged attention state (set by worker during cache initialization)
         self._paged_attention_runtime: PagedAttentionRuntime | None = None
@@ -636,6 +662,8 @@ class MetalModelRunner:
         self._model_lifecycle.load()
         if self._uses_encoder_pooling_backend():
             return
+        if self._diffusion is not None:
+            validate_diffusion_model(self.model)
         # Prune non-owned layers adjacent to the (lazy) load, before LoRA setup or
         # cache profiling materialize weights. No-op on the single-stage path.
         if self.pp is not None:
@@ -663,8 +691,8 @@ class MetalModelRunner:
             max_position_embeddings=max_position_embeddings,
         )
         # Probed here because it runs a cacheless one-token forward, which is
-        # only safe before a paged context is installed. PP and multimodal take
-        # other forward branches that never request selection.
+        # only safe before a paged context is installed. PP takes another
+        # forward branch that never requests selection.
         self._selective_logits_supported = (
             self.pp is None
             and text_path_selective_logits_allowed(
@@ -852,6 +880,25 @@ class MetalModelRunner:
             [*decode_bounds, *range(num_decode_rows + 1, num_selected + 1)],
         )
 
+    def _needs_prompt_logprob_rows(self, prefill_reqs: list[PrefillRequest]) -> bool:
+        """Whether a prompt-logprobs request needs every packed prompt row."""
+        needed = self._prompt_logprobs_tracker.wants_any(
+            pr.req_id for pr in prefill_reqs
+        )
+        if needed:
+            # The profiled activation allowance covers the rows the
+            # sampler reads (see _profile_logits_indices); this step
+            # projects every packed prompt position instead, so say so
+            # once rather than letting the KV budget look inclusive.
+            logger.warning_once(
+                "A step with prompt logprobs projects a logits row for every "
+                "packed prompt position — up to max_num_batched_tokens x vocab "
+                "— which the profiled activation allowance does not reserve. "
+                "Lower --gpu-memory-utilization if these requests share a "
+                "large KV cache."
+            )
+        return needed
+
     def _target_input_embeddings(self, input_ids: mx.array) -> mx.array:
         return self._model_adapter.target_input_embeddings(
             self._forward_model, input_ids
@@ -878,6 +925,80 @@ class MetalModelRunner:
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """Initialize runtime caches from the engine's KV cache config."""
         self._cache_policy.initialize_kv_cache(kv_cache_config)
+
+    def register_kv_connector_caches(self) -> None:
+        """Hand the runtime's KV storage to the KV connector.
+
+        Called by the worker after ``initialize_kv_cache`` when a KV connector
+        is configured. Only the SDPA runtime binds vLLM's allocation as
+        ``KVCacheStorage``. Hybrid, MLA and count-based (draft model) caches
+        have nothing the connector can address.
+        """
+        from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
+
+        runtime = self._paged_attention_runtime
+        storage = None
+        if isinstance(runtime, SDPAPagedAttentionRuntime):
+            try:
+                storage = runtime.storage
+            except RuntimeError:
+                storage = None
+        if storage is None:
+            raise NotImplementedError(
+                "KV offloading on Metal requires the SDPA paged attention "
+                "runtime with storage bound from the KV cache config; "
+                f"{type(runtime).__name__} provides none."
+            )
+        get_kv_transfer_group().register_kv_caches(storage)
+
+    def _kv_connector_start_step(self, scheduler_output: SchedulerOutput) -> None:
+        """Open the connector step context for this step.
+
+        Holds the mixin's context open across execute_model and sample_tokens.
+        Must run before the forward, so sync loads land before attention reads.
+        """
+        if self._kv_connector_stack is not None:
+            # A previous step raised between start and finish. Close it here:
+            # a context left open breaks the store-flush ordering and writes
+            # the wrong KV into the offload pool.
+            logger.error("Closing leaked KV connector step context.")
+            self._close_kv_connector_step()
+        stack = ExitStack()
+        stack.enter_context(set_forward_context(None, self.vllm_config))
+        # The private form on purpose. The public wrapper re-checks
+        # has_kv_transfer_group() and would turn a missing group into a
+        # silent no-op. The caller has already checked it.
+        self._kv_connector_output = stack.enter_context(
+            KVConnectorModelRunnerMixin._get_kv_connector_output(scheduler_output)
+        )
+        self._kv_connector_stack = stack
+
+    def _close_kv_connector_step(self) -> KVConnectorOutput | None:
+        stack = self._kv_connector_stack
+        output = self._kv_connector_output
+        self._kv_connector_stack = None
+        self._kv_connector_output = None
+        if stack is not None:
+            stack.close()  # fills `output` in the mixin's finally block
+        return output
+
+    def finish_kv_connector_step(self) -> KVConnectorOutput | None:
+        """Close this step's connector context, if one is open.
+
+        Idempotent. Every exit that ends a step goes through here, including
+        worker shutdown. A no-op without a KV connector.
+        """
+        if self._kv_connector_stack is None or not has_kv_transfer_group():
+            return None
+        return self._close_kv_connector_step()
+
+    def _attach_kv_connector_output(
+        self, output: ModelRunnerOutput
+    ) -> ModelRunnerOutput:
+        kv_connector_output = self.finish_kv_connector_step()
+        if kv_connector_output is not None:
+            output.kv_connector_output = kv_connector_output
+        return output
 
     def reset_mm_cache(self) -> None:
         """Reset profiling-time multimodal cache state when present."""
@@ -941,6 +1062,12 @@ class MetalModelRunner:
         Does not check ``adapter.forward_ready``; callers do that.
         """
         return self._supports_mm_inputs or adapter.requires_explicit_positions
+
+    def _mm_forward_selects_rows(self, adapter: MultimodalRuntimeAdapter) -> bool:
+        """Whether the mm forward projects only the rows the sampler reads."""
+        return self._selective_logits_supported and callable(
+            getattr(adapter, "call_lm_hidden_states", None)
+        )
 
     @staticmethod
     def _mm_forward_forced(adapter: MultimodalRuntimeAdapter | None) -> bool:
@@ -1009,26 +1136,28 @@ class MetalModelRunner:
 
         ``None`` keeps the full-row projection whenever selection cannot apply
         (pipeline parallel, LoRA, an adapter that rejects it), whenever a
-        multimodal step can run, or when the batch is smaller than the rows a
-        step can sample. The mm forward projects every packed row, so a
+        multimodal step can run without selecting rows, or when the batch is
+        smaller than the rows a step can sample. An mm forward without
+        ``call_lm_hidden_states`` projects every packed row, so such a
         forward-ready adapter keeps the full reserve when vLLM accepts
         multimodal inputs or the adapter requires explicit positions.
 
         This is the *sampler's* worst case. A step whose batch carries a
         prompt-logprobs request projects a logits row for every packed prompt
-        position instead — ``needs_prompt_logprob_rows`` skips both pruning
-        paths — so those steps can exceed the profiled allowance by up to
-        ``max_num_batched_tokens x vocab x dtype size`` (the whole-batch logits
-        tensor). That path is opt-in per request and cannot be disabled by
-        configuration: vLLM caps ``prompt_logprobs`` at ``max_logprobs``, but
-        ``prompt_logprobs=0`` is still accepted. ``_start_paged_forward``
-        warns once when a step first takes it.
+        position instead — steps where :meth:`_needs_prompt_logprob_rows` holds
+        skip every pruning path — so those steps can exceed the profiled
+        allowance by up to ``max_num_batched_tokens x vocab x dtype size`` (the
+        whole-batch logits tensor). That path is opt-in per request and cannot
+        be disabled by configuration: vLLM caps ``prompt_logprobs`` at
+        ``max_logprobs``, but ``prompt_logprobs=0`` is still accepted.
+        :meth:`_needs_prompt_logprob_rows` warns once when a step first takes it.
         """
         adapter = self._multimodal_adapter
         if not self._selective_logits_supported or (
             adapter is not None
             and adapter.forward_ready
             and self._mm_step_can_run(adapter)
+            and not self._mm_forward_selects_rows(adapter)
         ):
             return None
         rows = int(input_ids.shape[-1])
@@ -1393,13 +1522,28 @@ class MetalModelRunner:
                     offset_caches,
                 )
             elif use_mm_forward:
+                assert adapter is not None
+                selects = self._mm_forward_selects_rows(adapter)
+                if selects and not self._needs_prompt_logprob_rows(prefill_reqs):
+                    logits_layout = self._paged_logits_layout(
+                        cu_seqlens,
+                        num_decode_segments=len(decode_segments),
+                    )
                 model_output, mm_prefill_deltas = self._run_mm_paged_forward(
                     input_ids,
                     offset_caches,
                     prefill_reqs,
                     decode_segments,
+                    hidden_states_only=logits_layout.indices is not None,
                 )
-                logits = self._extract_logits(model_output)
+                if logits_layout.indices is None:
+                    logits = self._extract_logits(model_output)
+                else:
+                    logits = self._model_adapter.project_logits(
+                        self._forward_model,
+                        model_output,
+                        logits_indices=logits_layout.indices,
+                    )
                 target_hidden_states = None
                 del model_output
             elif self.pp is not None and self.pp.size > 1:
@@ -1436,21 +1580,9 @@ class MetalModelRunner:
                 # position, so their steps skip both head-pruning paths: the
                 # projection-free intermediate forward (no logits at all) and
                 # the selective layout (last prefill row only).
-                needs_prompt_logprob_rows = self._prompt_logprobs_tracker.wants_any(
-                    pr.req_id for pr in prefill_reqs
+                needs_prompt_logprob_rows = self._needs_prompt_logprob_rows(
+                    prefill_reqs
                 )
-                if needs_prompt_logprob_rows:
-                    # The profiled activation allowance covers the rows the
-                    # sampler reads (see _profile_logits_indices); this step
-                    # projects every packed prompt position instead, so say so
-                    # once rather than letting the KV budget look inclusive.
-                    logger.warning_once(
-                        "A step with prompt logprobs projects a logits row for every "
-                        "packed prompt position — up to max_num_batched_tokens x vocab "
-                        "— which the profiled activation allowance does not reserve. "
-                        "Lower --gpu-memory-utilization if these requests share a "
-                        "large KV cache."
-                    )
                 if (
                     intermediate_only
                     and self._intermediate_forward_supported
@@ -2109,8 +2241,13 @@ class MetalModelRunner:
         offset_caches: list[OffsetCache],
         prefill_reqs: list[PrefillRequest],
         decode_segments: tuple[PagedDecodeSegment, ...],
+        *,
+        hidden_states_only: bool = False,
     ) -> tuple[Any, dict[str, int]]:
         """Run paged forward through ``adapter.call_lm`` with packed splice.
+
+        ``hidden_states_only`` calls ``adapter.call_lm_hidden_states`` instead
+        and returns the final hidden states, for the caller's selective head.
 
         Builds per-segment M-RoPE positions (sliced out of the full-prompt
         positions for mm prefill chunks, computed as ``cache_start_pos +
@@ -2350,7 +2487,12 @@ class MetalModelRunner:
             req_id: int(meta[1]) for req_id, meta in mm_request_meta.items()
         }
 
-        model_output = adapter.call_lm(
+        call_lm = (
+            cast(Any, adapter).call_lm_hidden_states
+            if hidden_states_only
+            else adapter.call_lm
+        )
+        model_output = call_lm(
             input_ids,
             inputs_embeds,
             offset_caches,
@@ -2825,6 +2967,8 @@ class MetalModelRunner:
             raise RuntimeError("Model not loaded")
         if self._uses_encoder_pooling_backend():
             return self._run_encoder_pooling_batch(scheduler_output)
+        if self._diffusion is not None:
+            return self._diffusion.execute_model(scheduler_output)
 
         # Gate the decode pipeline for this step BEFORE any state mutation:
         # an ineligible step must resolve the pending deferred sample first so
@@ -2874,6 +3018,22 @@ class MetalModelRunner:
         if spec_decode_error is not None:
             raise spec_decode_error
 
+        if has_kv_transfer_group():
+            kv_connector_metadata = scheduler_output.kv_connector_metadata
+            assert kv_connector_metadata is not None
+            get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
+            if scheduler_output.total_num_scheduled_tokens == 0:
+                # KV transfers must progress even on steps with no forward.
+                # Apply the runtime releases queued by the reconcile above, as
+                # every other execute_model exit does.
+                runtime = self._paged_attention_runtime
+                if runtime is not None:
+                    runtime.materialize_pending_state()
+                return KVConnectorModelRunnerMixin.kv_connector_no_forward(
+                    scheduler_output, self.vllm_config
+                )
+            self._kv_connector_start_step(scheduler_output)
+
         batch = _ExecutionBatch()
         self._handle_new_requests(
             batch, scheduler_output.scheduled_new_reqs, scheduler_output
@@ -2907,7 +3067,7 @@ class MetalModelRunner:
                 if runtime is not None:
                     runtime.materialize_pending_state()
                 self._validate_scheduled_outputs(batch, scheduler_output)
-                return batch.to_model_runner_output()
+                return self._attach_kv_connector_output(batch.to_model_runner_output())
             return None
 
         # Defensive invariant: the vLLM scheduler sets has_structured_output_requests
@@ -2929,7 +3089,7 @@ class MetalModelRunner:
         if runtime is not None:
             runtime.materialize_pending_state()
         self._validate_scheduled_outputs(batch, scheduler_output)
-        return batch.to_model_runner_output()
+        return self._attach_kv_connector_output(batch.to_model_runner_output())
 
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
@@ -2963,6 +3123,9 @@ class MetalModelRunner:
             # downstream), so clear the stash and return an empty output — the
             # engine collects results from the last stage only.
             if is_non_last_stage(self.pp):
+                # KV offloading with PP is rejected at config time. If that
+                # is relaxed, this exit must also finish the connector step.
+                assert self._kv_connector_stack is None
                 self._execute_model_state = None
                 runtime = self._paged_attention_runtime
                 if runtime is not None:
@@ -2980,10 +3143,12 @@ class MetalModelRunner:
             if runtime is not None:
                 runtime.materialize_pending_state()
             self._validate_scheduled_outputs(batch, scheduler_output)
-            return batch.to_model_runner_output()
+            return self._attach_kv_connector_output(batch.to_model_runner_output())
 
         # Async scheduling: execute_model may have failed; return None so
-        # vLLM can surface the original exception.
+        # vLLM can surface the original exception. It may have failed after
+        # opening the connector step, so end that step here.
+        self.finish_kv_connector_step()
         logger.error("sample_tokens called with no pending _execute_model_state.")
         return None
 
@@ -3051,11 +3216,15 @@ class MetalModelRunner:
         runtime = self._paged_attention_runtime
         if runtime is not None:
             runtime.materialize_pending_state()
+        # Close the connector step at submit, not resolve. The close queues this
+        # step's stores, and the next step submits them before their blocks are
+        # reused. See tests/test_kv_offload_connector_step_order.py.
         return self._decode_pipeline.submit(
             PendingSampleStep(
                 tokens=tokens,
                 entries=tuple(entries),
                 batch=batch,
                 scheduler_output=paged_state.scheduler_output,
+                kv_connector_output=self.finish_kv_connector_step(),
             )
         )

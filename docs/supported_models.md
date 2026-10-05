@@ -159,3 +159,27 @@ block-FP8 checkpoint is not supported.
 | OLMo 3 | 🔵 | MHA + per-layer sliding window (paged) | ✅ | `mlx-community/Olmo-3-7B-Instruct-4bit` |
 
 sliding-window attention (SWA) is not fully optimized.
+
+## Diffusion Language Models
+
+Block-diffusion LMs generate a whole canvas of tokens per block through
+iterative denoising instead of left-to-right decoding. vLLM schedules the
+canvas as draft tokens (`--diffusion-config '{"canvas_length": N}'`); the
+Metal runner runs prefill and commit steps causally, and denoising steps
+bidirectionally over the canvas on the paged KV cache (see
+`vllm_metal/v1/diffusion.py`).
+
+| Model | Support | Runner | Scope | Example checkpoint |
+| --- | --- | --- | --- | --- |
+| DiffusionGemma | 🔵 | mlx-vlm model, paged block diffusion | text input only, synchronous scheduling, no logprobs or LoRA | `mlx-community/diffusiongemma-26B-A4B-it-4bit` |
+
+```bash
+vllm serve mlx-community/diffusiongemma-26B-A4B-it-4bit \
+  --diffusion-config '{"canvas_length": 32}'
+```
+
+The canvas sampler follows the checkpoint's `generation_config.json`
+(temperature schedule, entropy-bound acceptance, convergence thresholds);
+top-k, top-p and penalties are ignored with a warning. Async scheduling is
+turned off automatically, since each step's canvas must reach the scheduler
+before the next one is scheduled.

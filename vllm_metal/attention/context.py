@@ -100,6 +100,13 @@ class PagedAttentionContext:
     segment_bidi_ranges: list[list[tuple[int, int]] | None] | None = None
     # Layer kinds ("sliding", "full") on which the ranges apply; empty = never.
     bidi_layer_kinds: frozenset[str] = frozenset()
+    # Anchor the sliding window at each block's first position rather than at
+    # each query row: every row of a block sees the same ``window - 1`` keys
+    # before the block plus the whole block (DiffusionGemma's decoder canvas).
+    # ``False`` keeps Gemma 4 vision's per-row ``(causal OR block) AND window``.
+    # The tiled kernel only applies the per-row rule, so sliding layers take
+    # the recompute path when this is set.
+    bidi_window_at_block_start: bool = False
     # Set by the first layer that handled image-block rows this forward
     # (either path), so the info line is emitted once per forward.
     bidi_logged: bool = False

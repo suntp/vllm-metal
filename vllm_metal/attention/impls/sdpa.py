@@ -395,7 +395,9 @@ def prepare_sdpa_qkv(
                 k_proj_out = k_norm(k_proj_out)
             keys = k_proj_out.reshape(B, L, n_kv_heads, -1)
             # K-eq-V variant (Gemma4 26B/31B): no v_proj, values = keys.
-            if hasattr(inner, "v_proj"):
+            # DiffusionGemma keeps the attribute but sets it to None on
+            # full-attention layers.
+            if getattr(inner, "v_proj", None) is not None:
                 values = inner.v_proj(x).reshape(B, L, n_kv_heads, -1)
             else:
                 values = keys
@@ -768,7 +770,10 @@ def sdpa_forward(
     # Gemma 4 vision: rows of image blocks attend bidirectionally on the
     # adapter's layer kinds.  The kernel path hands the per-row block ranges
     # to the tiled prefill kernel; the recompute path (the reference)
-    # recomputes those rows after the kernel with MLX SDPA.
+    # recomputes those rows after the kernel with MLX SDPA.  A block-anchored
+    # window (DiffusionGemma's decoder canvas) is not a rule the kernel knows,
+    # so it always takes the recompute on sliding layers; full layers have no
+    # window, where the two rules agree.
     mm_prefix_ranges: mx.array | None = None
     recompute_after_kernel = False
     if ctx.segment_bidi_ranges is not None:
@@ -776,7 +781,9 @@ def sdpa_forward(
         if kind in ctx.bidi_layer_kinds:
             assert ctx.cu_seqlens is not None
             float32_cache = kernel_k_cache.dtype == mx.float32
-            if image_block_path(ops, float32_cache=float32_cache) == "kernel":
+            if kind == "sliding" and ctx.bidi_window_at_block_start:
+                recompute_after_kernel = True
+            elif image_block_path(ops, float32_cache=float32_cache) == "kernel":
                 mm_prefix_ranges = _mm_prefix_rows(ctx)
                 if mm_prefix_ranges is not None and not ctx.bidi_logged:
                     ctx.bidi_logged = True
@@ -875,6 +882,8 @@ def sdpa_forward(
                 q_3d.shape[1],
                 cache_kv_heads,
                 q_3d.shape[2],
+                key_quant_type=kv_cache.k_quant,
+                value_bits=kv_cache.v_bits,
             )
 
         if plan is None:

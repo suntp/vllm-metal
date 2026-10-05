@@ -1,7 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bridge vLLM's GPU-runner-only DSpark check to the native Metal runner."""
 
-from functools import wraps
+from typing import Any
+
+from vllm_metal.patches.v1_runner_guard import allow_v1_runner_feature
+
+
+def _serves_dspark(vllm_config: Any) -> bool:
+    return (
+        vllm_config.parallel_config.worker_cls == "vllm_metal.v1.worker.MetalWorker"
+        and vllm_config.speculative_config is not None
+        and vllm_config.speculative_config.method == "dspark"
+    )
 
 
 def enable_dspark_for_metal_runner() -> None:
@@ -12,24 +22,4 @@ def enable_dspark_for_metal_runner() -> None:
     runners declare speculative-method support instead of applying GPU rules.
     Install from platform config validation, after VllmConfig is fully imported.
     """
-    from vllm.config import VllmConfig
-
-    original = VllmConfig._get_v1_model_runner_unsupported_features
-    if getattr(original, "_metal_dspark", False):
-        return
-
-    @wraps(original)
-    def unsupported_features(self: VllmConfig) -> list[str]:
-        unsupported = original(self)
-        if (
-            self.parallel_config.worker_cls == "vllm_metal.v1.worker.MetalWorker"
-            and self.speculative_config is not None
-            and self.speculative_config.method == "dspark"
-        ):
-            return [
-                item for item in unsupported if item != "dspark speculative decoding"
-            ]
-        return unsupported
-
-    unsupported_features._metal_dspark = True  # type: ignore[attr-defined]
-    VllmConfig._get_v1_model_runner_unsupported_features = unsupported_features
+    allow_v1_runner_feature("dspark speculative decoding", _serves_dspark)

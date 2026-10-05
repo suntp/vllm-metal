@@ -104,6 +104,10 @@ class MetalPlatform(Platform):
     # recomputes instead of sticking (#585 shape via a second engine).
     _mb_default_installed: ClassVar[str | None] = None
 
+    # Whether the configured model is a block-diffusion LM, whose runner emits
+    # no logprobs; set by check_and_update_config for validate_request.
+    _serves_diffusion: ClassVar[bool] = False
+
     # --- Ray distributed executor support (Phase 1) ---
     # Advertise the Apple GPU as a custom Ray resource named "mlx".  Because this
     # is not "GPU", vLLM's Ray executor uses the generic
@@ -291,6 +295,25 @@ class MetalPlatform(Platform):
                 f"vLLM logits processors ({controls}).",
                 parameter=unsupported_controls[0],
             )
+        if cls._serves_diffusion and (
+            params.logprobs is not None or params.prompt_logprobs is not None
+        ):
+            raise VLLMValidationError(
+                "Logprobs are not supported for diffusion models on Metal yet.",
+                parameter="logprobs",
+            )
+        # Upstream's diffusion sampler applies top_k/top_p to the canvas; the
+        # Metal one does not, so refuse them rather than ignore them.
+        if cls._serves_diffusion:
+            for name, enabled in (
+                ("top_k", params.top_k > 0),
+                ("top_p", params.top_p < 1.0),
+            ):
+                if enabled:
+                    raise VLLMValidationError(
+                        f"{name} is not supported for diffusion models on Metal yet.",
+                        parameter=name,
+                    )
 
     @classmethod
     def get_torch_device(cls, device_id: int = 0) -> torch.device:
@@ -580,6 +603,12 @@ class MetalPlatform(Platform):
                 "scheduling; disabled async_scheduling."
             )
 
+        cls._serves_diffusion = model_config is not None and getattr(
+            model_config, "is_diffusion", False
+        )
+        if cls._serves_diffusion:
+            cls._check_diffusion_config(vllm_config)
+
         if model_config is not None and model_config.is_hybrid:
             cache_config = vllm_config.cache_config
             if cache_config.mamba_cache_mode == "all":
@@ -733,6 +762,10 @@ class MetalPlatform(Platform):
             # NB: the Ray job-level hook is registered only AFTER the remaining DP
             # rejections (multimodal, STT) further below, so an unsupported DP
             # config fails fast before any ray.init side effect.
+
+        from vllm_metal.v1.kv_offload.config import configure_kv_offloading
+
+        configure_kv_offloading(vllm_config)
 
         scheduler_config = vllm_config.scheduler_config
 
@@ -903,6 +936,90 @@ class MetalPlatform(Platform):
             f"Metal memory: {total_mem / 1e9:.1f}GB total, "
             f"{available_mem / 1e9:.1f}GB available"
         )
+
+    @classmethod
+    def _check_diffusion_config(cls, vllm_config: "VllmConfig") -> None:
+        """Constrain a block-diffusion LM to what ``DiffusionGemmaRuntime`` serves.
+
+        The canvas travels as draft tokens (``num_speculative_tokens ==
+        canvas_length``) and each step's new canvas reaches the scheduler
+        through ``take_draft_token_ids()``, which only the synchronous engine
+        loop calls; async scheduling would schedule placeholder drafts.
+        """
+        from vllm_metal.compat import ensure_vllm_v1_diffusion_guard_patch
+        from vllm_metal.v1.diffusion import SUPPORTED_DIFFUSION_MODEL_TYPES
+
+        model_type = vllm_config.model_config.hf_config.model_type
+        if model_type not in SUPPORTED_DIFFUSION_MODEL_TYPES:
+            raise NotImplementedError(
+                f"Diffusion model type {model_type!r} is not supported on Metal "
+                f"(supported: {sorted(SUPPORTED_DIFFUSION_MODEL_TYPES)})."
+            )
+        diffusion_config = vllm_config.diffusion_config
+        if diffusion_config is None or diffusion_config.canvas_length is None:
+            raise ValueError(
+                "Diffusion models on Metal require --diffusion-config with a "
+                "canvas_length, e.g. --diffusion-config '{\"canvas_length\": 32}'."
+            )
+        if vllm_config.speculative_config is not None:
+            raise NotImplementedError(
+                "Speculative decoding is not supported with diffusion models."
+            )
+        # The scheduler clips every denoising step to the threshold, so a
+        # lower one would denoise a shorter canvas than configured.
+        threshold = vllm_config.scheduler_config.long_prefill_token_threshold
+        if 0 < threshold < diffusion_config.canvas_length:
+            raise NotImplementedError(
+                "Diffusion models on Metal do not support "
+                f"--long-prefill-token-threshold ({threshold}) below the "
+                f"canvas_length ({diffusion_config.canvas_length}); raise it "
+                "or leave it unset."
+            )
+        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+            raise NotImplementedError(
+                "Pipeline parallelism is not supported with diffusion models on Metal."
+            )
+        if vllm_config.lora_config is not None:
+            raise NotImplementedError(
+                "LoRA is not supported with diffusion models on Metal."
+            )
+        # The decoder's bidirectional canvas needs the mm_prefix kernel or the
+        # recompute, and neither reads a TurboQuant cache: the first denoising
+        # step would fail the engine step.
+        if get_config().turboquant:
+            raise NotImplementedError(
+                "TurboQuant KV cache is not supported with diffusion models on "
+                'Metal; drop "turboquant" from --additional-config.'
+            )
+        # The diffusion runtime is text-only. Zero modality limits turn an
+        # image/video request into a per-request validation error instead of an
+        # encoder input that would fail the whole engine step. Not
+        # language_model_only: that routes the load to the mlx_lm text
+        # backbone, which has no DiffusionGemma.
+        multimodal_config = vllm_config.model_config.multimodal_config
+        if multimodal_config is not None:
+            from vllm.config.multimodal import (
+                AudioDummyOptions,
+                ImageDummyOptions,
+                VideoDummyOptions,
+            )
+
+            multimodal_config.limit_per_prompt.update(
+                image=ImageDummyOptions(count=0),
+                video=VideoDummyOptions(count=0),
+                audio=AudioDummyOptions(count=0),
+            )
+            logger.warning(
+                "Diffusion models on Metal are text-only; image, video and "
+                "audio inputs are refused."
+            )
+        if vllm_config.scheduler_config.async_scheduling:
+            vllm_config.scheduler_config.async_scheduling = False
+            logger.warning(
+                "Diffusion models on Metal require synchronous scheduling; "
+                "disabled async_scheduling."
+            )
+        ensure_vllm_v1_diffusion_guard_patch()
 
     @staticmethod
     def _disable_hybrid_prefix_caching(vllm_config: "VllmConfig", reason: str) -> None:

@@ -43,10 +43,26 @@ Drafting stops when the selected span would exceed the effective target/draft
 context limit. Cancellation and preemption discard logical feature coverage;
 recomputation overwrites reused pages before drafting resumes.
 
-`enable_adaptive_verification`, non-greedy `draft_sample_method`, nonstandard
-`rejection_sample_method`, and `dspark_draft_topk` are rejected rather than ignored.
+`enable_adaptive_verification`, non-greedy `draft_sample_method`, and nonstandard
+`rejection_sample_method` are rejected rather than ignored.
 The vLLM 0.30 compatibility bridge exempts only `MetalWorker` from the GPU V1
 runner's DSpark prohibition; all other upstream runner checks remain active.
+
+### Limit Markov candidates
+
+Optionally add `"dspark_draft_topk": 64` to the speculative configuration.
+For each draft position, DSpark selects that many candidates from its base
+logits and computes the sequential Markov correction only for those tokens.
+This reduces Markov projection work but can exclude the full-vocabulary winner,
+changing proposals and acceptance. The target still verifies every proposal
+against its full vocabulary. Confidence uses the actual preceding draft token.
+
+The limit must be an integer from 1 through the draft vocabulary size. An
+explicit setting overrides the checkpoint's `dspark_draft_topk`; with neither
+set, the existing full-vocabulary path is unchanged. A limit equal to the
+vocabulary size also uses that path. Smaller limits trade candidate coverage for
+less projection work; measure acceptance and end-to-end latency together.
+This option does not enable adaptive verification or change the proposal width.
 
 ## Serving validation
 
@@ -68,6 +84,7 @@ The shared parity tool compares native mlx-lm, target-only serving, and DSpark
 serving. It records actual verification counts and reports `EXACT`, `TOP_K_MATCH`,
 and failures separately; top-k agreement is not exact sequence equivalence.
 These are correctness checks, not throughput or latency measurements.
+Pass `--dspark-draft-topk 64` to the parity tool to exercise candidate limiting.
 
 For the pinned pair above on Apple M5 Max, with vLLM 0.30.0, MLX 0.32.1,
 and mlx-lm 0.32.0, the shared 40-prompt corpus (32 output tokens, K=7) reports:
@@ -91,6 +108,78 @@ unresolved. Different draft candidates can change acceptance and performance;
 they do not bypass target verification. Serving output checks and checkpoint
 candidate equivalence are separate requirements, and the experimental integration
 does not establish complete DSpark qualification or a speedup.
+
+## Measure HTTP serving and memory
+
+Run the matched three-way comparison from a source checkout on macOS:
+
+```bash
+python -m tools.benchmark.dspark_serving_benchmark \
+    --target /path/to/Qwen3-4B-4bit/snapshot \
+    --dspark /path/to/dspark_qwen3_4b_block7/snapshot \
+    --draft /path/to/Qwen3-0.6B/snapshot \
+    --concurrency 1 4 --repeats 2 --output-len 64 \
+    --output-dir /path/to/new-benchmark-results
+```
+
+Use the pinned target/DSpark pair above and a compatible ordinary draft model.
+All three arms use the same target, tokenizer, plain greedy prompts, output
+length, context/prefill limits, memory fraction, and disabled prefix caching.
+The default workload is the shared 40-prompt parity corpus. For representative
+longer contexts, supply `--prompt-file` with JSONL `{"prompt": "..."}` rows and
+`--num-prompts`; prompts must fit the context limit without truncation. Draft
+widths are recorded separately (`--dspark-width 7`, `--draft-width 3`).
+Use `--dspark-draft-topk 64` to measure candidate limiting in the DSpark arm;
+the target-only and ordinary-draft arms retain their original configuration.
+
+The tool starts fresh loopback-only `vllm serve` processes with multiprocessing
+enabled, reverses arm and concurrency order between repeats, and shuts down each
+server's process group before starting the next. Per concurrency, it performs
+an untimed token-ID comparison pass, a discarded streaming warmup pass, then
+measures with `vllm bench serve`. Full output IDs from the untimed pass are
+retained and compared to that repeat's target-only arm. That pass submits
+batches of prompts in one completion request; the timed pass sends independent
+concurrent streaming requests. Exact-match counts describe only the untimed
+pass. Sample logprobs are never requested, since they disable drafting. Timings
+use the benchmark's streaming usage counts and latency definitions, not SSE
+chunk counts.
+
+`summary.json` retains every repeat's throughput and paired ratio, latency,
+and exact sequence counts. Each run also saves commands, detailed benchmark
+results, token IDs, server logs, source hashes, and before/after counters.
+Counter snapshots wait for completed requests and exclude both warmup passes;
+a missing required counter or a speculative arm with no actual verified drafts
+fails. Failed, incomplete, or mismatched workloads cannot produce a successful
+summary. Token divergence is reported explicitly, without being relabeled as
+top-k agreement or exact losslessness; investigate it with the separate serving
+parity tool.
+
+Worker snapshots distinguish MLX active/peak allocation, allocator cache, worker
+RSS and lifetime peak RSS, and physical KV backing bytes. The startup snapshot
+includes model loading and profiling; the measured phase resets only the MLX
+peak counter. These are different accounting domains on unified memory and
+must not be added together. Worker RSS excludes the API/client processes;
+reserved KV bytes do not mean every page is resident. The scheduler's own
+reported token capacity accounts for cache groups and is saved separately.
+Equal memory fractions can yield different usable capacities across arms.
+
+Follow the [macOS benchmark guide](benchmarking-macos.md) for warmup, power,
+thermal state and desktop contention. Before/after machine observations are
+saved; they cannot rule out interference during a run. Natural continuations
+can differ even under greedy sampling, so these measurements do not establish
+bitwise losslessness or a general speedup.
+
+To reproduce the RFC's Qwen3-8B/0.6B workload, use these pinned local snapshots
+in the same command:
+
+- Target: [mlx-community/Qwen3-8B-4bit](https://huggingface.co/mlx-community/Qwen3-8B-4bit/tree/545dc4251c05440727734bcd94334791f6ab0192).
+- DSpark: [deepseek-ai/dspark_qwen3_8b_block7](https://huggingface.co/deepseek-ai/dspark_qwen3_8b_block7/tree/03326e5043815da1f81b109078b2889737c26017).
+- Ordinary draft: [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B/tree/c1899de289a04d12100db370d81485cdf75e47ca).
+
+Compare the full-vocabulary and candidate-limited configurations in separate
+output directories, keeping all other settings fixed. This pair uses more
+memory than the 4B pair; record the memory fraction and cache capacity for
+every arm.
 
 ## Forward contract
 
