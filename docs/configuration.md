@@ -101,8 +101,11 @@ Because of that, the planner checks the plan against the machine before serving:
 `VLLM_METAL_KV_COMMIT_PROBE` (on by default) forces a bounded sample of the
 planned pool resident at startup — `min(capacity, 512 MiB)`, one write per
 page — and reads back how much memory was free and how much the kernel wrote to
-swap to make room. Paging is read from the cumulative swap-out counter, not from
-swap occupancy, which rises and falls within a probe and can hide the writes.
+swap to make room. Paging is read from the cumulative swap-file counter
+(`vm_stat` `Swapouts`): not from swap occupancy, which rises and falls within a
+probe and so can hide the writes, and not from psutil's `swap_memory().sout`,
+which on macOS is the `Pageouts` counter — it moves for file writeback and can
+stay put while the kernel is swapping.
 The sample lives in its own mapping and is dropped as soon as the probe returns,
 so it leaves nothing resident behind — the touch itself is transient, which a
 process's peak-RSS counter will see but steady state will not. If the kernel
@@ -112,7 +115,7 @@ recommended working set)` and less the memory the engine holds outside the pool
 — the TurboQuant prefill workspace, and the KV offload host pool
 (`--kv-offloading-size`), which is pageable but the same RAM — with a warning.
 The budget keeps the full byte count: vLLM chooses its own grouped layout from
-the bytes it is handed. If free memory is merely below the plan, the pool keeps its capacity and
-the shortfall is logged: a plan is a cap, and only the blocks requests actually
-write are ever backed. Set `VLLM_METAL_KV_COMMIT_PROBE=0` to skip the touch and
-trust `--gpu-memory-utilization` alone.
+the bytes it is handed. If free memory is merely below the plan, the pool keeps
+its capacity and the shortfall is logged: a plan is a cap, and only the blocks
+requests actually write are ever backed. Set `VLLM_METAL_KV_COMMIT_PROBE=0` to
+skip the touch and trust `--gpu-memory-utilization` alone.

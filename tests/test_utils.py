@@ -11,7 +11,12 @@ import psutil
 import pytest
 
 from tools.attention_bench_utils import attention_tolerances, package_versions
-from vllm_metal.utils import get_model_download_path, probe_commit, set_wired_limit
+from vllm_metal.utils import (
+    _parse_swap_out_bytes,
+    get_model_download_path,
+    probe_commit,
+    set_wired_limit,
+)
 
 
 def test_attention_tolerances_reject_unsupported_dtype():
@@ -114,3 +119,39 @@ def test_probe_commit_reports_a_machine_that_cannot_map(monkeypatch) -> None:
 
     with pytest.raises(OSError):
         probe_commit(1 << 20)
+
+
+_VM_STAT = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                                     6663.
+Pageins:                                    16116825.
+Pageouts:                                     216236.
+Swapins:                                    12239475.
+Swapouts:                                   15761162.
+"""
+
+
+def test_swap_out_counter_reads_the_swap_file_not_pageouts() -> None:
+    """Only ``Swapouts`` tracks the swap file.
+
+    psutil's macOS ``swap_memory().sout`` is the ``Pageouts`` counter, which
+    counts page-outs generally: it moves for file writeback and can stay put
+    while the kernel swaps. The probe needs the counter that only moves when
+    the swap file does.
+    """
+
+    assert _parse_swap_out_bytes(_VM_STAT) == 15761162 * 16384
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPageouts: 1.\n",
+        "Mach Virtual Memory Statistics:\nSwapouts: 1.\n",
+    ],
+    ids=["no_swapouts", "no_page_size"],
+)
+def test_swap_out_counter_needs_both_the_page_size_and_the_swapouts_line(
+    output: str,
+) -> None:
+    with pytest.raises(ValueError, match="missing"):
+        _parse_swap_out_bytes(output)

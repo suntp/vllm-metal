@@ -212,6 +212,11 @@ class KVCacheStorage:
         backing buffer, so the write goes through the native scatter like
         ``copy_blocks`` does.
         """
+        if len(rows) != len(self.pages):
+            raise ValueError(
+                f"scatter_rows takes one row array per page: got {len(rows)} "
+                f"for {len(self.pages)} pages"
+            )
         if not rows:
             return
         from vllm_metal.metal import get_ops

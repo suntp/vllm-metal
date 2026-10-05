@@ -138,6 +138,28 @@ def test_copy_cycles_snapshot_sources_and_deduplicate_aliases(monkeypatch):
     assert torch.all(storage.tensors["a0"][1] == 2)
 
 
+def test_scatter_rows_writes_into_requested_block_slots():
+    storage = make_storage(num_blocks=4)
+    dst = [1, 3]
+    rows = [
+        mx.full((len(dst), *page.shape[1:]), i + 1, dtype=page.dtype)
+        for i, page in enumerate(storage.pages)
+    ]
+    storage.zero_blocks(range(4))
+    storage.scatter_rows(rows, dst)
+    mx.eval(*storage.buffers)
+    for i, page in enumerate(storage.pages):
+        assert mx.array_equal(page[dst], rows[i])
+        assert not page[[0, 2]].any().item()
+
+
+def test_scatter_rows_rejects_row_count_mismatch():
+    storage = make_storage(num_blocks=4)
+    rows = [mx.zeros((1, 1), dtype=mx.uint8)]
+    with pytest.raises(ValueError, match="one row array per page"):
+        storage.scatter_rows(rows, [0])
+
+
 def test_packed_kv_store_preserves_strides_and_shared_backing():
     storage = make_storage()
     cache = MetalPagedKVCache.from_upstream(storage, ["a0", "a1"])

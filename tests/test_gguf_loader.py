@@ -26,7 +26,10 @@ from tests.gguf_kquant_fixtures import build_kquant_blocks  # noqa: E402
 from vllm_metal.gguf.adapter import GGUFModelAdapter  # noqa: E402
 from vllm_metal.gguf.loader import GGUFLoadError, GGUFModelLoader  # noqa: E402
 from vllm_metal.gguf.mlx_native import GGUFMLXQuantizedTensor  # noqa: E402
-from vllm_metal.gguf.raw_block import GGUFRawBlockTensor  # noqa: E402
+from vllm_metal.gguf.raw_block import (  # noqa: E402
+    RAW_KERNEL_GGUF_TYPES,
+    GGUFRawBlockTensor,
+)
 from vllm_metal.gguf.source import GGUFLoadSource  # noqa: E402
 from vllm_metal.gguf.wrappers import GGUFLinear  # noqa: E402
 
@@ -74,7 +77,7 @@ def _dense_tensor_specs(config: dict, *, has_qk_norm: bool, with_bias: bool) -> 
     """Return ``{gguf_name: (kind, shape)}`` for a dense decoder GGUF.
 
     ``kind`` is ``"q"`` (quantized weight) or ``"f"`` (F32 plain weight/bias).
-    Tests may inject ``"q3_k"``/``"q6_k"`` zero blocks for tables that are
+    Tests may inject ``"iq4_xs"``/``"q6_k"`` zero blocks for tables that are
     never read or must be rejected; K-quant ``"q"`` weights get field-built
     blocks because gguf-py can dequantize K-quants but not quantize them.
     """
@@ -122,8 +125,8 @@ def _write_gguf(
         data = rng.standard_normal(shape).astype(np.float32)
         data = (values or {}).get(name, data)
         qtype = (quant_overrides or {}).get(name)
-        if kind in ("q3_k", "q6_k"):
-            raw_qtype = {"q3_k": QT.Q3_K, "q6_k": QT.Q6_K}[kind]
+        if kind in ("iq4_xs", "q6_k"):
+            raw_qtype = {"iq4_xs": QT.IQ4_XS, "q6_k": QT.Q6_K}[kind]
             block_size, type_size = gguf.GGML_QUANT_SIZES[raw_qtype]
             assert shape[-1] % block_size == 0
             packed_shape = (
@@ -134,7 +137,7 @@ def _write_gguf(
             writer.add_tensor(name, raw, raw_shape=raw.shape, raw_dtype=raw_qtype)
         elif kind == "q" or qtype is not None:
             raw_dtype = qtype or quant_type
-            if raw_dtype in (QT.Q4_K, QT.Q5_K, QT.Q6_K):
+            if raw_dtype in (QT.Q2_K, QT.Q3_K, QT.Q4_K, QT.Q5_K, QT.Q6_K):
                 raw = build_kquant_blocks(shape[0], shape[-1], raw_dtype)
             else:
                 quant_input = data.reshape(1, -1) if data.ndim == 1 else data
@@ -192,7 +195,7 @@ def _file_quant_tensor(
     tensor = next(t for t in gguf.GGUFReader(gguf_path).tensors if t.name == name)
     logical = tuple(int(dim) for dim in reversed(tensor.shape))
     data = tensor.data.reshape(-1)
-    if tensor.tensor_type == QT.Q6_K:
+    if tensor.tensor_type in RAW_KERNEL_GGUF_TYPES:
         return GGUFRawBlockTensor.from_raw_blocks(data, logical, tensor.tensor_type)
     return GGUFMLXQuantizedTensor.from_raw_blocks(data, logical, tensor.tensor_type)
 
@@ -311,11 +314,11 @@ def test_loads_cached_remote_model_offline(tmp_path, monkeypatch):
     np.testing.assert_array_equal(np.array(model(tokens)), np.array(reference(tokens)))
 
 
-@pytest.mark.parametrize("output_kind", ["q6_k", "q3_k"])
+@pytest.mark.parametrize("output_kind", ["q6_k", "iq4_xs"])
 def test_skips_tie_redundant_output(tmp_path, output_kind):
     # Tied config, but the GGUF still carries a redundant output.weight, as
     # llama.cpp exports of tied models do. It is never read, so even a qtype
-    # the loader cannot execute (Q3_K) does not block the model.
+    # the loader cannot execute (IQ4_XS) does not block the model.
     d = _dims(_tiny_config("qwen3", **_KQUANT_CONFIG))
     gguf_path, cfg_dir = _build_dense_fixture(
         tmp_path,
@@ -436,7 +439,18 @@ def _write_minimal_tokenizer(config_dir: str, vocab_size: int) -> None:
 
 @pytest.mark.parametrize(
     "quant_type",
-    [QT.Q8_0, QT.Q4_0, QT.Q4_1, QT.Q5_0, QT.Q5_1, QT.Q4_K, QT.Q5_K, QT.Q6_K],
+    [
+        QT.Q8_0,
+        QT.Q4_0,
+        QT.Q4_1,
+        QT.Q5_0,
+        QT.Q5_1,
+        QT.Q2_K,
+        QT.Q3_K,
+        QT.Q4_K,
+        QT.Q5_K,
+        QT.Q6_K,
+    ],
 )
 def test_quantized_llama_qk_are_row_unpermuted(tmp_path, quant_type):
     # The main quantized-path behavior: installed q/k GGUFLinear tensors carry the
@@ -828,7 +842,7 @@ def test_rejects_unsupported_qtype_before_model_allocation(tmp_path, monkeypatch
         "qwen3",
         config_overrides=_KQUANT_CONFIG,
         has_qk_norm=True,
-        inject={"blk.0.ffn_up.weight": ("q3_k", (256, 256))},
+        inject={"blk.0.ffn_up.weight": ("iq4_xs", (256, 256))},
     )
 
     def fail_load_model(*args, **kwargs):
@@ -837,7 +851,7 @@ def test_rejects_unsupported_qtype_before_model_allocation(tmp_path, monkeypatch
     monkeypatch.setattr(gguf_loader, "load_model", fail_load_model)
     with pytest.raises(
         GGUFLoadError,
-        match="Unsupported qtype Q3_K on mapped weight 'blk.0.ffn_up.weight'",
+        match="Unsupported qtype IQ4_XS on mapped weight 'blk.0.ffn_up.weight'",
     ):
         GGUFModelLoader(
             gguf_path,
@@ -920,12 +934,12 @@ def test_rejects_unsupported_untied_output(tmp_path):
         "qwen3",
         config_overrides={**_KQUANT_CONFIG, "tie_word_embeddings": False},
         has_qk_norm=True,
-        inject={"output.weight": ("q3_k", (256, 256))},
+        inject={"output.weight": ("iq4_xs", (256, 256))},
     )
 
     with pytest.raises(
         GGUFLoadError,
-        match="Unsupported qtype Q3_K on mapped weight 'output.weight'",
+        match="Unsupported qtype IQ4_XS on mapped weight 'output.weight'",
     ):
         GGUFModelLoader(
             gguf_path,
@@ -1063,22 +1077,23 @@ def test_rejects_unsupported_kquant_weight_at_preflight(tmp_path):
         tmp_path,
         "qwen3",
         has_qk_norm=True,
-        inject={"blk.0.ffn_gate.weight": ("q3_k", (128, 256))},
+        inject={"blk.0.ffn_gate.weight": ("iq4_xs", (128, 256))},
     )
 
     with pytest.raises(GGUFLoadError) as excinfo:
         GGUFModelLoader(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32).load()
 
     assert str(excinfo.value) == (
-        "Unsupported qtype Q3_K on mapped weight 'blk.0.ffn_gate.weight'; "
-        "only Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K (and plain F32/F16/BF16) "
-        "are supported."
+        "Unsupported qtype IQ4_XS on mapped weight 'blk.0.ffn_gate.weight'; "
+        "only Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K "
+        "(and plain F32/F16/BF16) are supported."
     )
 
 
 @pytest.mark.parametrize(
     ("body_type", "embd_type"),
     [
+        pytest.param(QT.Q3_K, QT.Q6_K, id="q3_k_m"),
         pytest.param(QT.Q4_K, QT.Q6_K, id="q4_k_m"),
         pytest.param(QT.Q5_K, QT.Q6_K, id="q5_k_m"),
         pytest.param(QT.Q4_K, QT.Q8_0, id="q4_k_l"),

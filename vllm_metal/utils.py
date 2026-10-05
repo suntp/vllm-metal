@@ -3,6 +3,8 @@
 
 import logging
 import mmap
+import re
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +15,40 @@ logger = logging.getLogger(__name__)
 # fault commits. One write per stride commits every page it covers, and the
 # value comes from the runtime rather than a page size assumed here.
 _PAGE_STRIDE = mmap.PAGESIZE
+
+# ``vm_stat`` prints both counters; only the second one tracks the swap file.
+_PAGE_SIZE_RE = re.compile(r"page size of (\d+) bytes")
+_SWAP_OUTS_RE = re.compile(r"^Swapouts:\s*(\d+)\.", re.MULTILINE)
+
+
+def _parse_swap_out_bytes(vm_stat_output: str) -> int:
+    """Cumulative swap-file writes in bytes, from ``vm_stat`` output.
+
+    ``vm_stat`` reports ``Pageouts`` and ``Swapouts`` as separate counters and
+    both are in pages; the swap file is the second one.
+    """
+    page_size = _PAGE_SIZE_RE.search(vm_stat_output)
+    swap_outs = _SWAP_OUTS_RE.search(vm_stat_output)
+    if page_size is None or swap_outs is None:
+        raise ValueError("vm_stat output is missing its page size or Swapouts line")
+    return int(swap_outs.group(1)) * int(page_size.group(1))
+
+
+def _swap_out_bytes() -> int:
+    """Cumulative bytes the kernel has written to the swap file.
+
+    Not ``psutil.swap_memory().sout``: on macOS that is the *Pageouts* counter,
+    which counts page-outs generally and so also moves for file writeback that
+    has nothing to do with memory pressure, while missing swap the kernel does
+    under pressure. ``vm_stat`` reports ``Swapouts`` for the swap file itself.
+    Swap occupancy is wrong for a different reason: it falls as readily as it
+    rises, so a machine that pages 128 MiB out while reclaiming 128 MiB back
+    reads as no change at all.
+    """
+    output = subprocess.run(
+        ["/usr/bin/vm_stat"], capture_output=True, text=True, check=True
+    ).stdout
+    return _parse_swap_out_bytes(output)
 
 
 def get_model_download_path(
@@ -109,11 +145,10 @@ class CommitProbe:
 
     @property
     def swap_out_bytes(self) -> int:
-        """Bytes the kernel wrote to swap while the sample was resident.
+        """Bytes the kernel wrote to the swap file while the sample was resident.
 
-        Cumulative swap-out counts, not occupancy: occupancy falls as readily
-        as it rises, so a machine that pages 128 MiB out while reclaiming
-        128 MiB back reads as no change at all.
+        A cumulative count, so it cannot be hidden by reclamation, unlike swap
+        occupancy.
         """
         return max(0, self.swap_out_after - self.swap_out_before)
 
@@ -141,9 +176,10 @@ def probe_commit(nbytes: int) -> CommitProbe:
     rather than written to swap, so nothing of the sample is left for the next
     allocation to inherit.)
 
-    Paging is read from the cumulative swap-out counter rather than swap
-    occupancy, which both rises and falls during a probe and so can hide the
-    writes this is looking for. ``available_after`` is read once the sample has
+    Paging is read from the cumulative swap-file counter (see
+    :func:`_swap_out_bytes`) rather than swap occupancy, which both rises and
+    falls during a probe and so can hide the writes this is looking for.
+    ``available_after`` is read once the sample has
     been dropped, so the pair describes the machine before the probe and with
     the probe's memory already back.
 
@@ -156,7 +192,7 @@ def probe_commit(nbytes: int) -> CommitProbe:
         raise ValueError("probe_commit needs a positive size")
 
     available_before = int(psutil.virtual_memory().available)
-    swap_out_before = int(psutil.swap_memory().sout)
+    swap_out_before = _swap_out_bytes()
     started = time.perf_counter()
 
     buf = mmap.mmap(-1, nbytes)
@@ -172,7 +208,7 @@ def probe_commit(nbytes: int) -> CommitProbe:
     # Read after the mapping is gone, so these describe the machine with the
     # probe's memory already back. Swap-outs are cumulative, so the paging the
     # probe caused is counted whether it happened before or after the release.
-    swap_out_after = int(psutil.swap_memory().sout)
+    swap_out_after = _swap_out_bytes()
     available_after = int(psutil.virtual_memory().available)
 
     return CommitProbe(
