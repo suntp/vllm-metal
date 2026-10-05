@@ -200,6 +200,11 @@ static_assert(kPartitionSize == 512,
               "GQA partition list assumes the established 512-token split");
 constexpr std::array<int, 2> kGqaPartitionSizes = {512, 256};
 constexpr int64_t kGqaSimdGroupsPerCore = 33;
+// The ordinary GQA reducer specializes out the TurboQuant workspace, but
+// retains red_smem[2 * NUM_WARPS] (256 threads / 32 SIMD lanes). Reserve its
+// 64 bytes as well as the dynamic statistics; dispatch also checks the
+// compiled pipeline's actual static allocation before encoding the reducer.
+constexpr size_t kGqaReduceStaticMemoryBytes = 2 * (256 / 32) * sizeof(float);
 
 // M3 (10-core, g15g) batched calibration. Tighten short-context admission,
 // and avoid the slower P512 producer for measured long head256 layouts.
@@ -312,11 +317,11 @@ static int gqa_decode_batch_plan_for_shape(
   // P512 already passed the work gate, so P256 also has sufficient complete
   // work. Use the allocation bound (which direct callers may overestimate),
   // rather than only the CPU lengths, when checking the smaller reducer.
-  // Do not turn a feasible P512 call into a resource fallback at >1M tokens.
+  // Do not turn a feasible P512 call into a resource error near the P256 limit.
   const int64_t allocation_length = std::max(max_seq_len, longest);
   const int64_t partitions256 = (allocation_length + 255) / 256;
   if (paged_reduce_threadgroup_bytes(partitions256) >
-      kM3GqaReducerMemoryBytes) return partition;
+      kM3GqaReducerMemoryBytes - kGqaReduceStaticMemoryBytes) return partition;
   return 256;
 }
 
@@ -2272,6 +2277,7 @@ NB_MODULE(_paged_ops, m) {
     m3["block32_min_context"] = kM3GqaBlock32MinContext;
     m3["preferred_partition"] = 256;
     m3["reducer_memory_bytes"] = kM3GqaReducerMemoryBytes;
+    m3["reducer_static_memory_bytes"] = kGqaReduceStaticMemoryBytes;
     config["m3_batched_preference"] = m3;
     return config;
   }, "Read-only test metadata from the native dispatch table and planner. "

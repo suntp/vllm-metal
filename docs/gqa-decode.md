@@ -46,8 +46,10 @@ On that M3, multi-request head256 batches that qualify for P512 prefer P256
 when the longest actual KV length reaches
 4,096 tokens with kernel block16, or 8,192 with block32. This preference
 keeps the work gate: it does not admit an otherwise ineligible batch. It
-also requires P256's reducer to fit 32 KiB, using the allocation upper bound
-as well as the actual lengths; an oversized bound retains P512. These are
+also requires P256's dynamic statistics plus its 64-byte static workspace to
+fit 32 KiB, using the allocation upper bound as well as the actual lengths;
+an oversized bound retains P512. Dispatch additionally checks the compiled
+pipeline's actual static allocation. These are
 device and layout calibration limits, independent of model names. Outside
 the short guard, shorter contexts and head128 keep the common rule.
 Single requests and other devices are unchanged.

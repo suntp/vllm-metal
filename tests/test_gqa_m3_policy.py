@@ -143,21 +143,20 @@ def test_single_request_policy_is_preserved(geometry):
     )
 
 
-def test_m3_smaller_partition_respects_the_allocation_bound():
+@pytest.mark.parametrize(
+    "maximum,expected",
+    [(1046528, 256), (1046529, 512), (1048576, 512), (1048577, 512)],
+)
+def test_m3_smaller_partition_respects_the_allocation_bound(maximum, expected):
     ops = get_ops()
-    # Two FP32 statistics per partition, aligned to 16 bytes. At this boundary
-    # P256 just fits 32 KiB; one more logical token requires P512 instead.
+    # 4,088 partitions use 32,704 dynamic bytes plus 64 static bytes. The old
+    # 1,048,576-token bound spent all 32 KiB on dynamic memory and then threw
+    # at the real reducer dispatch, despite a feasible P512 route.
     assert (
         ops.gqa_decode_batch_partition_size(
-            24, 4, 256, [8192] * 4, 10, 16, gpu_arch=M3_ARCH, max_seq_len=1048576
+            24, 4, 256, [8192] * 4, 10, 16, gpu_arch=M3_ARCH, max_seq_len=maximum
         )
-        == 256
-    )
-    assert (
-        ops.gqa_decode_batch_partition_size(
-            24, 4, 256, [8192] * 4, 10, 16, gpu_arch=M3_ARCH, max_seq_len=1048577
-        )
-        == 512
+        == expected
     )
 
 
@@ -295,13 +294,53 @@ def test_partition_transition_and_reordered_rows_survive_lazy_evaluation():
         np.testing.assert_allclose(np.array(out), reference, atol=2e-3, rtol=0)
 
 
-def test_native_selection_keeps_feasible_p512_for_an_oversized_allocation_bound():
+def test_short_guard_transition_survives_deferred_decode():
+    ops = get_ops()
+    batch, q, kv, head, block = 6, 32, 8, 128, 16
+    keys = mx.zeros((batch, block, kv, head), mx.float16)
+    value_np = np.ones((batch, block, kv, head), np.float16)
+    for row in range(batch):
+        value_np[row] *= row + 1
+        value_np[row, -1] += 64
+    values = mx.array(value_np)
+    tables = mx.array([[row] * 44 for row in range(batch)], mx.int32)
+    pending = []
+    for length in (703, 704):
+        out = _primitive(
+            mx.zeros((batch, q, head), mx.float16),
+            keys,
+            values,
+            tables,
+            mx.array([length] * batch, mx.int32),
+            block,
+            length,
+            [length] * batch,
+        )
+        pending.append((length, out))
+    for length, out in reversed(pending):
+        mx.eval(out)
+        expected_partition = (
+            0 if length == 703 and mx.device_info()["architecture"] == M3_ARCH else 256
+        )
+        assert ops.last_gqa_partition_size() == expected_partition
+        expected = np.arange(1, batch + 1) + 64 * (length // block) / length
+        reference = np.broadcast_to(expected[:, None, None], out.shape)
+        np.testing.assert_allclose(np.array(out), reference, atol=0.004, rtol=0.001)
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "maximum,m3_partition",
+    [(1046528, 256), (1046529, 512), (1048576, 512), (1048577, 512)],
+)
+def test_native_selection_keeps_resource_feasible_partition(
+    dtype, maximum, m3_partition
+):
     ops = get_ops()
     batch, q, kv, head, block = 4, 24, 4, 256, 16
-    maximum = 1048577
-    query = mx.ones((batch, q, head), mx.float16)
-    keys = mx.ones((1, block, kv, head), mx.float16)
-    values = mx.full(keys.shape, 2, mx.float16)
+    query = mx.ones((batch, q, head), dtype)
+    keys = mx.ones((1, block, kv, head), dtype)
+    values = mx.full(keys.shape, 2, dtype)
     tables = mx.zeros((batch, (maximum + block - 1) // block), mx.int32)
     lengths = [8192] * batch
     out = _primitive(
@@ -316,5 +355,26 @@ def test_native_selection_keeps_feasible_p512_for_an_oversized_allocation_bound(
     )
     mx.eval(out)
     assert ops.last_paged_dispatch() == "gqa_decode"
-    assert ops.last_gqa_partition_size() == 512
-    np.testing.assert_allclose(np.array(out), 2, atol=2e-3, rtol=0)
+    expected = m3_partition if mx.device_info()["architecture"] == M3_ARCH else 512
+    assert ops.last_gqa_partition_size() == expected
+    np.testing.assert_allclose(np.array(out.astype(mx.float32)), 2, atol=2e-3, rtol=0)
+    # Exercise the selected M3 specialization on non-M3 CI as well. Only
+    # occupancy/preference is forced; real pipeline resource checks remain.
+    selected = mx.array(0)
+    ops._gqa_paged_attention_for_test(
+        query,
+        keys,
+        values,
+        head**-0.5,
+        tables,
+        mx.array(lengths, mx.int32),
+        block,
+        maximum,
+        m3_partition,
+        selected,
+    )
+    mx.eval(selected)
+    assert ops.last_gqa_partition_size() == m3_partition
+    np.testing.assert_allclose(
+        np.array(selected.astype(mx.float32)), 2, atol=2e-3, rtol=0
+    )
