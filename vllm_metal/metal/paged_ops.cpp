@@ -168,7 +168,8 @@ static int gpu_core_count() {
 
 // One measured dispatch table, also exposed read-only to numerical/routing
 // tests. Include the kernel page view so geometry and page admission cannot
-// drift independently. Device/model names are not routing inputs.
+// drift independently. Model names are not routing inputs; the calibrated
+// device preference below is separate from functional geometry admission.
 struct GqaDecodeGeometry {
   int num_heads;
   int num_kv_heads;
@@ -199,6 +200,16 @@ static_assert(kPartitionSize == 512,
               "GQA partition list assumes the established 512-token split");
 constexpr std::array<int, 2> kGqaPartitionSizes = {512, 256};
 constexpr int64_t kGqaSimdGroupsPerCore = 33;
+
+// M3 (10-core, g15g) batched calibration. Tighten short-context admission,
+// and avoid the slower P512 producer for measured long head256 layouts.
+// Single requests and other devices retain the existing selection.
+constexpr int kM3GqaGpuCores = 10;
+constexpr int kM3GqaShortHead128Batch = 6;
+constexpr int kM3GqaShortHead128MinContext = 704;
+constexpr int kM3GqaBlock16MinContext = 4096;
+constexpr int kM3GqaBlock32MinContext = 8192;
+constexpr size_t kM3GqaReducerMemoryBytes = 32 * 1024;
 
 static std::string gqa_decode_kernel_name(
     const std::string& dtype, int head_size, int block_size, int partition_size) {
@@ -271,10 +282,42 @@ static int gqa_decode_batch_partition_size(
 
 static int gqa_decode_batch_plan_for_shape(
     int num_heads, int num_kv_heads, int head_size,
-    const std::vector<int>& context_lens, int gpu_cores, int block_size) {
+    const std::vector<int>& context_lens, int gpu_cores, int block_size,
+    const std::string& gpu_arch = "", int max_seq_len = 0) {
   if (!gqa_decode_geometry_supported(
           num_heads, num_kv_heads, head_size, block_size)) return 0;
-  return gqa_decode_batch_partition_size(num_heads, context_lens, gpu_cores);
+  const int partition =
+      gqa_decode_batch_partition_size(num_heads, context_lens, gpu_cores);
+  if (partition == 0 || context_lens.size() <= 1 ||
+      gpu_cores != kM3GqaGpuCores) return partition;
+
+  const auto& architecture = gpu_arch.empty()
+      ? metal::device(Device::gpu).get_architecture() : gpu_arch;
+  if (architecture != "applegpu_g15g") return partition;
+
+  const int longest =
+      *std::max_element(context_lens.begin(), context_lens.end());
+  // The six-request head128 short interval regresses despite passing the
+  // common work budget. Keep adjacent batches and longer contexts eligible.
+  if (num_heads == 32 && num_kv_heads == 8 && head_size == 128 &&
+      context_lens.size() == kM3GqaShortHead128Batch &&
+      longest < kM3GqaShortHead128MinContext) return 0;
+
+  if (partition != 512 || head_size != 256) return partition;
+
+  const int minimum = block_size == 16
+      ? kM3GqaBlock16MinContext : kM3GqaBlock32MinContext;
+  if (longest < minimum) return partition;
+
+  // P512 already passed the work gate, so P256 also has sufficient complete
+  // work. Use the allocation bound (which direct callers may overestimate),
+  // rather than only the CPU lengths, when checking the smaller reducer.
+  // Do not turn a feasible P512 call into a resource fallback at >1M tokens.
+  const int64_t allocation_length = std::max(max_seq_len, longest);
+  const int64_t partitions256 = (allocation_length + 255) / 256;
+  if (paged_reduce_threadgroup_bytes(partitions256) >
+      kM3GqaReducerMemoryBytes) return partition;
+  return 256;
 }
 
 // Engage the split while the base decode grid (num_q_heads * num_seqs) stays
@@ -895,8 +938,10 @@ static void dispatch_paged_attention_v2_online(
       : gqa_test_partition > 0 ? gqa_test_partition
       : num_seqs == 1
           ? gqa_decode_partition_size(num_heads, max_seq_len, detected_gpu_core_count())
-          : gqa_decode_batch_partition_size(
-                num_heads, gqa_context_lens, detected_gpu_core_count());
+          : gqa_decode_batch_plan_for_shape(
+                num_heads, num_kv_heads, head_size, gqa_context_lens,
+                detected_gpu_core_count(), block_size, d.get_architecture(),
+                max_seq_len);
   const int64_t gqa_partitions = gqa_partition_size > 0
       ? (static_cast<int64_t>(max_seq_len) + gqa_partition_size - 1) /
             gqa_partition_size : 0;
@@ -2182,8 +2227,11 @@ NB_MODULE(_paged_ops, m) {
   m.def("gqa_decode_batch_partition_size", &gqa_decode_batch_plan_for_shape,
         nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
         nb::arg("context_lens"), nb::arg("gpu_cores"), nb::arg("block_size") = 16,
-        "GQA partition from per-request KV lengths, or zero. Geometry and "
-        "occupancy planning only; dispatch separately checks features and resources.");
+        nb::arg("gpu_arch") = "", nb::arg("max_seq_len") = 0,
+        "GQA partition from per-request KV lengths, or zero. Empty gpu_arch "
+        "uses the executing GPU; an explicit architecture is a read-only planning "
+        "input and does not override dispatch. max_seq_len optionally supplies "
+        "the allocation upper bound. Dispatch separately checks features and resources.");
   m.def("last_gqa_partition_size", []() {
     return g_last_gqa_partition.load(std::memory_order_relaxed);
   }, "Partition selected by the most recent recorded paged eval, or zero "
@@ -2214,6 +2262,17 @@ NB_MODULE(_paged_ops, m) {
     config["geometries"] = geometries;
     config["partitions"] = partitions;
     config["simd_groups_per_core"] = kGqaSimdGroupsPerCore;
+    nb::dict m3;
+    m3["architecture"] = "applegpu_g15g";
+    m3["gpu_cores"] = kM3GqaGpuCores;
+    m3["short_head128_batch"] = kM3GqaShortHead128Batch;
+    m3["short_head128_min_context"] = kM3GqaShortHead128MinContext;
+    m3["long_head_size"] = 256;
+    m3["block16_min_context"] = kM3GqaBlock16MinContext;
+    m3["block32_min_context"] = kM3GqaBlock32MinContext;
+    m3["preferred_partition"] = 256;
+    m3["reducer_memory_bytes"] = kM3GqaReducerMemoryBytes;
+    config["m3_batched_preference"] = m3;
     return config;
   }, "Read-only test metadata from the native dispatch table and planner. "
      "Does not create pipelines, override policy or inspect hardware.");
