@@ -123,7 +123,11 @@ Every eligible call additionally requires:
   `num_decode_tokens`, plus their CPU `gqa_context_lens` metadata.
 - A verification window of at most 1.
 - Matching FP16/BF16 query, key-cache and value-cache types.
-- A kernel page size allowed above and sufficient reducer shared memory.
+- A kernel page size allowed above and sufficient reducer shared memory:
+  aligned dynamic statistics plus the compiled pipeline's static allocation.
+  This is checked before allocating GQA scratch or encoding the producer;
+  an oversized `max_seq_len` allocation bound falls back even when the actual
+  KV lengths pass the work budget. The reducer reuses the checked pipeline.
 - No TurboQuant, attention sinks, logit soft-capping or sliding window.
 - A known, positive GPU core count.
 

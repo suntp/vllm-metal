@@ -68,6 +68,81 @@ def test_batch_planner_requires_known_cores(cores):
     )
 
 
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "partition,length,maximum,expected",
+    [
+        (256, 1536, 1046527, 256),
+        (256, 1536, 1046528, 256),
+        (256, 1536, 1046529, 0),
+        (256, 1536, 1048576, 0),
+        (256, 1536, 1048577, 0),
+        (512, 4096, 2093055, 512),
+        (512, 4096, 2093056, 512),
+        (512, 4096, 2093057, 0),
+        (512, 4096, 2097152, 0),
+        (512, 4096, 2097153, 0),
+    ],
+)
+def test_generic_admission_counts_static_reducer_memory(
+    dtype, partition, length, maximum, expected
+):
+    ops = get_ops()
+    batch, q, kv, head, block = 10, 32, 8, 128, 16
+    # Apple GPUs allow 32 KiB per threadgroup. 4,088 partitions consume
+    # 32,704 aligned dynamic bytes plus the ordinary reducer's 64 static bytes.
+    # Also cover the former dynamic-only limit and its successor.
+    # These are allocation bounds, not the actual KV lengths used for planning.
+    lengths = [length] * batch
+    assert ops.gqa_decode_batch_partition_size(q, kv, head, lengths, 40) == partition
+    query = mx.zeros((batch, q, head), dtype)
+    keys = mx.zeros((batch, block, kv, head), dtype)
+    values = mx.stack(
+        [mx.full((block, kv, head), (i + 1) / 16, dtype) for i in range(batch)]
+    )
+    tables = mx.array(
+        [[i] * ((maximum + block - 1) // block) for i in range(batch)], mx.int32
+    )
+    reference = np.broadcast_to(
+        np.arange(1, batch + 1)[:, None, None] / 16, query.shape
+    )
+    outputs = []
+    for disabled in (True, False):
+        out = mx.array(0)
+        ops.paged_attention_primitive(
+            query,
+            keys,
+            values,
+            kv,
+            head**-0.5,
+            0.0,
+            tables,
+            mx.array(lengths, mx.int32),
+            mx.arange(batch + 1, dtype=mx.int32),
+            block,
+            maximum,
+            -1,
+            out,
+            num_decode_requests=batch,
+            num_decode_tokens=batch,
+            max_decode_context_len=length,
+            gqa_context_lens=lengths,
+            gqa_disabled=disabled,
+        )
+        mx.eval(out)
+        selected = 0 if disabled else expected
+        assert ops.last_gqa_partition_size() == selected
+        assert ops.last_gqa_num_requests() == (batch if selected else 0)
+        if selected:
+            assert ops.last_paged_dispatch() == "gqa_decode"
+        else:
+            assert ops.last_paged_dispatch() == "per_token_ps0"
+        actual = np.array(out.astype(mx.float32))
+        np.testing.assert_allclose(actual, reference, atol=2e-3, rtol=0)
+        outputs.append(actual)
+    np.testing.assert_allclose(outputs[0], outputs[1], atol=2e-3, rtol=0)
+
+
 @pytest.mark.parametrize(
     "cores,q,kv,head,batch,entry,promotion",
     [

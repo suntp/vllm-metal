@@ -234,6 +234,11 @@ static size_t paged_reduce_threadgroup_bytes(int64_t num_partitions) {
       ~size_t(15);
 }
 
+static bool paged_reduce_memory_fits(
+    size_t dynamic_bytes, size_t static_bytes, size_t capacity) {
+  return dynamic_bytes <= capacity && static_bytes <= capacity - dynamic_bytes;
+}
+
 // Occupancy planning only. Functional/geometry eligibility is checked by the
 // dispatch gate before calling this, independently of the test-only override.
 static int gqa_decode_partition_size(int num_heads, int max_seq_len,
@@ -320,8 +325,9 @@ static int gqa_decode_batch_plan_for_shape(
   // Do not turn a feasible P512 call into a resource error near the P256 limit.
   const int64_t allocation_length = std::max(max_seq_len, longest);
   const int64_t partitions256 = (allocation_length + 255) / 256;
-  if (paged_reduce_threadgroup_bytes(partitions256) >
-      kM3GqaReducerMemoryBytes - kGqaReduceStaticMemoryBytes) return partition;
+  if (!paged_reduce_memory_fits(paged_reduce_threadgroup_bytes(partitions256),
+                               kGqaReduceStaticMemoryBytes,
+                               kM3GqaReducerMemoryBytes)) return partition;
   return 256;
 }
 
@@ -690,13 +696,9 @@ static void dispatch_paged_attention_tiled(
 // into `out` (log-sum-exp combine).  Partials must follow the ps512 contract:
 // log2-space (max, exp-sum) stats plus epsilon-normalised partial outputs in
 // tmp_out[token, head, partition, :].
-static void dispatch_paged_attention_v2_reduce(
-    metal::Device& d, metal::CommandEncoder& enc, array& out,
-    const array& exp_sums, const array& max_logits, const array& tmp_out,
-    const array& seq_lens, const array& cu_seqlens_q, int num_seqs,
-    int total_q_tokens, int num_heads, int head_size, int max_num_partitions,
-    const std::string& dt, bool use_sinks, const array* sinks,
-    bool use_tq_fc, int partition_size = kPartitionSize) {
+static MTL::ComputePipelineState* paged_attention_v2_reduce_kernel(
+    metal::Device& d, const std::string& dt, int head_size,
+    int partition_size, bool use_sinks, bool use_tq_fc) {
   const auto rname = paged_reduce_kernel_name(dt, head_size, partition_size);
   // The reduce kernel reads only use_sinks (40) and use_turboquant (50); the
   // other function constants are inert for it.  TurboQuant batches take this
@@ -710,14 +712,28 @@ static void dispatch_paged_attention_v2_reduce(
       + "_tq" + (use_tq_fc ? "1" : "0")
       + "_sk" + (use_sinks ? "1" : "0");
   auto* lib = d.get_library("paged_attention_v2_kern");
-  auto* rkernel = d.get_kernel(
+  return d.get_kernel(
       rname, lib, rhash,
       {{&use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)},
        {&use_tq_fc, MTL::DataType::DataTypeBool, NS::UInteger(50)}});
+}
+
+static void dispatch_paged_attention_v2_reduce(
+    metal::Device& d, metal::CommandEncoder& enc, array& out,
+    const array& exp_sums, const array& max_logits, const array& tmp_out,
+    const array& seq_lens, const array& cu_seqlens_q, int num_seqs,
+    int total_q_tokens, int num_heads, int head_size, int max_num_partitions,
+    const std::string& dt, bool use_sinks, const array* sinks,
+    bool use_tq_fc, int partition_size = kPartitionSize,
+    MTL::ComputePipelineState* rkernel = nullptr) {
+  if (rkernel == nullptr) {
+    rkernel = paged_attention_v2_reduce_kernel(
+        d, dt, head_size, partition_size, use_sinks, use_tq_fc);
+  }
   const size_t reduce_shmem = paged_reduce_threadgroup_bytes(max_num_partitions);
   const size_t capacity = d.mtl_device()->maxThreadgroupMemoryLength();
-  if (reduce_shmem > capacity ||
-      rkernel->staticThreadgroupMemoryLength() > capacity - reduce_shmem) {
+  if (!paged_reduce_memory_fits(
+          reduce_shmem, rkernel->staticThreadgroupMemoryLength(), capacity)) {
     throw std::invalid_argument(
         "paged attention reduction exceeds the device threadgroup memory limit");
   }
@@ -950,9 +966,18 @@ static void dispatch_paged_attention_v2_online(
   const int64_t gqa_partitions = gqa_partition_size > 0
       ? (static_cast<int64_t>(max_seq_len) + gqa_partition_size - 1) /
             gqa_partition_size : 0;
+  // Check the actual reducer pipeline before allocating scratch or encoding
+  // the GQA producer. Dynamic statistics alone can fit while their sum with
+  // static workspace exceeds the device limit. Reuse this pipeline below.
+  auto* gqa_rkernel = gqa_partition_size > 0
+      ? paged_attention_v2_reduce_kernel(
+            d, dt, head_size, gqa_partition_size, false, false)
+      : nullptr;
   const bool gqa_decode = gqa_partition_size > 0
-      && paged_reduce_threadgroup_bytes(gqa_partitions) <=
-          d.mtl_device()->maxThreadgroupMemoryLength();
+      && paged_reduce_memory_fits(
+          paged_reduce_threadgroup_bytes(gqa_partitions),
+          gqa_rkernel->staticThreadgroupMemoryLength(),
+          d.mtl_device()->maxThreadgroupMemoryLength());
   if (gqa_decode) {
     const int gqa_num_partitions = static_cast<int>(gqa_partitions);
     const int gqa_group = num_heads / num_kv_heads;
@@ -998,7 +1023,7 @@ static void dispatch_paged_attention_v2_online(
         d, enc, out, g_exp_sums, g_max_logits, g_tmp_out, seq_lens,
         cu_seqlens_q, num_seqs, total_q_tokens, num_heads, head_size,
         gqa_num_partitions, dt, /*use_sinks=*/false, nullptr,
-        /*use_tq_fc=*/false, gqa_partition_size);
+        /*use_tq_fc=*/false, gqa_partition_size, gqa_rkernel);
     return;
   }
 
