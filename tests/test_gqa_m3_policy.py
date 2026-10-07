@@ -33,7 +33,7 @@ def _native_diagnostics():
         ((24, 4, 256, 16), [4096] * 4, 256),
         ((24, 4, 256, 16), [8192] * 8, 256),
         ((24, 4, 256, 16), [1] * 63 + [131072], 256),
-        ((24, 4, 256, 16), [1] * 127 + [131072], 256),
+        ((24, 4, 256, 16), [1] * 127 + [131072], 0),
         ((24, 4, 256, 16), [1, 255, 256, 8192], 256),
         ((16, 2, 256, 16), [4095] * 5, 512),
         ((16, 2, 256, 16), [4096] * 5, 256),
@@ -180,7 +180,7 @@ def _primitive(query, keys, values, tables, lengths, block, maximum, host_length
         num_decode_requests=batch,
         num_decode_tokens=batch,
         max_decode_context_len=maximum,
-        gqa_context_lens=host_lengths,
+        gqa_length_plan=get_ops().gqa_decode_length_plan(host_lengths),
     )
     return out
 

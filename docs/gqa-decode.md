@@ -87,16 +87,24 @@ start P256 at 1,280 tokens each and P512 at 2,560 each on that GPU.
 
 Only complete partitions count toward selection. The producer, temporary
 buffers and reducer still use `ceil(KV_length / P)` so the final partial
-partition is processed. Selection is stateless and scans the CPU lengths for
-at most two candidates; it adds no GPU readback, startup benchmark or
-per-request performance probe.
+partition is processed. The first ordinary decode layer builds an immutable
+CPU length plan once per forward, shared across layers and KV groups. A single
+pass records the request count, maximum length and complete-partition totals
+for P256/P512. Each native layer copies this fixed-size value and applies its
+geometry's policy without re-copying or re-scanning the request list. A new
+forward gets a new plan; deferred execution retains the original value.
+Single- and multi-request selection use the same planner. There is no GPU
+readback, startup benchmark or per-request performance probe.
 `gqa_decode_partition_size` exposes the default decision for tests;
 `gqa_decode_shape_eligible` is true when it selects a nonzero partition.
 `gqa_decode_batch_partition_size` takes a list of per-request lengths and
 applies the M3 preference using the executing GPU's architecture by default.
 Its optional `gpu_arch` is a read-only simulation input; it cannot change
 actual dispatch. `max_seq_len` optionally supplies an allocation upper bound.
-These queries check geometry and planning only, not the full dispatch conditions.
+These queries check geometry, work and the scratch budget, not all dispatch
+conditions. Direct primitive callers can pass `gqa_length_plan` from
+`gqa_decode_length_plan(context_lens)`, or the original `gqa_context_lens` list;
+the two inputs are mutually exclusive and must agree with GPU `seq_lens`.
 
 Kernel block size is the view after hybrid-cache translation: a 1056-token
 scheduler page selects block32, while a 784- or 528-token page selects
@@ -123,6 +131,11 @@ Every eligible call additionally requires:
   `num_decode_tokens`, plus their CPU `gqa_context_lens` metadata.
 - A verification window of at most 1.
 - Matching FP16/BF16 query, key-cache and value-cache types.
+- At most **512 MiB total GQA scratch per attention call**, including all
+  rectangular padding: `B * Q * ceil(max_seq_len / P) * (2 * head_dim + 8)`
+  bytes for the FP16/BF16 partial output and two FP32 statistics. Larger calls
+  fall back before allocation. This ceiling covers the measured serving
+  windows; it is not a reservation or a bound on total process memory.
 - A kernel page size allowed above and sufficient reducer shared memory:
   aligned dynamic statistics plus the compiled pipeline's static allocation.
   This is checked before allocating GQA scratch or encoding the producer;
@@ -153,7 +166,8 @@ unrecognized GQA build without disable support requires a rebuild rather than
 silently ignoring the switch. The structured query is part of the required
 extension ABI; an artifact too old to export it is unsupported and fails at
 the query instead of probing older entry points.
-The `gqa_batch_context_lens` capability advertises the new optional metadata;
+The `gqa_length_plan` capability advertises the per-forward plan. Builds with
+only `gqa_batch_context_lens` receive the original optional length list;
 an older structured query that omits it keeps its existing batch routing.
 
 ## Routing contract

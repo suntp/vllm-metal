@@ -671,6 +671,7 @@ class _PagedRoutingOpsSpy:
     def __init__(self, *, supports_mm_prefix: bool = True) -> None:
         self.calls: list[SimpleNamespace] = []
         self._supports_mm_prefix = supports_mm_prefix
+        self.length_plans: list[tuple[int, ...]] = []
 
     def supports_mm_prefix(self) -> bool:
         return self._supports_mm_prefix
@@ -681,7 +682,13 @@ class _PagedRoutingOpsSpy:
             "gqa_disable": True,
             "decode_routing_metadata": True,
             "gqa_batch_context_lens": True,
+            "gqa_length_plan": True,
         }
+
+    def gqa_decode_length_plan(self, lengths):
+        plan = tuple(lengths)
+        self.length_plans.append(plan)
+        return plan
 
     def reshape_and_cache(
         self,
@@ -722,6 +729,7 @@ class _PagedRoutingOpsSpy:
         max_decode_context_len: int = 0,
         gqa_disabled: bool = False,
         gqa_context_lens: list[int] | None = None,
+        gqa_length_plan: object = None,
     ) -> None:
         del window_seqlen_q, sinks
         self.calls[-1].block_tables = block_tables.tolist()
@@ -732,6 +740,7 @@ class _PagedRoutingOpsSpy:
         self.calls[-1].num_decode_tokens = num_decode_tokens
         self.calls[-1].max_decode_context_len = max_decode_context_len
         self.calls[-1].gqa_context_lens = gqa_context_lens
+        self.calls[-1].gqa_length_plan = gqa_length_plan
 
 
 class _PreMmPrefixOps(_PagedOpsCapsOff):
@@ -884,28 +893,34 @@ class TestSDPAForward:
         assert spy.calls[-1].num_decode_requests == 1
 
     @pytest.mark.parametrize("disabled", [False, True])
-    @pytest.mark.parametrize("batch_capability", [False, True])
+    @pytest.mark.parametrize("capability", ["none", "lengths", "plan"])
     @pytest.mark.parametrize("kind", ["decode", "mixed", "expanded_verify"])
     def test_gqa_batch_metadata_is_only_forwarded_for_ordinary_decode(
-        self, monkeypatch, disabled, batch_capability, kind
+        self, monkeypatch, disabled, capability, kind
     ) -> None:
         monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", str(int(disabled)))
         if kind == "decode":
             decode, prefill = [([[0]], 1), ([[1]], 3)], []
         elif kind == "mixed":
-            decode, prefill = [([[0]], 1)], [([[1]], 1, 0)]
+            decode = [([[0]], 1), ([[1]], 3)]
+            prefill = [([[2]], 1, 0)]
         else:
-            decode, prefill = [([[0]], 1, 2)], []
+            decode, prefill = [([[0]], 1, 2), ([[1]], 3, 2)], []
         prepare_grouped(decode, prefill, (8,))
         ctx = get_context()
-        assert ctx is not None
+        assert ctx is not None and ctx.num_decode_requests == 2
+        if kind == "mixed":
+            assert ctx.num_decode_tokens == 2 and len(ctx.context_lens) == 3
+        elif kind == "expanded_verify":
+            assert ctx.num_decode_tokens == 4
         spy = _PagedRoutingOpsSpy()
         query = MagicMock(
             return_value={
                 "gqa_decode": True,
                 "gqa_disable": True,
                 "decode_routing_metadata": True,
-                "gqa_batch_context_lens": batch_capability,
+                "gqa_batch_context_lens": capability == "lengths",
+                "gqa_length_plan": capability == "plan",
             }
         )
         monkeypatch.setattr(spy, "paged_attention_capabilities", query)
@@ -915,23 +930,34 @@ class TestSDPAForward:
             num_layers=1,
             num_kv_heads=_N_KV_HEADS,
             head_dim=_HEAD_DIM,
-            num_blocks=2,
+            num_blocks=3,
             block_size=8,
             dtype=mx.float16,
         )
-        x = mx.ones((1, 2, _HIDDEN), mx.float16)
-        zeros = mx.zeros((1, 2, _N_HEADS * _HEAD_DIM), mx.float16)
+        total = len(ctx.slot_mapping)
+        x = mx.ones((1, total, _HIDDEN), mx.float16)
+        zeros = mx.zeros((1, total, _N_HEADS * _HEAD_DIM), mx.float16)
+        eligible = kind == "decode" and not disabled
         with (
             patch.object(sdpa_mod, "get_ops", return_value=spy),
             patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
         ):
-            sdpa_forward(inner, x, ctx, cache, layer_idx=0)
-            sdpa_forward(inner, x, ctx, cache, layer_idx=0)
-        expected = (
-            [2, 4] if kind == "decode" and batch_capability and not disabled else None
-        )
-        assert spy.calls[-1].gqa_context_lens == expected
-        query.assert_called_once_with()
+            for _layer in range(3):
+                sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+            assert spy.calls[-1].gqa_context_lens == (
+                [2, 4] if eligible and capability == "lengths" else None
+            )
+            plan = spy.calls[-1].gqa_length_plan
+            assert plan == ((2, 4) if eligible and capability == "plan" else None)
+            assert len(spy.length_plans) == int(eligible and capability == "plan")
+            query.assert_called_once_with()
+            if eligible and capability == "plan":
+                # A new forward has new lengths and must not reuse the old plan.
+                prepare_grouped([([[1]], 4), ([[0]], 2)], [], (8,))
+                next_ctx = get_context()
+                sdpa_forward(inner, x, next_ctx, cache, layer_idx=0)
+                assert spy.length_plans == [(2, 4), (5, 3)]
+                assert spy.calls[-1].gqa_length_plan is not plan
 
     def test_mixed_batch_routes_slots_and_page_tables_by_layer_group(self) -> None:
         """Full and sliding layers consume their scheduler-group metadata."""

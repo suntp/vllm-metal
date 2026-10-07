@@ -14,7 +14,15 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tools.attention_bench_utils import attention_tolerances, ref_paged_attn
+from tests.gqa_test_utils import (
+    _assert_close,
+    _assert_fallback,
+    _dispatch_family,
+    _grouped_paged_reference,
+    _interleaved_table,
+    _run_primitive,
+)
+from tools.attention_bench_utils import ref_paged_attn
 from vllm_metal.metal import get_ops
 
 # The native dispatcher owns the supported domain. Parametrize the positive
@@ -33,34 +41,6 @@ HEAD_SIZE = 128
 BLOCK_SIZE = 16
 
 
-def _interleaved_table(n_blocks: int) -> list[int]:
-    """Non-contiguous logical pages within a compact physical allocation."""
-    return np.random.default_rng(715).permutation(n_blocks).tolist()
-
-
-def _assert_close(out: mx.array, ref: mx.array, dtype: mx.Dtype) -> None:
-    atol, rtol = attention_tolerances(dtype, float32_tolerance=2e-4)
-    np.testing.assert_allclose(
-        np.array(out.astype(mx.float32)),
-        np.array(ref.astype(mx.float32)),
-        atol=atol,
-        rtol=rtol,
-    )
-    # Long-context outputs are small: absolute tolerances alone could accept
-    # an incorrectly zero-filled result, so also bound the relative L2 error.
-    out_np = np.array(out.astype(mx.float32))
-    ref_np = np.array(ref.astype(mx.float32))
-    relative_l2 = np.linalg.norm(out_np - ref_np) / max(np.linalg.norm(ref_np), 1e-10)
-    assert (
-        relative_l2
-        < {
-            mx.bfloat16: 2e-2,
-            mx.float16: 6e-3,
-            mx.float32: 1e-3,
-        }[dtype]
-    )
-
-
 @pytest.fixture(scope="module", autouse=True)
 def _enable_dispatch_diagnostics():
     ops = get_ops()
@@ -70,92 +50,6 @@ def _enable_dispatch_diagnostics():
     finally:
         mx.synchronize()
         ops._set_paged_dispatch_diagnostics(previous)
-
-
-def _dispatch_family() -> str:
-    return get_ops().last_paged_dispatch()
-
-
-def _assert_fallback() -> None:
-    # Existing occupancy routing chooses ps0 or ps512 depending on the GPU.
-    assert _dispatch_family() in {"per_token_ps0", "per_token_ps512"}
-
-
-def _grouped_paged_reference(
-    *,
-    query: mx.array,
-    key_cache: mx.array,
-    value_cache: mx.array,
-    query_lens: list[int],
-    kv_lens: list[int],
-    block_tables: np.ndarray,
-    scale: float,
-    sliding_window: int | None = None,
-    soft_cap: float = 0.0,
-) -> mx.array:
-    """FP32 attention without repeating K/V for each grouped query head.
-
-    Fold the query-token and GQA-group axes into a matrix row axis. Each KV
-    head then owns one ordinary QK/PV matrix product, so the long-context reference
-    retains only the unique gathered K/V instead of allocating a copy for
-    every query head. This is a high-level full-softmax oracle, independent
-    of the paged kernel's partitioning and online softmax implementation.
-    """
-    # GPU matrix-matrix and matrix-vector paths can use different effective
-    # precision even for float32 arrays. Keep the oracle's arithmetic on CPU
-    # so grouping changes neither its precision nor its error allowance.
-    with mx.stream(mx.cpu):
-        _, block_size, kv_heads, head_size = key_cache.shape
-        query_heads = query.shape[1]
-        group = query_heads // kv_heads
-        outputs = []
-        offset = 0
-        for index, (query_len, kv_len) in enumerate(
-            zip(query_lens, kv_lens, strict=True)
-        ):
-            pages = mx.array(
-                block_tables[index, : (kv_len + block_size - 1) // block_size]
-            )
-            keys = (
-                key_cache[pages]
-                .reshape(-1, kv_heads, head_size)[:kv_len]
-                .astype(mx.float32)
-                .transpose(1, 0, 2)
-            )
-            values = (
-                value_cache[pages]
-                .reshape(-1, kv_heads, head_size)[:kv_len]
-                .astype(mx.float32)
-                .transpose(1, 0, 2)
-            )
-            queries = (
-                query[offset : offset + query_len]
-                .astype(mx.float32)
-                .reshape(query_len, kv_heads, group, head_size)
-                .transpose(1, 0, 2, 3)
-                .reshape(kv_heads, query_len * group, head_size)
-            )
-            scores = mx.einsum("krd,knd->krn", queries * scale, keys)
-            scores = scores.reshape(kv_heads, query_len, group, kv_len)
-            if soft_cap > 0:
-                scores = soft_cap * mx.tanh(scores / soft_cap)
-            query_positions = (kv_len - query_len + mx.arange(query_len))[:, None]
-            key_positions = mx.arange(kv_len)[None, :]
-            allowed = key_positions <= query_positions
-            if sliding_window is not None:
-                allowed = allowed & (key_positions > query_positions - sliding_window)
-            scores = mx.where(allowed[None, :, None, :], scores, float("-inf"))
-            probabilities = mx.softmax(scores, axis=-1).reshape(
-                kv_heads, query_len * group, kv_len
-            )
-            result = mx.einsum("krn,knd->krd", probabilities, values)
-            outputs.append(
-                result.reshape(kv_heads, query_len, group, head_size)
-                .transpose(1, 0, 2, 3)
-                .reshape(query_len, query_heads, head_size)
-            )
-            offset += query_len
-        return mx.concatenate(outputs, axis=0)
 
 
 @pytest.mark.parametrize("query_heads", [3, 12])
@@ -189,74 +83,6 @@ def test_grouped_reference_matches_expanded_reference(
     np.testing.assert_allclose(
         np.array(grouped), np.array(expanded), atol=2e-6, rtol=2e-5
     )
-
-
-def _run_primitive(
-    kv_lens: list[int],
-    dtype: mx.Dtype,
-    *,
-    interleaved: bool,
-    seed: int,
-    num_query_heads: int = NUM_QUERY_HEADS,
-    num_kv_heads: int = NUM_KV_HEADS,
-    head_size: int = HEAD_SIZE,
-    block_size: int = BLOCK_SIZE,
-    test_partition: int | None = None,
-) -> tuple[mx.array, mx.array]:
-    assert len(kv_lens) == 1
-    mx.random.seed(seed)
-    n = kv_lens[0]
-    n_blocks = (n + block_size - 1) // block_size
-    pages = _interleaved_table(n_blocks) if interleaved else list(range(n_blocks))
-    shape = (n_blocks + 4, block_size, num_kv_heads, head_size)
-    key = mx.random.normal(shape).astype(dtype)
-    value = mx.random.normal(shape).astype(dtype)
-    query = mx.random.normal((1, num_query_heads, head_size)).astype(dtype)
-    tables = mx.array([pages], dtype=mx.int32)
-    lengths = mx.array(kv_lens, dtype=mx.int32)
-    mx.eval(query, key, value, tables, lengths)
-    out = mx.array(0)
-    if test_partition is not None:
-        get_ops()._gqa_paged_attention_for_test(
-            query,
-            key,
-            value,
-            head_size**-0.5,
-            tables,
-            lengths,
-            block_size,
-            n,
-            test_partition,
-            out,
-        )
-    else:
-        get_ops().paged_attention_primitive(
-            query,
-            key,
-            value,
-            num_kv_heads,
-            head_size**-0.5,
-            0.0,
-            tables,
-            lengths,
-            mx.array([0, 1], dtype=mx.int32),
-            block_size,
-            n,
-            -1,
-            out,
-        )
-    mx.eval(out)
-    ref = _grouped_paged_reference(
-        query=query,
-        key_cache=key,
-        value_cache=value,
-        query_lens=[1],
-        kv_lens=kv_lens,
-        block_tables=np.array(tables),
-        scale=head_size**-0.5,
-    )
-    mx.eval(ref)
-    return out, ref
 
 
 def test_dispatch_diagnostics_are_disabled_in_a_fresh_process() -> None:

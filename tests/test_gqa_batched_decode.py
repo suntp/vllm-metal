@@ -5,14 +5,13 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tests.test_gqa_decode_routing import _run_primitive
-from tests.test_gqa_paged_decode import (
-    GQA_GEOMETRIES,
-    GQA_PARTITIONS,
+from tests.gqa_test_utils import (
     _assert_close,
     _assert_fallback,
     _dispatch_family,
+    _run_primitive,
 )
+from tests.test_gqa_paged_decode import GQA_GEOMETRIES, GQA_PARTITIONS
 from vllm_metal.metal import get_ops
 
 
@@ -455,7 +454,8 @@ def test_invalid_host_lengths_fail_before_dispatch(lengths):
         )
 
 
-def test_host_lengths_are_captured_by_each_lazy_primitive():
+@pytest.mark.parametrize("preplanned", [False, True])
+def test_host_lengths_are_captured_by_each_lazy_primitive(preplanned):
     ops = get_ops()
     q = mx.ones((2, 32, 128), mx.float16)
     k = mx.ones((1344, 16, 8, 128), mx.float16)
@@ -464,6 +464,11 @@ def test_host_lengths_are_captured_by_each_lazy_primitive():
     lengths = mx.array([10752, 10752], mx.int32)
     cu = mx.array([0, 1, 2], mx.int32)
     host_lengths = [10752, 10752]
+    routing = (
+        {"gqa_length_plan": ops.gqa_decode_length_plan(host_lengths)}
+        if preplanned
+        else {"gqa_context_lens": host_lengths}
+    )
     selected, fallback = mx.array(0), mx.array(0)
     ops.paged_attention_primitive(
         q,
@@ -481,9 +486,10 @@ def test_host_lengths_are_captured_by_each_lazy_primitive():
         selected,
         num_decode_requests=2,
         num_decode_tokens=2,
-        gqa_context_lens=host_lengths,
+        **routing,
     )
-    # Later caller-side mutation must not alter the pending primitive's plan.
+    # Neither caller-side mutation nor destruction may change the saved plan.
+    del routing
     host_lengths.clear()
     ops.paged_attention_primitive(
         q,
@@ -609,3 +615,76 @@ def test_unsupported_batch_cache_retains_fallback(dtype, turboquant):
     )
     _assert_fallback()
     _assert_close(out, ref, dtype)
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_ragged_scratch_budget_falls_back_before_allocation(dtype):
+    ops = get_ops()
+    batch, q, kv, head, block = 256, 24, 4, 256, 16
+    lengths = [131072] + [1] * (batch - 1)
+    padded_bytes = batch * q * 256 * (2 * head + 8)
+    assert padded_bytes == 780 * 1024**2
+    assert ops._gqa_decode_config_for_test()["max_scratch_bytes"] == 512 * 1024**2
+    assert ops.gqa_decode_batch_partition_size(q, kv, head, lengths, 40) == 0
+    query = mx.zeros((batch, q, head), dtype)
+    keys = mx.zeros((1, block, kv, head), dtype)
+    values = mx.full(keys.shape, 2, dtype)
+    tables = mx.zeros((batch, max(lengths) // block), mx.int32)
+    gpu_lengths = mx.array(lengths, mx.int32)
+    cu = mx.arange(batch + 1, dtype=mx.int32)
+    mx.eval(query, keys, values, tables, gpu_lengths, cu)
+    mx.synchronize()
+    before = mx.get_active_memory()
+    mx.reset_peak_memory()
+    out = mx.array(0)
+    ops.paged_attention_primitive(
+        query,
+        keys,
+        values,
+        kv,
+        head**-0.5,
+        0.0,
+        tables,
+        gpu_lengths,
+        cu,
+        block,
+        max(lengths),
+        -1,
+        out,
+        num_decode_requests=batch,
+        num_decode_tokens=batch,
+        max_decode_context_len=max(lengths),
+        gqa_length_plan=ops.gqa_decode_length_plan(lengths),
+    )
+    mx.eval(out)
+    assert ops.last_paged_dispatch() == "per_token_ps0"
+    assert ops.last_gqa_partition_size() == 0
+    assert mx.get_peak_memory() - before < 64 * 1024**2
+    np.testing.assert_allclose(np.array(out.astype(mx.float32)), 2, atol=2e-3)
+
+
+def test_precomputed_length_plan_is_immutable_and_validated():
+    ops = get_ops()
+    plan = ops.gqa_decode_length_plan([10752, 10752])
+    assert plan.num_requests == 2 and plan.max_length == 10752
+    with pytest.raises(AttributeError):
+        plan.max_length = 1
+    query = mx.zeros((1, 32, 128), mx.float16)
+    keys = mx.zeros((1, 16, 8, 128), mx.float16)
+    with pytest.raises(ValueError, match="one positive length per decode row"):
+        ops.paged_attention_primitive(
+            query,
+            keys,
+            keys,
+            8,
+            128**-0.5,
+            0.0,
+            mx.zeros((1, 672), mx.int32),
+            mx.array([10752], mx.int32),
+            mx.array([0, 1], mx.int32),
+            16,
+            10752,
+            -1,
+            mx.array(0),
+            gqa_length_plan=plan,
+        )

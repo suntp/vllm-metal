@@ -8,22 +8,19 @@ Tests inject core counts only when hardware detection is unavailable.
 from __future__ import annotations
 
 import mlx.core as mx
-import numpy as np
 import pytest
 
-from tests.test_gqa_paged_decode import (
-    BLOCK_SIZE,
-    GQA_GEOMETRIES,
-    GQA_PARTITIONS,
-    GQA_SIMD_GROUPS_PER_CORE,
-    HEAD_SIZE,
-    NUM_KV_HEADS,
-    NUM_QUERY_HEADS,
+from tests.gqa_test_utils import (
     _assert_close,
     _assert_fallback,
     _dispatch_family,
-    _grouped_paged_reference,
-    _interleaved_table,
+    _run_primitive,
+)
+from tests.test_gqa_paged_decode import (
+    GQA_GEOMETRIES,
+    GQA_PARTITIONS,
+    GQA_SIMD_GROUPS_PER_CORE,
+    NUM_QUERY_HEADS,
 )
 from vllm_metal.metal import get_ops
 
@@ -34,6 +31,7 @@ def test_native_reports_public_routing_capabilities():
         "gqa_disable": True,
         "decode_routing_metadata": True,
         "gqa_batch_context_lens": True,
+        "gqa_length_plan": True,
     }
 
 
@@ -81,165 +79,6 @@ def _eligible_context(query_heads: int = NUM_QUERY_HEADS, minimum: int = 32768) 
     partitions = (GQA_SIMD_GROUPS_PER_CORE * cores + query_heads - 1) // query_heads
     n = max(minimum, partitions * min(GQA_PARTITIONS))
     return n
-
-
-def _run_primitive(
-    kv_lens: list[int],
-    dtype: mx.Dtype,
-    *,
-    interleaved: bool,
-    seed: int,
-    window_seqlen_q: int = 1,
-    query_lens: list[int] | None = None,
-    num_decode_requests: int = -1,
-    num_decode_tokens: int = 0,
-    max_decode_context_len: int = 0,
-    gqa_disabled: bool = False,
-    num_query_heads: int = NUM_QUERY_HEADS,
-    num_kv_heads: int = NUM_KV_HEADS,
-    head_size: int = HEAD_SIZE,
-    block_size: int = BLOCK_SIZE,
-    softcap: float = 0.0,
-    sliding_window: int = -1,
-    sink_value: float | None = None,
-    turboquant: bool = False,
-    native_reference: bool = False,
-    test_partition: int | None = None,
-    gqa_context_lens: list[int] | None = None,
-) -> tuple[mx.array, mx.array]:
-    mx.random.seed(seed)
-    num_seqs = len(kv_lens)
-    max_kv_len = max(kv_lens)
-    scale = head_size**-0.5
-    if query_lens is None:
-        query_lens = [1] * num_seqs
-    n_blocks_needed = (max_kv_len + block_size - 1) // block_size
-    tables = []
-    max_blk = 0
-    for s in range(num_seqs):
-        if interleaved:
-            table = [
-                b + s * n_blocks_needed for b in _interleaved_table(n_blocks_needed)
-            ]
-        else:
-            table = list(range(s * n_blocks_needed, (s + 1) * n_blocks_needed))
-        tables.append(table)
-        max_blk = max(max_blk, max(table))
-    cache_shape = (max_blk + 4, block_size, num_kv_heads, head_size)
-    key_cache = mx.random.normal(cache_shape).astype(dtype)
-    value_cache = mx.random.normal(cache_shape).astype(dtype)
-    query = mx.random.normal((sum(query_lens), num_query_heads, head_size)).astype(
-        dtype
-    )
-    block_tables = mx.array(tables, dtype=mx.int32)
-    kv_lens_arr = mx.array(kv_lens, dtype=mx.int32)
-    cu = [0]
-    for qlen in query_lens:
-        cu.append(cu[-1] + qlen)
-    cu_seqlens_q = mx.array(cu, dtype=mx.int32)
-    sinks = (
-        None
-        if sink_value is None
-        else mx.full((num_query_heads,), sink_value, dtype=mx.float32)
-    )
-    mx.eval(key_cache, value_cache, query, block_tables, kv_lens_arr, cu_seqlens_q)
-
-    key_ref, value_ref = key_cache, value_cache
-    quant_kwargs = {}
-    if gqa_context_lens is not None:
-        quant_kwargs["gqa_context_lens"] = gqa_context_lens
-    if turboquant:
-        from vllm_metal.attention.caches.turboquant import (
-            get_v_centroids,
-            turbo_quant_decode,
-            turbo_quant_encode,
-        )
-
-        (key_cache, k_scale, k_zero), (value_cache, v_scale) = turbo_quant_encode(
-            key_cache, value_cache, "q8_0"
-        )
-        key_ref, value_ref = turbo_quant_decode(
-            (key_cache, k_scale, k_zero),
-            (value_cache, v_scale),
-            output_dtype=dtype,
-            key_quant_type="q8_0",
-        )
-        quant_kwargs.update(
-            {
-                "key_scale_cache": k_scale,
-                "value_scale_cache": v_scale,
-                "key_zero_cache": k_zero,
-                "v_centroids": get_v_centroids(3),
-                "use_turboquant": True,
-                "quant_type": "q8_0",
-                "v_bits": 3,
-            }
-        )
-        mx.eval(key_cache, value_cache, k_scale, k_zero, v_scale, key_ref, value_ref)
-
-    out = mx.array(0)
-    if test_partition is not None:
-        get_ops()._gqa_paged_attention_for_test(
-            query,
-            key_cache,
-            value_cache,
-            scale,
-            block_tables,
-            kv_lens_arr,
-            block_size,
-            max_kv_len,
-            test_partition,
-            out,
-        )
-    else:
-        get_ops().paged_attention_primitive(
-            query,
-            key_cache,
-            value_cache,
-            num_kv_heads,
-            scale,
-            softcap,
-            block_tables,
-            kv_lens_arr,
-            cu_seqlens_q,
-            block_size,
-            max_kv_len,
-            sliding_window,
-            out,
-            window_seqlen_q=window_seqlen_q,
-            num_decode_requests=num_decode_requests,
-            num_decode_tokens=num_decode_tokens,
-            max_decode_context_len=max_decode_context_len,
-            gqa_disabled=gqa_disabled,
-            sinks=sinks,
-            **quant_kwargs,
-        )
-    mx.eval(out)
-    if sinks is None and not native_reference:
-        ref = _grouped_paged_reference(
-            query=query,
-            key_cache=key_ref,
-            value_cache=value_ref,
-            query_lens=query_lens,
-            kv_lens=kv_lens,
-            block_tables=np.array(block_tables),
-            scale=scale,
-            sliding_window=None if sliding_window < 0 else sliding_window,
-            soft_cap=softcap,
-        )
-    else:
-        assert query_lens == [1] and softcap == 0 and sliding_window < 0
-        flat_k = key_cache[block_tables[0]].reshape(-1, num_kv_heads, head_size)
-        flat_v = value_cache[block_tables[0]].reshape(-1, num_kv_heads, head_size)
-        ref = mx.fast.scaled_dot_product_attention(
-            query.transpose(1, 0, 2)[None],
-            flat_k[:max_kv_len].transpose(1, 0, 2)[None],
-            flat_v[:max_kv_len].transpose(1, 0, 2)[None],
-            scale=scale,
-            sinks=None if sinks is None else sinks.astype(dtype),
-        ).reshape(out.shape)
-    mx.eval(ref)
-    return out, ref
 
 
 def test_core_count_override_restores_hardware_detection() -> None:

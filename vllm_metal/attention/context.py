@@ -150,6 +150,8 @@ class PagedAttentionContext:
     )
     # Public native ABI capabilities, queried once for this forward's layers.
     paged_native_capabilities: dict[str, bool] | None = None
+    # Immutable native length statistics, shared by all KV groups/layers.
+    gqa_length_plan: Any = None
 
 
 def set_context(ctx: PagedAttentionContext) -> None:
