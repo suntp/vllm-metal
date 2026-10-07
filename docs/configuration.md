@@ -100,12 +100,17 @@ where the eager fill's resident pages at least showed up as used.
 Because of that, the planner checks the plan against the machine before serving:
 `VLLM_METAL_KV_COMMIT_PROBE` (on by default) forces a bounded sample of the
 planned pool resident at startup — `min(capacity, 512 MiB)`, one write per
-page — and reads back how much memory was free and how much the kernel wrote to
-swap to make room. Paging is read from the cumulative swap-file counter
-(`vm_stat` `Swapouts`): not from swap occupancy, which rises and falls within a
-probe and so can hide the writes, and not from psutil's `swap_memory().sout`,
-which on macOS is the `Pageouts` counter — it moves for file writeback and can
-stay put while the kernel is swapping.
+page — and reads back how much memory was free and how much the kernel
+compressed or wrote to swap to make room. macOS answers pressure with the
+compressor first and the swap file once that fills, so paging is read from both
+cumulative counters (`vm_stat` `Compressions` and `Swapouts`): not from swap
+occupancy, which rises and falls within a probe and so can hide the writes, and
+not from psutil's `swap_memory().sout`, which on macOS is the `Pageouts`
+counter — it moves for file writeback and can stay put while the kernel is
+swapping. The `vm_stat` read has a five-second timeout; if the command is
+missing, fails, hangs or prints something unexpected, startup stops with an
+error that names `VLLM_METAL_KV_COMMIT_PROBE=0` as the opt-out, because a
+default-on safety check must not pass silently.
 The sample lives in its own mapping and is dropped as soon as the probe returns,
 so it leaves nothing resident behind — the touch itself is transient, which a
 process's peak-RSS counter will see but steady state will not. If the kernel

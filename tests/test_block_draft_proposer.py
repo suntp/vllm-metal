@@ -204,8 +204,80 @@ def test_missing_and_discontinuous_features_fail_before_drafting(proposer):
         proposer.propose(_prefill(state, _features(1), 1, True))
 
 
+def test_prefix_caching_cannot_adopt_unknown_decode_coverage(proposer):
+    proposer.enable_prefix_caching = True
+    state = RequestState(
+        token_ids=[1] * 17 + [2],
+        prompt_len=16,
+        sampling_params=SamplingParams(temperature=0),
+        block_ids=[[0, 1], [5, 2]],
+    )
+    ctx = replace(
+        _prefill(state, _features(1), 0, True),
+        decode_reqs=[("r", state)],
+        decode_segments=[
+            PagedDecodeSegment(
+                req_id="r",
+                input_token_ids=(1,),
+                start_row=0,
+                num_query_tokens=1,
+                draft_token_ids=(),
+                cache_start_pos=16,
+                block_ids=tuple(tuple(g) for g in state.block_ids),
+            )
+        ],
+        decode_token_ids=[[2]],
+        prefill_reqs=[],
+        prefill_token_ids=[],
+        prefill_result_modes=[],
+        num_decode_segments=1,
+    )
+    with pytest.raises(RuntimeError, match="discontinuous"):
+        proposer.propose(ctx)
+    assert not proposer._valid_ends
+
+
+@pytest.mark.parametrize("start", [0, 16])
+def test_first_prefill_draft_uses_sampled_anchor_at_absolute_position(
+    proposer, monkeypatch, start
+):
+    proposer.enable_prefix_caching = True
+    state = RequestState(
+        token_ids=[1] * 31 + [2],
+        prompt_len=31,
+        sampling_params=SamplingParams(temperature=0),
+        block_ids=[[0, 1], [5, 2, 7, 1]],
+    )
+    features = _features(31)
+    if start:
+        proposer.cache.write_context(
+            [f[:start] for f in features], [(state.block_ids[1], 0, start)]
+        )
+    compile_draft = proposer._compile_draft
+    calls = []
+
+    def record_compile(width):
+        forward = compile_draft(width)
+
+        def record_forward(anchors, rows):
+            calls.append((anchors.tolist(), rows))
+            return forward(anchors, rows)
+
+        return record_forward
+
+    monkeypatch.setattr(proposer, "_compile_draft", record_compile)
+    result = proposer.propose(
+        _prefill(state, [f[start:] for f in features], start, True)
+    )
+    assert result is not None
+    # The final prompt token is 1; the target has already emitted anchor 2 at
+    # position 31. A cached suffix must preserve that absolute position and
+    # must not draft from the final prompt token or ingest anchor 2 twice.
+    assert calls == [([2], [(state.block_ids[1], 31)])]
+
+
 @pytest.mark.parametrize("proposer_cls", [DFlashProposer, DSparkProposer])
-@pytest.mark.parametrize("restriction", ["prefix", "lora", "tp", "block_size"])
+@pytest.mark.parametrize("restriction", ["lora", "tp", "block_size"])
 def test_unsupported_configuration_fails_before_loading(restriction, proposer_cls):
     config = SimpleNamespace(
         speculative_config=SimpleNamespace(
@@ -232,9 +304,7 @@ def test_unsupported_configuration_fails_before_loading(restriction, proposer_cl
         _is_vlm=False,
         _is_pooling=False,
     )
-    if restriction == "prefix":
-        config.cache_config.enable_prefix_caching = True
-    elif restriction == "lora":
+    if restriction == "lora":
         config.lora_config = object()
     elif restriction == "tp":
         config.parallel_config.tensor_parallel_size = 2
@@ -363,3 +433,113 @@ def test_context_limit_uses_selected_width(width, proposer):
         assert len(result.draft_token_ids[0]) == 1
     else:
         assert result is None
+
+
+@pytest.mark.parametrize("producer", ["greedy", "sampled", "grammar", "zero_k"])
+def test_prefix_hit_reuses_committed_kv_without_writing_shared_blocks(
+    proposer, producer
+):
+    proposer.enable_prefix_caching = True
+    params = SamplingParams(
+        temperature=0.7 if producer == "sampled" else 0,
+        structured_outputs=StructuredOutputsParams(choice=["yes", "no"])
+        if producer == "grammar"
+        else None,
+    )
+    state = RequestState(
+        token_ids=[1] * 31 + [2],
+        prompt_len=31,
+        sampling_params=params,
+        block_ids=[[0], [5, 2, 7, 1]],
+    )
+    original = _features(31)
+    ctx = _prefill(state, original, 0, True)
+    if producer == "zero_k":
+        ctx = replace(ctx, num_speculative_tokens=0)
+    result = proposer.propose(ctx)
+    assert (result is not None) == (producer == "greedy")
+    shared = [
+        np.array(stored[5])
+        for caches in (
+            proposer.cache.cache.key_caches,
+            proposer.cache.cache.value_caches,
+        )
+        for stored in caches
+    ]
+    proposer.release_requests({"r"})
+    # Reuse one full block and allocate private suffix/lookahead pages.
+    state.sampling_params = SamplingParams(temperature=0)
+    state.block_ids = [[0], [5, 3, 8, 4]]
+    state.token_ids = [1] * 16 + [3] * 7 + [4]
+    state.prompt_len = 23
+    suffix = _features(7)
+    result = proposer.propose(_prefill(state, suffix, 16, True))
+    assert result is not None
+    features = [
+        mx.concatenate([prefix[:16], tail])[None]
+        for prefix, tail in zip(original, suffix, strict=True)
+    ]
+    assert (
+        result.draft_token_ids
+        == _dense_tokens(proposer, mx.array([4]), features, 3).tolist()
+    )
+    for saved, stored in zip(
+        shared,
+        [
+            stored
+            for caches in (
+                proposer.cache.cache.key_caches,
+                proposer.cache.cache.value_caches,
+            )
+            for stored in caches
+        ],
+        strict=True,
+    ):
+        np.testing.assert_array_equal(np.array(stored[5]), saved)
+    for layer, (keys, values) in enumerate(proposer.model._project_context(features)):
+        for stored, expected in (
+            (proposer.cache.cache.key_caches[layer], keys),
+            (proposer.cache.cache.value_caches[layer], values),
+        ):
+            actual = mx.stack(
+                [stored[state.block_ids[1][p // 16], p % 16] for p in range(23)]
+            )
+            np.testing.assert_allclose(
+                np.array(actual),
+                np.array(expected[0].transpose(1, 0, 2)),
+                atol=0.004,
+                rtol=0.004,
+            )
+
+
+def test_prefix_hit_does_not_allow_a_later_gap(proposer):
+    proposer.enable_prefix_caching = True
+    state = RequestState(
+        token_ids=[1] * 40,
+        prompt_len=40,
+        sampling_params=SamplingParams(temperature=0),
+        block_ids=[[0], [5, 2, 7, 1]],
+    )
+    assert proposer.propose(_prefill(state, _features(4), 16, False)) is None
+    before = [np.array(buffer) for buffer in proposer.cache.storage.buffers]
+    with pytest.raises(RuntimeError, match="discontinuous"):
+        proposer.propose(_prefill(state, _features(4), 24, False))
+    for actual, expected in zip(proposer.cache.storage.buffers, before, strict=True):
+        np.testing.assert_array_equal(np.array(actual), expected)
+
+
+@pytest.mark.parametrize("start", [32, 48])
+def test_prefix_hit_beyond_draft_context_stays_target_only(proposer, start):
+    proposer.enable_prefix_caching = True
+    proposer.cache.max_model_len = 32
+    state = RequestState(
+        token_ids=[1] * (start + 1) + [2],
+        prompt_len=start + 1,
+        sampling_params=SamplingParams(temperature=0),
+        block_ids=[[0], [5, 2, 7, 1]],
+    )
+    before = [np.array(buffer) for buffer in proposer.cache.storage.buffers]
+    assert proposer.propose(_prefill(state, _features(1), start, True)) is None
+    assert not proposer._valid_ends
+    for actual, expected in zip(proposer.cache.storage.buffers, before, strict=True):
+        np.testing.assert_array_equal(np.array(actual), expected)

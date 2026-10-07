@@ -8,6 +8,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,18 @@ _PAGE_STRIDE = mmap.PAGESIZE
 # ``vm_stat`` prints both counters; only the second one tracks the swap file.
 _PAGE_SIZE_RE = re.compile(r"page size of (\d+) bytes")
 _SWAP_OUTS_RE = re.compile(r"^Swapouts:\s*(\d+)\.", re.MULTILINE)
+_COMPRESSIONS_RE = re.compile(r"^Compressions:\s*(\d+)\.", re.MULTILINE)
+_VM_STAT_TIMEOUT_SECONDS = 5.0
+
+
+def _parse_page_counter(
+    vm_stat_output: str, counter: re.Pattern[str], name: str
+) -> int:
+    page_size = _PAGE_SIZE_RE.search(vm_stat_output)
+    pages = counter.search(vm_stat_output)
+    if page_size is None or pages is None:
+        raise ValueError(f"vm_stat output is missing its page size or {name} line")
+    return int(pages.group(1)) * int(page_size.group(1))
 
 
 def _parse_swap_out_bytes(vm_stat_output: str) -> int:
@@ -27,15 +40,28 @@ def _parse_swap_out_bytes(vm_stat_output: str) -> int:
     ``vm_stat`` reports ``Pageouts`` and ``Swapouts`` as separate counters and
     both are in pages; the swap file is the second one.
     """
-    page_size = _PAGE_SIZE_RE.search(vm_stat_output)
-    swap_outs = _SWAP_OUTS_RE.search(vm_stat_output)
-    if page_size is None or swap_outs is None:
-        raise ValueError("vm_stat output is missing its page size or Swapouts line")
-    return int(swap_outs.group(1)) * int(page_size.group(1))
+    return _parse_page_counter(vm_stat_output, _SWAP_OUTS_RE, "Swapouts")
 
 
-def _swap_out_bytes() -> int:
-    """Cumulative bytes the kernel has written to the swap file.
+def _parse_compressed_bytes(vm_stat_output: str) -> int:
+    """Cumulative bytes the kernel has compressed, from ``vm_stat`` output.
+
+    macOS answers memory pressure with the compressor first and the swap file
+    only once the compressor is full, so a sample the compressor absorbed shows
+    up here and not in ``Swapouts``.
+    """
+    return _parse_page_counter(vm_stat_output, _COMPRESSIONS_RE, "Compressions")
+
+
+class PagingCounters(NamedTuple):
+    """The kernel's cumulative displacement counters, in bytes."""
+
+    swap_out_bytes: int
+    compressed_bytes: int
+
+
+def _paging_counters() -> PagingCounters:
+    """The kernel's cumulative swap-file and compressor counters.
 
     Not ``psutil.swap_memory().sout``: on macOS that is the *Pageouts* counter,
     which counts page-outs generally and so also moves for file writeback that
@@ -44,11 +70,29 @@ def _swap_out_bytes() -> int:
     Swap occupancy is wrong for a different reason: it falls as readily as it
     rises, so a machine that pages 128 MiB out while reclaiming 128 MiB back
     reads as no change at all.
+
+    Raises ``RuntimeError`` when ``vm_stat`` is missing, fails, hangs past its
+    timeout, or prints something else. The probe is a default-on safety gate,
+    so it must not pass an unverified plan silently; the error names
+    ``VLLM_METAL_KV_COMMIT_PROBE=0`` as the explicit opt-out.
     """
-    output = subprocess.run(
-        ["/usr/bin/vm_stat"], capture_output=True, text=True, check=True
-    ).stdout
-    return _parse_swap_out_bytes(output)
+    try:
+        output = subprocess.run(
+            ["/usr/bin/vm_stat"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=_VM_STAT_TIMEOUT_SECONDS,
+        ).stdout
+        return PagingCounters(
+            swap_out_bytes=_parse_swap_out_bytes(output),
+            compressed_bytes=_parse_compressed_bytes(output),
+        )
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        raise RuntimeError(
+            f"KV commit probe could not read vm_stat ({exc}); set "
+            "VLLM_METAL_KV_COMMIT_PROBE=0 to skip the probe."
+        ) from exc
 
 
 def get_model_download_path(
@@ -139,6 +183,8 @@ class CommitProbe:
     probed_bytes: int
     swap_out_before: int
     swap_out_after: int
+    compressed_before: int
+    compressed_after: int
     available_before: int
     available_after: int
     seconds: float
@@ -152,11 +198,26 @@ class CommitProbe:
         """
         return max(0, self.swap_out_after - self.swap_out_before)
 
+    @property
+    def compressed_bytes(self) -> int:
+        """Bytes the kernel compressed while the sample was resident."""
+        return max(0, self.compressed_after - self.compressed_before)
+
+    @property
+    def displaced_bytes(self) -> int:
+        """Bytes the kernel moved out of the way to back the sample.
+
+        The compressor and the swap file are the kernel's two answers to
+        pressure, in that order, so both counters add up to one signal.
+        """
+        return self.swap_out_bytes + self.compressed_bytes
+
     def describe(self) -> str:
         return (
             f"forced {self.probed_bytes / 2**20:.0f} MiB resident in "
             f"{self.seconds:.2f}s: available "
             f"{self.available_before / 2**30:.1f}->{self.available_after / 2**30:.1f} GiB, "
+            f"compressed +{self.compressed_bytes / 2**20:.0f} MiB, "
             f"swap out +{self.swap_out_bytes / 2**20:.0f} MiB"
         )
 
@@ -176,9 +237,12 @@ def probe_commit(nbytes: int) -> CommitProbe:
     rather than written to swap, so nothing of the sample is left for the next
     allocation to inherit.)
 
-    Paging is read from the cumulative swap-file counter (see
-    :func:`_swap_out_bytes`) rather than swap occupancy, which both rises and
-    falls during a probe and so can hide the writes this is looking for.
+    Paging is read from the kernel's cumulative compressor and swap-file
+    counters (see :func:`_paging_counters`) rather than swap occupancy, which
+    both rises and falls during a probe and so can hide the writes this is
+    looking for. The compressor comes first: macOS compresses other pages to
+    make room before it writes swap, so a probe that reads only the swap file
+    misses a sample the compressor absorbed.
     ``available_after`` is read once the sample has
     been dropped, so the pair describes the machine before the probe and with
     the probe's memory already back.
@@ -192,7 +256,7 @@ def probe_commit(nbytes: int) -> CommitProbe:
         raise ValueError("probe_commit needs a positive size")
 
     available_before = int(psutil.virtual_memory().available)
-    swap_out_before = _swap_out_bytes()
+    before = _paging_counters()
     started = time.perf_counter()
 
     buf = mmap.mmap(-1, nbytes)
@@ -208,14 +272,16 @@ def probe_commit(nbytes: int) -> CommitProbe:
     # Read after the mapping is gone, so these describe the machine with the
     # probe's memory already back. Swap-outs are cumulative, so the paging the
     # probe caused is counted whether it happened before or after the release.
-    swap_out_after = _swap_out_bytes()
+    after = _paging_counters()
     available_after = int(psutil.virtual_memory().available)
 
     return CommitProbe(
         probed_bytes=nbytes,
-        swap_out_before=swap_out_before,
-        swap_out_after=swap_out_after,
+        swap_out_before=before.swap_out_bytes,
+        swap_out_after=after.swap_out_bytes,
         available_before=available_before,
         available_after=available_after,
         seconds=time.perf_counter() - started,
+        compressed_before=before.compressed_bytes,
+        compressed_after=after.compressed_bytes,
     )

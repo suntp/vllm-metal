@@ -33,6 +33,50 @@ def _configure_kv_events(vllm_config: VllmConfig, extra: dict[str, Any]) -> None
             tier.setdefault("enable_kv_events", True)
 
 
+def _kv_dtype_bytes(cache_dtype: str, model_dtype: Any) -> int:
+    """Bytes per KV element for ``--kv-cache-dtype``; ``auto`` follows the model."""
+    if cache_dtype == "auto":
+        return int(model_dtype.itemsize)
+    from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+
+    return int(STR_DTYPE_TO_TORCH_DTYPE[cache_dtype].itemsize)
+
+
+# Measured in #1037: two full-length requests is the smallest pool with no
+# store retries on Mistral-7B and Qwen3-32B at concurrency 4. A full pool
+# loses nothing, the scheduler retries the store on the next step.
+_DEFAULT_POOL_REQUESTS = 2
+
+
+def default_host_pool_bytes(vllm_config: VllmConfig) -> int:
+    """Host pool bytes for two ``max_model_len`` requests of KV.
+
+    The pool stages blocks for the disk tier. A full pool does not lose a
+    block: the scheduler retries the store on the next step. Two full-length
+    requests is the smallest pool with no retries at concurrency 4 in the
+    #1037 measurements, where every size from half a request to four stored
+    the same bytes. Offloading serves only uniform full-attention models, whose
+    KV is ``2 * layers * kv_heads * head_size`` elements per token; a
+    compressed layout only lets the same bytes hold more blocks. The token
+    count rounds up to whole blocks once the block size is known.
+    """
+    model_config = vllm_config.model_config
+    parallel_config = vllm_config.parallel_config
+    cache_config = vllm_config.cache_config
+    per_token = (
+        2
+        * model_config.get_num_layers_by_block_type(parallel_config)
+        * model_config.get_num_kv_heads(parallel_config)
+        * model_config.get_head_size()
+        * _kv_dtype_bytes(cache_config.cache_dtype, model_config.dtype)
+    )
+    tokens = int(model_config.max_model_len)
+    block_size = cache_config.block_size
+    if block_size:
+        tokens = -(-tokens // block_size) * block_size
+    return per_token * tokens * _DEFAULT_POOL_REQUESTS
+
+
 def configure_kv_offloading(vllm_config: VllmConfig) -> None:
     """Translate --kv-offloading-size and validate the KV connector.
 
@@ -40,6 +84,8 @@ def configure_kv_offloading(vllm_config: VllmConfig) -> None:
     after this hook and would set a connector Metal cannot serve. So translate
     here and clear ``kv_offloading_size``, which disarms the upstream one.
     Without a size or a connector this returns without touching anything.
+    With the connector but no size, the host pool defaults to two
+    ``max_model_len`` requests of KV.
     """
     cache_config = vllm_config.cache_config
     kv_transfer_config = vllm_config.kv_transfer_config
@@ -120,9 +166,13 @@ def configure_kv_offloading(vllm_config: VllmConfig) -> None:
         extra["cpu_bytes_to_use"] = int(kv_offloading_size * (1 << 30))
         cache_config.kv_offloading_size = None
     elif "cpu_bytes_to_use" not in extra:
-        raise NotImplementedError(
-            "KV offloading on Metal needs a host pool size: pass "
-            "--kv-offloading-size N (GiB) alongside the connector."
+        extra["cpu_bytes_to_use"] = default_host_pool_bytes(vllm_config)
+        logger.info_once(
+            "KV offloading on Metal: no --kv-offloading-size given, so the host "
+            "pool defaults to %.2f GiB, two --max-model-len requests (%d tokens "
+            "each) of KV.",
+            extra["cpu_bytes_to_use"] / 2**30,
+            model_config.max_model_len,
         )
     # Only "fs" works here; "obj" needs NIXL, which has no macOS build.
     # The spec renames "fs" to MetalFileSystemTierManager. This hook runs again

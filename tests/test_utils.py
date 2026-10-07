@@ -2,6 +2,7 @@
 """Tests for shared Metal utilities."""
 
 import importlib.metadata
+import subprocess
 import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -12,6 +13,9 @@ import pytest
 
 from tools.attention_bench_utils import attention_tolerances, package_versions
 from vllm_metal.utils import (
+    CommitProbe,
+    _paging_counters,
+    _parse_compressed_bytes,
     _parse_swap_out_bytes,
     get_model_download_path,
     probe_commit,
@@ -123,6 +127,7 @@ def test_probe_commit_reports_a_machine_that_cannot_map(monkeypatch) -> None:
 
 _VM_STAT = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
 Pages free:                                     6663.
+Compressions:                               45258515577.
 Pageins:                                    16116825.
 Pageouts:                                     216236.
 Swapins:                                    12239475.
@@ -155,3 +160,75 @@ def test_swap_out_counter_needs_both_the_page_size_and_the_swapouts_line(
 ) -> None:
     with pytest.raises(ValueError, match="missing"):
         _parse_swap_out_bytes(output)
+
+
+def test_paging_counters_read_with_a_timeout(monkeypatch):
+    seen = {}
+
+    def run(*args, **kwargs):
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(args, 0, _VM_STAT, "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    assert _paging_counters() == (15761162 * 16384, 45258515577 * 16384)
+    assert seen["timeout"] > 0
+
+
+def test_compressed_counter_reads_the_compressor_line() -> None:
+    assert _parse_compressed_bytes(_VM_STAT) == 45258515577 * 16384
+
+
+def test_compressed_counter_needs_its_line() -> None:
+    with pytest.raises(ValueError, match="Compressions"):
+        _parse_compressed_bytes(_VM_STAT.replace("Compressions", "Nothing"))
+
+
+def test_probe_reports_what_the_compressor_absorbed() -> None:
+    # Measured on an 8 GB machine under pressure: a 128 MiB touch was met
+    # almost entirely by the compressor while the swap file barely moved.
+    probe = CommitProbe(
+        probed_bytes=128 << 20,
+        swap_out_before=0,
+        swap_out_after=1 << 20,
+        compressed_before=0,
+        compressed_after=126 << 20,
+        available_before=1 << 30,
+        available_after=1 << 30,
+        seconds=0.03,
+    )
+
+    assert probe.compressed_bytes == 126 << 20
+    assert probe.displaced_bytes == 127 << 20
+    assert "compressed +126 MiB, swap out +1 MiB" in probe.describe()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        FileNotFoundError("no vm_stat"),
+        subprocess.CalledProcessError(1, "vm_stat"),
+        subprocess.TimeoutExpired("vm_stat", 5.0),
+    ],
+    ids=["missing", "failed", "hung"],
+)
+def test_paging_counters_fail_loud_and_name_the_opt_out(monkeypatch, failure):
+    # The probe is a default-on safety gate: an unreadable counter ends
+    # startup instead of passing an unverified plan.
+    def run(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    with pytest.raises(RuntimeError, match="VLLM_METAL_KV_COMMIT_PROBE=0") as excinfo:
+        _paging_counters()
+    assert excinfo.value.__cause__ is failure
+
+
+def test_paging_counters_fail_loud_on_unexpected_output(monkeypatch):
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, "???", "")
+    )
+
+    with pytest.raises(RuntimeError, match="VLLM_METAL_KV_COMMIT_PROBE=0"):
+        _paging_counters()

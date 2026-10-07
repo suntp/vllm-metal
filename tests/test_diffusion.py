@@ -102,6 +102,15 @@ class TestDiffusionSettings:
         with pytest.raises(ValueError, match="EntropyBound"):
             DiffusionSettings.from_vllm_config(_vllm_config(gen_config=gen))
 
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_rejects_non_positive_stability_threshold(self, value) -> None:
+        # Zero wipes the canvas history every step, so the stability check
+        # passes on an empty list and the loop reports convergence at once.
+        gen = {**_GEN_CONFIG, "stability_threshold": value}
+
+        with pytest.raises(ValueError, match="stability_threshold"):
+            DiffusionSettings.from_vllm_config(_vllm_config(gen_config=gen))
+
 
 class TestSamplerMath:
     def test_temperature_schedule_runs_from_t_max_to_t_min(self) -> None:
@@ -560,8 +569,12 @@ class TestPlatformDiffusionConfig:
         with pytest.raises(ValueError, match="canvas_length"):
             MetalPlatform._check_diffusion_config(_vllm_config(canvas_length=None))
 
+    @pytest.mark.parametrize(
+        ("params", "parameter"),
+        [({"logprobs": 2}, "logprobs"), ({"prompt_logprobs": 1}, "prompt_logprobs")],
+    )
     def test_rejects_logprobs_requests_while_serving_diffusion(
-        self, monkeypatch
+        self, monkeypatch, params, parameter
     ) -> None:
         from vllm.exceptions import VLLMValidationError
         from vllm.sampling_params import SamplingParams
@@ -569,8 +582,9 @@ class TestPlatformDiffusionConfig:
         monkeypatch.setattr(MetalPlatform, "_serves_diffusion", True)
 
         MetalPlatform.validate_request(None, SamplingParams())
-        with pytest.raises(VLLMValidationError, match="Logprobs"):
-            MetalPlatform.validate_request(None, SamplingParams(logprobs=2))
+        with pytest.raises(VLLMValidationError, match="Logprobs") as exc_info:
+            MetalPlatform.validate_request(None, SamplingParams(**params))
+        assert exc_info.value.parameter == parameter
 
     @pytest.mark.parametrize(
         ("params", "parameter"),

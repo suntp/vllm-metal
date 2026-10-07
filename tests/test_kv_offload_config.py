@@ -11,6 +11,8 @@ import os
 from types import SimpleNamespace
 
 import pytest
+import torch
+from vllm.config import AuxOutputConfig
 
 from vllm_metal.config import reset_config
 from vllm_metal.platform import MetalPlatform
@@ -65,6 +67,7 @@ def _base_config(**cache_overrides) -> SimpleNamespace:
             max_num_scheduled_tokens=None,
         ),
         lora_config=None,
+        aux_output_config=AuxOutputConfig(),
         kv_transfer_config=None,
         # Real VllmConfig always carries this; the events path reads it.
         kv_events_config=None,
@@ -196,18 +199,6 @@ def test_other_connector_with_offloading_rejected() -> None:
     vllm_config.kv_transfer_config = _nixl_config()
     vllm_config.cache_config.kv_offloading_size = 4
     with pytest.raises(NotImplementedError, match="NixlConnector"):
-        MetalPlatform.check_and_update_config(vllm_config)
-
-
-def test_explicit_connector_without_size_rejected() -> None:
-    vllm_config = _base_config()
-    vllm_config.kv_transfer_config = SimpleNamespace(
-        kv_connector="OffloadingConnector",
-        kv_connector_module_path=None,
-        kv_role="kv_both",
-        kv_connector_extra_config={},
-    )
-    with pytest.raises(NotImplementedError, match="--kv-offloading-size"):
         MetalPlatform.check_and_update_config(vllm_config)
 
 
@@ -447,3 +438,73 @@ def test_no_offloading_leaves_the_config_as_upstream(
 
     assert with_offload_hook == without_offload_hook
     assert with_offload_hook.kv_transfer_config is None
+
+
+def _metal_connector_without_size() -> SimpleNamespace:
+    return SimpleNamespace(
+        kv_connector="MetalOffloadingConnector",
+        kv_connector_module_path=None,
+        kv_role=None,
+        kv_connector_extra_config={},
+    )
+
+
+def _uniform_model(vllm_config, *, layers=36, kv_heads=8, head_size=128) -> None:
+    model_config = vllm_config.model_config
+    model_config.dtype = torch.float16
+    model_config.get_num_layers_by_block_type = (
+        lambda parallel_config, block_type="attention": layers
+    )
+    model_config.get_num_kv_heads = lambda parallel_config: kv_heads
+    model_config.get_head_size = lambda: head_size
+
+
+def test_connector_without_size_defaults_the_pool_to_two_requests() -> None:
+    vllm_config = _base_config()
+    vllm_config.kv_transfer_config = _metal_connector_without_size()
+    _uniform_model(vllm_config)
+
+    MetalPlatform.check_and_update_config(vllm_config)
+
+    ktc = vllm_config.kv_transfer_config
+    assert ktc.kv_connector == "MetalOffloadingConnector"
+    assert ktc.kv_role == "kv_both"
+    # 2 * layers * kv_heads * head_size * float16 bytes, for two 4096-token requests.
+    assert (
+        ktc.kv_connector_extra_config["cpu_bytes_to_use"]
+        == 2 * 36 * 8 * 128 * 2 * 4096 * 2
+    )
+
+
+def test_default_pool_rounds_the_request_up_to_whole_blocks() -> None:
+    vllm_config = _base_config(block_size=16)
+    vllm_config.model_config.max_model_len = 4100
+    vllm_config.kv_transfer_config = _metal_connector_without_size()
+    _uniform_model(vllm_config, layers=1, kv_heads=1, head_size=1)
+
+    MetalPlatform.check_and_update_config(vllm_config)
+
+    extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+    assert extra["cpu_bytes_to_use"] == 2 * 2 * 4112 * 2
+
+
+def test_explicit_pool_bytes_in_the_connector_config_are_kept() -> None:
+    vllm_config = _base_config()
+    vllm_config.kv_transfer_config = _metal_connector_without_size()
+    vllm_config.kv_transfer_config.kv_connector_extra_config["cpu_bytes_to_use"] = 123
+
+    MetalPlatform.check_and_update_config(vllm_config)
+
+    assert (
+        vllm_config.kv_transfer_config.kv_connector_extra_config["cpu_bytes_to_use"]
+        == 123
+    )
+
+
+@pytest.mark.parametrize(
+    ("cache_dtype", "expected"), [("auto", 2), ("bfloat16", 2), ("fp8", 1)]
+)
+def test_default_pool_follows_the_kv_cache_dtype(cache_dtype, expected) -> None:
+    from vllm_metal.v1.kv_offload.config import _kv_dtype_bytes
+
+    assert _kv_dtype_bytes(cache_dtype, torch.float16) == expected

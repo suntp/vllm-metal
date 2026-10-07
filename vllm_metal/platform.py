@@ -197,6 +197,13 @@ class MetalPlatform(Platform):
             return False
 
     @classmethod
+    def log_warnings(cls) -> None:
+        """Mirror vLLM's logging onto vllm_metal once vLLM has configured it."""
+        from vllm_metal import _configure_logging
+
+        _configure_logging()
+
+    @classmethod
     def get_device_count(cls) -> int:
         """Get number of available devices.
 
@@ -300,7 +307,9 @@ class MetalPlatform(Platform):
         ):
             raise VLLMValidationError(
                 "Logprobs are not supported for diffusion models on Metal yet.",
-                parameter="logprobs",
+                parameter="logprobs"
+                if params.logprobs is not None
+                else "prompt_logprobs",
             )
         # Upstream's diffusion sampler applies top_k/top_p to the canvas; the
         # Metal one does not, so refuse them rather than ignore them.
@@ -445,13 +454,33 @@ class MetalPlatform(Platform):
                 "(vllm-metal defaults it to 0)."
             )
 
+        # vLLM leaves AuxOutput validation to out-of-tree platforms, and
+        # MetalModelRunner produces no auxiliary outputs.
+        if vllm_config.aux_output_config.enabled:
+            raise NotImplementedError(
+                "--enable-return-routed-experts is not supported on Metal: "
+                "MetalModelRunner does not return routed experts."
+            )
+
         config = get_config()
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
 
+        add = vllm_config.additional_config
+        if isinstance(add, dict) and "dspark_draft_quantization" in add:
+            if add["dspark_draft_quantization"] != "q4":
+                raise ValueError(
+                    "dspark_draft_quantization must be 'q4', got "
+                    f"{add['dspark_draft_quantization']!r}"
+                )
+            if (
+                vllm_config.speculative_config is None
+                or vllm_config.speculative_config.method != "dspark"
+            ):
+                raise ValueError("dspark_draft_quantization requires method='dspark'")
+
         # Apply TurboQuant config from --additional-config
         # Example: --additional-config '{"turboquant": true, "k_quant": "q4_0"}'
-        add = vllm_config.additional_config
         if isinstance(add, dict) and add.get("turboquant"):
             config.turboquant = True
             config.k_quant = add.get("k_quant", "q8_0")
@@ -1064,20 +1093,20 @@ class MetalPlatform(Platform):
         return True
 
     @classmethod
-    def _find_non_ssm_backend(
+    def _find_non_ssm_backends(
         cls, vllm_config: "VllmConfig"
-    ) -> "type[AttentionBackend] | None":
-        """Return a Metal-specific backend for block_size calculation.
+    ) -> "list[type[AttentionBackend]]":
+        """Return the Metal-specific backend for block_size calculation.
 
         Since MLX models don't populate static_forward_context, the default
-        Platform._find_non_ssm_backend (which walks attention layers via
+        Platform._find_non_ssm_backends (which walks attention layers via
         get_layers_from_vllm_config) returns nothing. We override to return
         the synthetic MetalBackend, which advertises Metal's MultipleOf(16)
         kernel alignment to the framework's hybrid-block-size math.
         """
         from vllm_metal.attention.synthetic_backend import MetalBackend
 
-        return MetalBackend
+        return [MetalBackend]
 
     @classmethod
     def _default_mb_per_buffer(cls, vllm_config: "VllmConfig") -> None:
@@ -1119,7 +1148,7 @@ class MetalPlatform(Platform):
         """Update block_size for Metal platform.
 
         Delegates to vLLM's base implementation, which reads the Metal kernel
-        alignment (MultipleOf(16)) from our :meth:`_find_non_ssm_backend`
+        alignment (MultipleOf(16)) from our :meth:`_find_non_ssm_backends`
         override. Adds a one-time warning when paged attention is enabled for
         a hybrid model, explaining the cache-block-size translation mechanism
         (PR #235).
@@ -1161,8 +1190,8 @@ class MetalPlatform(Platform):
                 "  This is a logical transformation — physical memory is unchanged."
             )
 
-        # Delegate the rest to upstream. With our ``_find_non_ssm_backend``
-        # returning :class:`MetalBackend` (which advertises ``MultipleOf(16)``),
+        # Delegate the rest to upstream. With our ``_find_non_ssm_backends``
+        # returning ``[MetalBackend]`` (which advertises ``MultipleOf(16)``),
         # vLLM's Phase 1 picks a kernel-aligned default of 16 for non-hybrid
         # models (matching the kernel sweet spot), and Phase 2
         # (``_align_hybrid_block_size``) handles hybrid alignment. The kernel
@@ -1230,8 +1259,7 @@ class MetalPlatform(Platform):
             v_quant=v_quant,
         )
 
-        backend_cls = cls._find_non_ssm_backend(vllm_config)
-        assert backend_cls is not None
+        backend_cls = cls._find_non_ssm_backends(vllm_config)[0]
         backend_block_alignment_size = min(
             s.base if isinstance(s, MultipleOf) else s
             for s in backend_cls.get_supported_kernel_block_sizes()

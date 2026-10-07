@@ -206,17 +206,30 @@ def _turboquant_prefill_plan(
         return None
     if ctx.cu_seqlens is None:
         raise ValueError("TurboQuant prefill requires cumulative query lengths")
-    min_tokens = tuple(
-        min_prefill_tokens(
-            num_query_heads,
-            num_kv_heads,
-            head_dim,
-            context_len=context_len,
-            key_quant_type=key_quant_type,
-            value_bits=value_bits,
-        )
-        for context_len in ctx.context_lens
+    # The policy is part of the key, so a swapped policy is never served
+    # thresholds computed by another one.
+    threshold_key = (
+        min_prefill_tokens,
+        num_query_heads,
+        num_kv_heads,
+        head_dim,
+        key_quant_type,
+        value_bits,
     )
+    min_tokens = meta.tq_min_tokens.get(threshold_key)
+    if min_tokens is None:
+        min_tokens = tuple(
+            min_prefill_tokens(
+                num_query_heads,
+                num_kv_heads,
+                head_dim,
+                context_len=context_len,
+                key_quant_type=key_quant_type,
+                value_bits=value_bits,
+            )
+            for context_len in ctx.context_lens
+        )
+        meta.tq_min_tokens[threshold_key] = min_tokens
     key = (
         cache_block_size,
         num_query_heads,

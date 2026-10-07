@@ -26,6 +26,10 @@ from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItem
 
 from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec, PlaceholderRange
 from vllm_metal.multimodal.gemma4.sidecar import Gemma4VisionSidecar
+from vllm_metal.multimodal.text_backbone import (
+    resolve_backbone_embed_tokens,
+    resolve_text_backbone,
+)
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 
 logger = init_logger(__name__)
@@ -114,18 +118,8 @@ class Gemma4MultimodalAdapter:
                 f"{bidirectional_attention!r} is not supported (only 'vision' or None)"
             )
         language_model = getattr(text_model, "language_model", None)
-        backbone = getattr(language_model, "model", None)
-        if backbone is None:
-            raise RuntimeError(
-                "text_model.language_model.model missing; expected the mlx_lm "
-                "Gemma4TextModel (mlx-lm version drift detected)."
-            )
-        embed_tokens = getattr(backbone, "embed_tokens", None)
-        if embed_tokens is None or not callable(embed_tokens):
-            raise RuntimeError(
-                "Gemma4TextModel.embed_tokens missing or not callable; "
-                "mlx-lm version drift detected."
-            )
+        backbone = resolve_text_backbone(language_model, owner="mlx-lm")
+        embed_tokens = resolve_backbone_embed_tokens(backbone, owner="mlx-lm")
         if not hasattr(backbone, "embed_scale"):
             raise RuntimeError(
                 "Gemma4TextModel.embed_scale missing; mlx-lm version drift detected."

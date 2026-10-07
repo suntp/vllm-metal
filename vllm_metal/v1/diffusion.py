@@ -93,6 +93,12 @@ class DiffusionSettings:
             raise ValueError(
                 f"entropy_bound must be a positive float (got {entropy_bound})."
             )
+        stability_threshold = int(gen.get("stability_threshold", 1))
+        if stability_threshold <= 0:
+            raise ValueError(
+                "stability_threshold must be a positive integer "
+                f"(got {stability_threshold})."
+            )
         max_denoising_steps = int(
             diffusion_config.max_denoising_steps or gen.get("max_denoising_steps") or 48
         )
@@ -103,7 +109,7 @@ class DiffusionSettings:
             t_max=float(gen.get("t_max", 0.8)),
             entropy_bound=entropy_bound,
             confidence_threshold=float(gen.get("confidence_threshold", 0.005)),
-            stability_threshold=int(gen.get("stability_threshold", 1)),
+            stability_threshold=stability_threshold,
         )
 
 

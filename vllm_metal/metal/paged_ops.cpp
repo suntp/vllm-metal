@@ -1986,8 +1986,7 @@ static void dispatch_mla_paged_attention(
     if (candidate.kv_lora_rank == kv_lora_rank &&
         candidate.qk_rope_head_dim == qk_rope_head_dim &&
         candidate.block_size == block_size &&
-        candidate.heads_per_tg == heads_per_tg &&
-        candidate.partition_size == 0) {
+        candidate.heads_per_tg == heads_per_tg) {
       spec = &candidate;
       break;
     }
@@ -2000,6 +1999,17 @@ static void dispatch_mla_paged_attention(
         std::to_string(block_size) + " heads_per_tg=" +
         std::to_string(heads_per_tg));
   }
+
+  if (spec->partition_size != 0) {
+    throw std::runtime_error(
+        "MLA kernel: matched kv_lora_rank=" +
+        std::to_string(spec->kv_lora_rank) + " qk_rope_head_dim=" +
+        std::to_string(spec->qk_rope_head_dim) + " block_size=" +
+        std::to_string(spec->block_size) + " heads_per_tg=" +
+        std::to_string(spec->heads_per_tg) + " but partition_size=" +
+        std::to_string(spec->partition_size) + " is not dispatchable");
+  }
+
   if (num_heads % heads_per_tg != 0) {
     throw std::runtime_error(
         "MLA kernel: num_heads (" + std::to_string(num_heads) +

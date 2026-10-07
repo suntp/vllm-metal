@@ -1,10 +1,15 @@
-# vLLM Metal Plugin
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/vllm-metal-dark.svg">
+    <img src="docs/assets/vllm-metal-light.svg" alt="vLLM Metal — Run vLLM on your Apple Silicon GPU" width="900">
+  </picture>
+</p>
 
-> **High-performance LLM inference on Apple Silicon using MLX and vLLM**
+<p align="center">
+| <a href="https://docs.vllm.ai/projects/vllm-metal/en/latest/"><b>Documentation</b></a> | <a href="https://vllm.ai/blog/2026-09-22-vllm-metal-v0-28-0"><b>Blog</b></a> | <a href="https://slack.vllm.ai/"><b>Developer Slack</b></a> (#hw-metal) |
+</p>
 
 vLLM Metal is a plugin that enables vLLM to run on Apple Silicon Macs using MLX as the primary compute backend. It unifies MLX and PyTorch under a single lowering path.
-
-**Documentation**: https://docs.vllm.ai/projects/vllm-metal/en/latest/
 
 ---
 *Latest News* 🔥

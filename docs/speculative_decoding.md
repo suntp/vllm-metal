@@ -14,12 +14,12 @@ for method behavior and configuration details.
 | Additional KV cache | None; reads target KV | Second scheduler-managed cache | None |
 
 Experimental [DFlash serving](dflash.md) is also available for a qualified Qwen3
-target/draft pair, with prefix caching disabled. It supports fixed widths and
+target/draft pair, with scheduler-owned prefix reuse. It supports fixed widths and
 vLLM's batch-size-based draft schedule, including K=0 pause/resume.
 
 Experimental [DSpark serving](dspark.md) uses the same scheduler-owned cache
-lifecycle with DSpark's own embeddings and Markov prediction head. It requires
-prefix caching to be disabled and verifies greedy proposals on the target.
+lifecycle with DSpark's own embeddings and Markov prediction head. It supports
+scheduler-owned prefix reuse and verifies greedy proposals on the target.
 
 These methods currently have these Metal-specific constraints:
 

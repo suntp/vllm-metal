@@ -32,9 +32,13 @@ class DFlashProposer(BlockDraftProposer):
         embed: Callable[[mx.array], mx.array],
         project: Callable[[mx.array], mx.array],
         controller: SpeculativeDecodeController,
+        enable_prefix_caching: bool = False,
     ) -> None:
         super().__init__(
-            model, num_draft_tokens=num_draft_tokens, controller=controller
+            model,
+            num_draft_tokens=num_draft_tokens,
+            controller=controller,
+            enable_prefix_caching=enable_prefix_caching,
         )
         self.embed, self.project = embed, project
 
@@ -62,6 +66,7 @@ class DFlashProposer(BlockDraftProposer):
             embed=runner._target_input_embeddings,
             project=project,
             controller=runner._spec_decode_controller,
+            enable_prefix_caching=runner.vllm_config.cache_config.enable_prefix_caching,
         )
         proposer.max_model_len = min(
             proposer.max_model_len, spec.draft_model_config.max_model_len

@@ -28,7 +28,7 @@ from vllm_metal.attention.context import (
     get_context,
     prepare_grouped,
 )
-from vllm_metal.attention.impls import sdpa
+from vllm_metal.attention.impls import sdpa, turboquant_prefill
 from vllm_metal.attention.impls.turboquant_prefill import (
     unsupported_reason,
     workspace_upper_bound,
@@ -527,6 +527,32 @@ def test_read_existing_cache_stays_read_only(recorded_ops):
     mx.eval(read_output)
     assert mx.array_equal(output, read_output).item()
     np.testing.assert_array_equal(before, np.array(case.cache._storage.buffers[0]))
+
+
+def test_admission_thresholds_computed_once_per_forward():
+    # The thresholds depend on geometry, format and context, never on the
+    # layer, so one forward computes them once and each layer reuses them.
+    case = build_case(qlens=(128, 128), context_lens=(257, 1153))
+    meta = sdpa._kernel_metadata(case.ctx, None, [], case.ctx.block_tables, 16)
+    seen = []
+    original = turboquant_prefill.min_prefill_tokens
+
+    def counting(*args, **kwargs):
+        seen.append(kwargs["context_len"])
+        return original(*args, **kwargs)
+
+    with patch.object(turboquant_prefill, "min_prefill_tokens", counting):
+        for _layer in range(3):
+            sdpa._turboquant_prefill_plan(
+                case.ctx, meta, case.ctx.block_tables, 16, 8, 2, 128
+            )
+        case.ctx.kernel_metadata_cache.clear()
+        fresh = sdpa._kernel_metadata(case.ctx, None, [], case.ctx.block_tables, 16)
+        sdpa._turboquant_prefill_plan(
+            case.ctx, fresh, case.ctx.block_tables, 16, 8, 2, 128
+        )
+
+    assert seen == [257, 1153, 257, 1153]
 
 
 @pytest.mark.parametrize("block_size", [16, 544])

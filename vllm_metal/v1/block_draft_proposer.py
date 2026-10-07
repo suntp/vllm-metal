@@ -34,7 +34,8 @@ class BlockDraftProposer(ABC):
 
     Accepted draft tokens still need their target features projected next step:
     temporary block KV is never equivalent to committed context KV. Prefix
-    caching is deliberately unsupported until that lifecycle is qualified.
+    coverage comes from the scheduler's common hit across all cache groups;
+    every active request commits features, including target-only fallbacks.
     """
 
     name: str
@@ -47,6 +48,7 @@ class BlockDraftProposer(ABC):
         *,
         num_draft_tokens: int,
         controller: SpeculativeDecodeController,
+        enable_prefix_caching: bool = False,
     ) -> None:
         model._validate_num_draft_tokens(num_draft_tokens, extra_slots=self.extra_slots)
         if model.fc.weight.dtype not in (mx.float16, mx.bfloat16):
@@ -55,6 +57,7 @@ class BlockDraftProposer(ABC):
         self.max_model_len = model.config.max_position_embeddings
         self.num_draft_tokens = num_draft_tokens
         self.controller = controller
+        self.enable_prefix_caching = enable_prefix_caching
         self.layer_names = tuple(
             f"{self.name.lower()}_layers.{i}.self_attn"
             for i in range(model.config.num_hidden_layers)
@@ -69,10 +72,6 @@ class BlockDraftProposer(ABC):
         config = runner.vllm_config
         spec = config.speculative_config
         assert spec is not None and spec.draft_model_config is not None
-        if config.cache_config.enable_prefix_caching:
-            raise NotImplementedError(
-                f"{cls.name} on Metal requires --no-enable-prefix-caching"
-            )
         if (
             runner.is_hybrid
             or runner.is_mla
@@ -207,11 +206,18 @@ class BlockDraftProposer(ABC):
             start: int,
             count: int,
             row: int,
+            *,
+            is_prefill: bool = False,
         ) -> None:
             end = min(start + count, cache.max_model_len)
             if start >= end:
                 return
-            if start != self._valid_ends.get(req_id, 0):
+            # New/resumed prefills start at the scheduler's reconciled cache
+            # hit, which covers draft layers too. Only this first span may
+            # adopt existing coverage; later gaps must still fail. Cleanup
+            # discards request metadata, not scheduler-owned cached pages.
+            initial_end = start if is_prefill and self.enable_prefix_caching else 0
+            if start != self._valid_ends.get(req_id, initial_end):
                 raise RuntimeError(
                     f"{self.name} committed context is discontinuous for {req_id!r}"
                 )
@@ -238,6 +244,7 @@ class BlockDraftProposer(ABC):
                 prefill.start_pos,
                 len(prefill.token_ids),
                 ctx.cu_seqlens[ctx.num_decode_segments + i],
+                is_prefill=True,
             )
         if spans:
             cache.write_context(
@@ -259,10 +266,13 @@ class BlockDraftProposer(ABC):
                 # Keep constrained requests on the target's grammar sampler.
                 if state.sampling_params.structured_outputs is not None:
                     continue
-                end = self._valid_ends.get(req_id, 0)
+                # A fresh hit may already be beyond the draft's context
+                # limit and have no local coverage entry. It remains a
+                # target-only request without reading unwritten draft KV.
+                end = len(state.token_ids) - 1
                 if end + width + self.extra_slots > cache.max_model_len:
                     continue
-                if end != len(state.token_ids) - 1:
+                if end != self._valid_ends.get(req_id, 0):
                     raise RuntimeError(
                         f"{self.name} anchor does not follow committed target features"
                     )

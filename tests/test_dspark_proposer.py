@@ -5,6 +5,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 import pytest
 import torch
@@ -13,6 +14,7 @@ from vllm.config import VllmConfig
 
 from tests.test_block_draft_proposer import _features, _prefill
 from tests.test_dspark_paged import make_cache
+from tests.test_dspark_quantization import make_model
 from vllm_metal.patches.dspark_config import enable_dspark_for_metal_runner
 from vllm_metal.v1 import dspark_proposer
 from vllm_metal.v1.dspark_proposer import DSparkProposer
@@ -22,8 +24,11 @@ from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 
 @pytest.mark.parametrize("width", [1, 3, 7])
 @pytest.mark.parametrize("draft_topk", [None, 8])
-def test_dspark_uses_exactly_k_slots_at_context_and_page_limit(width, draft_topk):
-    model, cache = make_cache()
+@pytest.mark.parametrize("quantized", [False, True])
+def test_dspark_uses_exactly_k_slots_at_context_and_page_limit(
+    width, draft_topk, quantized
+):
+    model, cache = make_cache(quantized=quantized)
     proposer = DSparkProposer(
         model,
         num_draft_tokens=7,
@@ -94,10 +99,12 @@ def test_unsupported_drafting_options_fail_before_loading(option, value):
     "explicit,checkpoint,expected",
     [(None, None, None), (None, 8, 8), (16, 8, 16), (64, None, 64)],
 )
+@pytest.mark.parametrize("quantized", [False, True])
 def test_candidate_limit_resolves_explicit_option_before_checkpoint(
-    monkeypatch, explicit, checkpoint, expected
+    monkeypatch, explicit, checkpoint, expected, quantized
 ):
-    model, _ = make_cache()
+    # Build owns the conversion and must perform it before profiling/binding.
+    model = make_model(mx.float16)
     spec = SimpleNamespace(
         draft_model_config=SimpleNamespace(
             hf_config=SimpleNamespace(vocab_size=64, dspark_draft_topk=checkpoint),
@@ -113,7 +120,11 @@ def test_candidate_limit_resolves_explicit_option_before_checkpoint(
         num_speculative_tokens=7,
     )
     runner = SimpleNamespace(
-        vllm_config=SimpleNamespace(speculative_config=spec),
+        vllm_config=SimpleNamespace(
+            speculative_config=spec,
+            cache_config=SimpleNamespace(enable_prefix_caching=False),
+            additional_config={"dspark_draft_quantization": "q4"} if quantized else {},
+        ),
         model_config=SimpleNamespace(hf_config=SimpleNamespace(to_dict=dict)),
         kv_cache_dtype=mx.float16,
         _spec_decode_controller=SpeculativeDecodeController(),
@@ -123,6 +134,7 @@ def test_candidate_limit_resolves_explicit_option_before_checkpoint(
     proposer = DSparkProposer.build(runner)
     assert proposer.draft_topk == expected
     assert proposer.max_model_len == 32
+    assert isinstance(proposer.draft_model.lm_head, nn.QuantizedLinear) == quantized
 
 
 @pytest.mark.parametrize("source", ["explicit", "checkpoint"])
@@ -195,8 +207,11 @@ def test_draft_precision_options_checked_before_loading(
 
 @pytest.mark.parametrize("confidence", [False, True])
 @pytest.mark.parametrize("draft_topk", [None, 8])
-def test_profile_materializes_dspark_owned_heads(monkeypatch, confidence, draft_topk):
-    model, _ = make_cache(confidence=confidence)
+@pytest.mark.parametrize("quantized", [False, True])
+def test_profile_materializes_dspark_owned_heads(
+    monkeypatch, confidence, draft_topk, quantized
+):
+    model, _ = make_cache(confidence=confidence, quantized=quantized)
     proposer = DSparkProposer(
         model,
         num_draft_tokens=7,
@@ -206,10 +221,14 @@ def test_profile_materializes_dspark_owned_heads(monkeypatch, confidence, draft_
     draft = model.draft
     observed = []
 
-    def record(anchors, features, *, num_draft_tokens, draft_topk):
+    def record(anchors, features, *, num_draft_tokens, draft_topk, corrected_logits):
         observed.append((anchors.shape, num_draft_tokens, draft_topk))
         return draft(
-            anchors, features, num_draft_tokens=num_draft_tokens, draft_topk=draft_topk
+            anchors,
+            features,
+            num_draft_tokens=num_draft_tokens,
+            draft_topk=draft_topk,
+            corrected_logits=corrected_logits,
         )
 
     monkeypatch.setattr(model, "draft", record)
@@ -237,14 +256,16 @@ def test_config_bridge_preserves_other_runner_rejections(monkeypatch, method, wo
         parallel_config=SimpleNamespace(
             worker_cls=worker,
             prefill_context_parallel_size=2,
+            pipeline_parallel_size=2,
             enable_batch_sharded_sampling=True,
         ),
+        scheduler_config=SimpleNamespace(async_scheduling=True),
         speculative_config=None
         if method is None
         else SimpleNamespace(method=method, enable_adaptive_verification=True),
         model_config=SimpleNamespace(is_diffusion=True),
         _dflash_needs_multi_kv_group=lambda: True,
-        _is_dflash2_draft=lambda: True,
+        _is_dflash_candidate_draft=lambda: True,
     )
     before = original(config)
     after = first(config)

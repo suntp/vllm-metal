@@ -10,7 +10,13 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
-from vllm.config import CacheConfig, ParallelConfig, SchedulerConfig, VllmConfig
+from vllm.config import (
+    AuxOutputConfig,
+    CacheConfig,
+    ParallelConfig,
+    SchedulerConfig,
+    VllmConfig,
+)
 from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import SamplingParams
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -98,6 +104,7 @@ class TestMetalPlatform:
         config.scheduler_config = scheduler
         config.speculative_config = speculative_config  # type: ignore[assignment]
         config.lora_config = lora_config  # type: ignore[assignment]
+        config.aux_output_config = AuxOutputConfig()
         config.additional_config = {}
         return config
 
@@ -159,6 +166,24 @@ class TestMetalPlatform:
         """Test device name retrieval."""
         name = MetalPlatform.get_device_name()
         assert "Apple Silicon" in name
+
+    @pytest.mark.parametrize("value", [None, True, 4, "q8", {"bits": 4}])
+    def test_dspark_quantization_rejects_invalid_mode(self, value):
+        config = self._platform_config(
+            speculative_config=SimpleNamespace(method="dspark")
+        )
+        config.additional_config = {"dspark_draft_quantization": value}
+        with pytest.raises(ValueError, match="dspark_draft_quantization must be 'q4'"):
+            MetalPlatform.check_and_update_config(config)
+
+    @pytest.mark.parametrize("method", [None, "dflash", "draft_model", "ngram"])
+    def test_dspark_quantization_rejects_other_serving_methods(self, method):
+        config = self._platform_config(
+            speculative_config=SimpleNamespace(method=method) if method else None
+        )
+        config.additional_config = {"dspark_draft_quantization": "q4"}
+        with pytest.raises(ValueError, match="requires method='dspark'"):
+            MetalPlatform.check_and_update_config(config)
 
     def test_set_device_valid(self) -> None:
         """Test setting valid device."""
@@ -488,6 +513,22 @@ class TestMetalPlatform:
             ),
         ):
             MetalPlatform.check_and_update_config(self._platform_config())
+
+    def test_check_and_update_config_rejects_routed_experts(self) -> None:
+        """vLLM leaves AuxOutput validation to out-of-tree platforms."""
+        vllm_config = self._platform_config()
+        vllm_config.aux_output_config = AuxOutputConfig(
+            enable_return_routed_experts=True
+        )
+
+        with pytest.raises(
+            NotImplementedError,
+            match=re.escape(
+                "--enable-return-routed-experts is not supported on Metal: "
+                "MetalModelRunner does not return routed experts."
+            ),
+        ):
+            MetalPlatform.check_and_update_config(vllm_config)
 
     def test_check_and_update_config_rejects_tensor_parallel(self) -> None:
         """Tensor parallelism is unsupported on Metal yet; reject it at config time."""

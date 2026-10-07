@@ -133,6 +133,8 @@ def test_offload_pool_is_held_back_from_the_paging_cap(monkeypatch) -> None:
             swap_out_after=nbytes,  # paged the whole sample: no headroom
             available_before=free,
             available_after=free,
+            compressed_before=0,
+            compressed_after=0,
             seconds=0.0,
         ),
     )

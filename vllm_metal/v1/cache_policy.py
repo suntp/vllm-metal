@@ -244,10 +244,11 @@ KV_COMMIT_SAMPLE_BYTES = 512 << 20
 # small margin.
 KV_COMMIT_RESERVE_FLOOR_BYTES = 1 << 30
 
-# Swap the kernel may write before the probe calls it pressure. A touch can
-# stir a few MB of background paging out of other processes; a real shortfall
-# moves a noticeable part of the sample. The floor keeps a small probe (where
-# the fraction rounds to nothing) from treating that noise as pressure.
+# Memory the kernel may compress or swap out before the probe calls it
+# pressure. A touch can stir a few MB of background paging out of other
+# processes; a real shortfall moves a noticeable part of the sample. The floor
+# keeps a small probe (where the fraction rounds to nothing) from treating that
+# noise as pressure.
 KV_COMMIT_SWAP_TOLERANCE_DIVISOR = 8
 KV_COMMIT_SWAP_TOLERANCE_FLOOR_BYTES = 1 << 20
 
@@ -271,10 +272,10 @@ def kv_pool_bytes_after_probe(
     """Pool bytes to allocate after a commit probe.
 
     The probe answers two different questions and only one of them is a reason
-    to give capacity back. If the kernel had to page memory out to fault the
-    sample in, the machine has no headroom *now*: a pool it cannot back is
-    served from swap, so size it to what is free, less ``reserve_bytes`` and
-    less ``future_reserved_bytes``.
+    to give capacity back. If the kernel had to move memory out of the way, into
+    the compressor or out to swap, to fault the sample in, the machine has no
+    headroom *now*: a pool it cannot back is served from swap, so size it to
+    what is free, less ``reserve_bytes`` and less ``future_reserved_bytes``.
 
     ``future_reserved_bytes`` is memory the engine will allocate later out of
     the same free pool -- the TurboQuant prefill workspace, the KV offload host
@@ -289,7 +290,7 @@ def kv_pool_bytes_after_probe(
     back capacity an idle pool never needed is the regression the lazy
     allocation exists to avoid.
     """
-    if probe.swap_out_bytes <= swap_tolerance_bytes:
+    if probe.displaced_bytes <= swap_tolerance_bytes:
         return plan_bytes
     cap = probe.available_before - reserve_bytes - future_reserved_bytes
     return min(plan_bytes, max(0, cap))

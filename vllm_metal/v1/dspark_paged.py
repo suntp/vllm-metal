@@ -32,12 +32,19 @@ class DSparkPagedCache(BlockDraftPagedCache):
         self.draft_model = model
 
     def compile_draft(
-        self, *, num_draft_tokens: int, draft_topk: int | None = None
+        self,
+        *,
+        num_draft_tokens: int,
+        draft_topk: int | None = None,
+        corrected_logits: bool = True,
     ) -> Callable[
         [mx.array, Sequence[tuple[Sequence[int], int]]],
-        tuple[mx.array, mx.array, mx.array | None],
+        tuple[mx.array, mx.array | None, mx.array | None],
     ]:
         """Return IDs, corrected logits and raw confidence using exactly K slots.
+
+        ``corrected_logits=False`` returns ``None`` for the logits instead of
+        the dense tensor — for proposers that only keep the IDs.
 
         Validate external anchor values with ``draft_model.validate_anchors``
         before the repeated forward. Metadata validation remains in the graph.
@@ -48,6 +55,9 @@ class DSparkPagedCache(BlockDraftPagedCache):
             width=num_draft_tokens,
             embed=lambda anchors: model.block_embeddings(anchors, num_draft_tokens),
             finish=lambda hidden, anchors: model.greedy_proposal(
-                model.backbone.norm(hidden), anchors, draft_topk=draft_topk
+                model.backbone.norm(hidden),
+                anchors,
+                draft_topk=draft_topk,
+                corrected_logits=corrected_logits,
             ),
         )

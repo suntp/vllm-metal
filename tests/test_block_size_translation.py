@@ -283,6 +283,30 @@ class TestMLAKernelBlockSizes:
         }
         assert picked <= admitted
 
+    def test_nonzero_partition_size_is_named_after_geometry_match(self):
+        """Geometry selects the row. A nonzero partition_size is named, not skipped.
+
+        Requiring candidate.partition_size == 0 drops a real row and then the
+        miss error lists only the four geometry fields. The lookup must key on
+        geometry alone. A matched row with a nonzero partition_size throws, and
+        that message carries the row's partition_size.
+        """
+        cpp = self._PAGED_OPS.read_text()
+        body = self._fn_body(cpp, "static void dispatch_mla_paged_attention")
+
+        lookup = body[
+            body.index("for (const auto& candidate : kMlaKernelSpecs)") : body.index(
+                "if (spec == nullptr)"
+            )
+        ]
+        assert "partition_size==0" not in re.sub(r"\s+", "", lookup)
+
+        # ensure that the reject correctly flags partition_size
+        reject_at = body.index("spec->partition_size")
+        reject = body[reject_at : body.index("if (num_heads % heads_per_tg", reject_at)]
+        assert re.search(r"spec->partition_size\s*!=\s*0", reject)
+        assert "to_string(spec->partition_size)" in reject
+
 
 class TestNaxKernelInstantiations:
     """The NAX prefill gate and its kernel instantiations cannot drift.

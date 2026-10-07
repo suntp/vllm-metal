@@ -16,7 +16,7 @@ embedding and output projection; comparisons use that same target precision.
 
 ```bash
 vllm serve mlx-community/Qwen3-4B-4bit \
-    --no-enable-prefix-caching --no-async-scheduling \
+    --enable-prefix-caching --no-async-scheduling \
     --max-model-len 4096 --max-num-seqs 4 \
     --speculative-config '{"method":"dflash","model":"z-lab/Qwen3-4B-DFlash-b16","num_speculative_tokens":3}'
 ```
@@ -25,7 +25,7 @@ Use `temperature=0` without penalties, token constraints, or sample logprobs to
 exercise drafting. Other requests use ordinary target sampling. The current
 serving path requires a single-device Qwen3 text target, matching FP16 or BF16
 target/draft activation precision, and a native cache block size (8, 16, or 32).
-LoRA, TurboQuant, and prefix caching fail explicitly.
+LoRA and TurboQuant fail explicitly.
 For this checkpoint, the configured maximum draft width may be 1–15. Near the context limit,
 requests continue with target-only decoding when a complete block cannot fit.
 
@@ -37,7 +37,7 @@ drafting for larger batches:
 
 ```bash
 vllm serve mlx-community/Qwen3-4B-4bit \
-    --no-enable-prefix-caching --no-async-scheduling \
+    --enable-prefix-caching --no-async-scheduling \
     --max-model-len 4096 --max-num-seqs 4 \
     --speculative-config '{
       "method": "dflash",
@@ -78,6 +78,21 @@ only committed target-feature rows enter draft context. These overwrite temporar
 KV even for accepted draft tokens. Preemption and cancellation clear logical
 coverage before pages or request IDs are reused.
 
+Prefix caching is supported for synchronous serving. A fresh or resumed prefill
+starts at the scheduler's common cache hit across target and draft layers, then
+projects only the remaining target features. A missing block in either group
+shortens the common hit and causes suffix recomputation. Cached full blocks stay
+read-only; temporary draft slots and partial tails are not reusable prefixes.
+The upstream speculative-decoding policy conservatively drops the last matched
+block, so a hit can be shorter than the shared prompt.
+
+All active requests populate committed draft KV, including sampled, constrained,
+and zero-width fallback requests. Their prefixes can therefore serve later
+greedy requests. All context writes in a batch finish before drafting from shared
+pages. Reused request IDs adopt their new scheduler boundary after cleanup;
+eviction and cache reset remain owned by the scheduler. A prefix beyond the
+effective draft context limit continues with target-only decoding.
+
 The full-prefix callable below is for qualification. Serving uses
 `DFlashPagedCache.compile_draft`, passing cache views and fixed-width block
 tables as graph inputs, so it does not gather or reproject the full prefix.
@@ -89,22 +104,48 @@ Run the real-checkpoint lifecycle test with:
 ```bash
 pytest -m slow tests/test_block_draft_serving_e2e.py
 pytest -m slow tests/test_block_draft_schedule_e2e.py
+pytest -m slow tests/test_block_draft_prefix_caching_e2e.py -k dflash
 python -m tools.dflash_serving_parity --output-dir /path/to/new-parity-results
 python -m tools.dflash_serving_parity --batch-size 1 2 4 \
     --draft-schedule '[[1,1,3],[2,2,1],[3,4,0]]' \
     --output-dir /path/to/new-scheduled-parity-results
 ```
 
-It checks target-only parity, page boundaries, chunked prefill, acceptance and
-rejection, constrained-cache preemption, cancellation, and context-limit fallback.
-It also covers EOS, stop tokens, short output budgets, and mixed batches with
-sampling/logprob fallback, including cache-page release after completion.
+The prefix-caching test pins the reference target and draft revisions, compares
+cache-enabled outputs with cache-disabled outputs, and requires actual cache
+hits, reduced prefill work, and verified drafts after hits. It also exercises
+shared prompts, fallback producers, cancellation, and cache-pressure resume in
+both verification layouts. A separate preemption case retains cached pages and
+requires a nonzero hit on resume. One deliberately incorrect draft candidate
+forces rejection while preserving the original greedy output; this avoids
+depending on the checkpoint making a natural mistake on repetitive prompts.
+First-window assertions check the sampled anchor and absolute position and
+compare first-proposal IDs with cache-disabled serving. They cover cold, cached,
+and resumed prefills, where output parity alone could hide a draft-alignment
+regression behind target corrections. These trained drafters are not expected
+to have the near-perfect acceptance of an identical target/draft-model control.
+It saves token IDs, prefill counts, and elapsed times
+in pytest's temporary directory. These short cases do not establish general
+bitwise losslessness or a speedup; the broader numerical limitations below remain.
+
+The lifecycle tests check target-only parity, page boundaries, chunked prefill,
+acceptance and rejection, constrained-cache preemption, cancellation, and
+context-limit fallback. They also cover EOS, stop tokens, short output budgets,
+and mixed batches with sampling/logprob fallback, including cache-page release
+after completion.
 The scheduled-width test covers shrinking/growing blocks, consecutive K=0 steps,
 cancellation, and preemption/recomputation. The parity tool records selected
 widths and verified drafts; a configured K=0 batch need not verify any drafts.
 Floating-point reduction differences between single-token and multi-token target
 forwards can change greedy choices near ties. Report exact matches separately
 from mutual top-k agreement; the latter checks only the first differing token.
+
+Add `--audit-continuations` to the parity command for the shared
+[full-continuation audit](dspark.md#full-continuation-audit). It checks every
+emitted token against both the serving verifier and a native replay of its
+actual prefix. Any greedy mismatch fails, including mismatches after an initial
+near tie; candidate ranks and score gaps remain diagnostics.
+
 Measure throughput for your target, draft width, and workload before enabling
 this experimental mode in a deployment.
 
@@ -214,6 +255,6 @@ math and check that a causal block mask produces a different result.
 
 This is DFlash serving, not full DSpark support. A smaller qualified checkpoint,
 DSpark serving integration (following [model/head qualification](dspark.md)),
-confidence/cost-based planning, sampled verification, prefix
-reuse, and asynchronous execution remain separate roadmap items. Keep each
+confidence/cost-based planning, sampled verification, and
+asynchronous execution remain separate roadmap items. Keep each
 change independently reviewable and qualify its lifecycle and serving behavior.

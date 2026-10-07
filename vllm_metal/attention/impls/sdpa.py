@@ -150,6 +150,9 @@ class _KernelMetadata:
     tq_prefill_plans: dict[tuple[int, ...], _TurboQuantPrefillPlan | None] = field(
         default_factory=dict
     )
+    tq_min_tokens: dict[tuple[object, ...], tuple[int, ...]] = field(
+        default_factory=dict
+    )
     tq_prefill_workspace_bytes: int = 0
 
 

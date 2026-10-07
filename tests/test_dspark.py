@@ -194,6 +194,33 @@ def test_candidate_limit_excludes_outside_winner_and_preserves_token_id_ties(dty
     assert model.greedy_proposal(hidden, anchor, draft_topk=2)[0][0, 0].item() == 2
 
 
+def test_topk_draft_skips_dense_corrected_logits_when_disabled(monkeypatch):
+    model = DSparkModel(config())
+    model.set_dtype(mx.float32)
+    hidden = mx.random.normal((1, 7, 32))
+    anchors = mx.array([3])
+    calls = 0
+    real_full_like = mx.full_like
+
+    def counting_full_like(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_full_like(*args, **kwargs)
+
+    monkeypatch.setattr(mx, "full_like", counting_full_like)
+
+    tokens, logits, _ = model.greedy_proposal(
+        hidden, anchors, draft_topk=2, corrected_logits=False
+    )
+    assert logits is None
+    assert calls == 0
+
+    dense_tokens, dense_logits, _ = model.greedy_proposal(hidden, anchors, draft_topk=2)
+    assert dense_logits is not None
+    assert calls == 7
+    assert mx.array_equal(tokens, dense_tokens).item()
+
+
 @pytest.mark.parametrize("draft_topk", [0, -1, 65, True, 1.5])
 def test_invalid_candidate_limit_is_rejected(draft_topk):
     with pytest.raises(ValueError, match="draft_topk"):

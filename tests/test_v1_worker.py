@@ -740,6 +740,7 @@ class TestCommitProbeBudget:
         swap_out_bytes: int = 0,
         per_block_bytes: int = 1_000_000,
         turboquant_workspace: int = 0,
+        compressed_bytes: int = 0,
     ):
         worker = _make_worker(
             SimpleNamespace(
@@ -773,6 +774,8 @@ class TestCommitProbeBudget:
                 available_before=free_bytes,
                 available_after=free_bytes,
                 seconds=0.01,
+                compressed_before=1_000,
+                compressed_after=1_000 + compressed_bytes,
             )
 
         monkeypatch.setattr("vllm_metal.v1.cache_policy.probe_commit", fake_probe)
@@ -924,7 +927,12 @@ class TestKvPoolBytesAfterProbe:
     _TOLERANCE = kv_swap_tolerance_bytes(512 << 20)
 
     @staticmethod
-    def _probe(available_before: int, probed_bytes: int, swap_out_bytes: int):
+    def _probe(
+        available_before: int,
+        probed_bytes: int,
+        swap_out_bytes: int,
+        compressed_bytes: int = 0,
+    ):
         return CommitProbe(
             probed_bytes=probed_bytes,
             swap_out_before=0,
@@ -932,6 +940,8 @@ class TestKvPoolBytesAfterProbe:
             available_before=available_before,
             available_after=available_before,
             seconds=0.0,
+            compressed_before=0,
+            compressed_after=compressed_bytes,
         )
 
     def _fit(
@@ -960,6 +970,23 @@ class TestKvPoolBytesAfterProbe:
 
     def test_paging_inside_the_tolerance_is_noise(self) -> None:
         probe = self._probe(2 << 30, 512 << 20, self._TOLERANCE)
+
+        assert self._fit(6 << 30, probe) == 6 << 30
+
+    def test_compression_beyond_the_tolerance_caps_at_free_memory(self) -> None:
+        # The compressor absorbs the sample and the swap file never moves.
+        probe = self._probe(3 << 30, 512 << 20, 0, compressed_bytes=self._TOLERANCE + 1)
+
+        assert self._fit(6 << 30, probe) == (3 << 30) - (1 << 30)
+
+    def test_compression_and_swap_add_up_to_one_signal(self) -> None:
+        half = self._TOLERANCE // 2
+        probe = self._probe(3 << 30, 512 << 20, half + 1, compressed_bytes=half)
+
+        assert self._fit(6 << 30, probe) == (3 << 30) - (1 << 30)
+
+    def test_compression_inside_the_tolerance_is_noise(self) -> None:
+        probe = self._probe(2 << 30, 512 << 20, 0, compressed_bytes=self._TOLERANCE)
 
         assert self._fit(6 << 30, probe) == 6 << 30
 

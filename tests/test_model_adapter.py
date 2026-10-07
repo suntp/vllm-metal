@@ -713,6 +713,22 @@ class TestIntermediateForward:
             adapter.intermediate_forward(SimpleNamespace(), mx.array([[5]]))
 
 
+class _Qwen35BackboneStub:
+    """Headless ``language_model.model`` callable — the adapter binds it at load."""
+
+    def __init__(self) -> None:
+        self.embed_tokens = lambda input_ids: input_ids
+
+    def __call__(
+        self,
+        inputs: object,
+        inputs_embeds: object | None = None,
+        cache: object | None = None,
+        position_ids: object | None = None,
+    ) -> None:
+        return None
+
+
 class _Qwen35LanguageModelStub:
     """Mirrors mlx_vlm 0.4.x ``LanguageModel.__call__`` so signature sniffing works.
 
@@ -722,7 +738,7 @@ class _Qwen35LanguageModelStub:
     """
 
     def __init__(self) -> None:
-        self.model = SimpleNamespace(embed_tokens=lambda input_ids: input_ids)
+        self.model = _Qwen35BackboneStub()
 
     def __call__(
         self,
@@ -737,7 +753,7 @@ class _Qwen35LanguageModelStub:
 
 class _PaddleOCRLanguageModelStub:
     def __init__(self) -> None:
-        self.model = SimpleNamespace(embed_tokens=lambda input_ids: input_ids)
+        self.model = _Qwen35BackboneStub()
 
     def __call__(
         self,

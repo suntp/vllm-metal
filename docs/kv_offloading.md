@@ -22,7 +22,7 @@ vllm serve Qwen/Qwen3-8B \
 
 | Flag | Description |
 |---|---|
-| `--kv-offloading-size N` | Host pool size in GiB. Enables offloading. |
+| `--kv-offloading-size N` | Host pool size in GiB. Enables offloading. Optional when `--kv-transfer-config` names the connector: the pool then defaults to two `--max-model-len` requests of KV, and the startup log reports the size. |
 | `--kv-offloading-backend` | `native` (default). `lmcache` is refused. |
 | `--kv-transfer-config` | Secondary tiers, as JSON. Only `fs` is supported. |
 
@@ -33,6 +33,12 @@ Keys for an `fs` tier:
 | `type` | required | `fs` |
 | `root_dir` | required | Where block files are stored. |
 | `max_size_gib` | 10% of the volume | Disk cap in GiB. `0` means no cap. If unset and the disk has less free space than 10% of the volume, startup fails. |
+
+Without `--kv-offloading-size`, the pool defaults to the KV of two
+`--max-model-len` requests, rounded up to whole blocks. A full pool does not lose
+a block, the scheduler retries the store on the next step; two requests is the
+smallest pool with no retries at concurrency 4 in the #1037 measurements. Pass
+the flag to size it yourself.
 
 The host pool comes out of `--gpu-memory-utilization` (see
 [Configuration](configuration.md#kv-cache-memory-settings)), which is the total

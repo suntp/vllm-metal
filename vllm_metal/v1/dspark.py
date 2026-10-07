@@ -174,6 +174,37 @@ class DSparkModel(nn.Module):
             raise ValueError("DSpark features must use the checkpoint precision")
         return self.backbone(self.block_embeddings(anchors, num_draft_tokens), features)
 
+    def quantize_draft_linears(self) -> None:
+        """Convert backbone linears and the vocabulary projection to affine Q4.
+
+        Apply once after loading, before profiling or compiling. Embeddings,
+        feature fusion, norms and the Markov/confidence heads keep checkpoint
+        precision; activations and scheduler-owned KV keep that precision too.
+        """
+
+        def selected(path, module):
+            return path == "lm_head" or (
+                path.startswith("backbone.layers.") and isinstance(module, nn.Linear)
+            )
+
+        # Check all selected dimensions before replacing any module. Q4 is a
+        # runtime transform of a validated floating checkpoint, not a loader
+        # for pre-quantized checkpoints or a second quantization pass.
+        for path, module in self.named_modules():
+            if selected(path, module) and (
+                not isinstance(module, nn.Linear)
+                or module.weight.dtype not in (mx.float16, mx.bfloat16)
+                or module.weight.shape[-1] % 64
+            ):
+                raise ValueError(
+                    "DSpark Q4 requires unquantized FP16/BF16 linears with "
+                    f"input dimensions divisible by 64: {path}"
+                )
+        nn.quantize(
+            self, group_size=64, bits=4, mode="affine", class_predicate=selected
+        )
+        mx.eval(self.parameters())
+
     def block_embeddings(self, anchors: mx.array, num_draft_tokens: int) -> mx.array:
         """Embed the anchor and K-1 masks for dense or paged block attention."""
         cfg = self.config.backbone
@@ -202,7 +233,8 @@ class DSparkModel(nn.Module):
         anchors: mx.array,
         *,
         draft_topk: int | None = None,
-    ) -> tuple[mx.array, mx.array, mx.array | None]:
+        corrected_logits: bool = True,
+    ) -> tuple[mx.array, mx.array | None, mx.array | None]:
         """Return token IDs, corrected logits, and optional raw confidence logits.
 
         Each correction and confidence prediction uses the preceding token:
@@ -212,12 +244,17 @@ class DSparkModel(nn.Module):
         With draft_topk, only the top base-logit candidates receive Markov
         corrections; all other corrected logits are -inf. This approximates
         the proposal, never the target's verification distribution.
+
+        ``corrected_logits=False`` skips building the dense per-position
+        logits tensor (a full-vocabulary -inf fill per draft position) and
+        returns ``None`` in its place — for callers that only need the IDs.
         """
         self.backbone.validate_anchor_metadata(anchors)
         self.backbone.validate_embeddings(hidden, 0)
         if hidden.shape[0] != anchors.shape[0]:
             raise ValueError("DSpark requires one anchor per block")
-        if hidden.dtype != self.lm_head.weight.dtype:
+        # The vocabulary projection may have packed integer weights.
+        if hidden.dtype != self.embed_tokens.weight.dtype:
             raise ValueError("DSpark block states must use the checkpoint precision")
         self.validate_draft_topk(draft_topk, self.config.backbone.vocab_size)
         logits = self.lm_head(hidden)
@@ -247,14 +284,19 @@ class DSparkModel(nn.Module):
                 previous = mx.take_along_axis(indices[:, i], choice, axis=-1).squeeze(
                     -1
                 )
-                step_logits = mx.put_along_axis(
-                    mx.full_like(logits[:, i], -float("inf")),
-                    indices[:, i],
-                    candidate_logits,
-                    axis=-1,
+                step_logits = (
+                    mx.put_along_axis(
+                        mx.full_like(logits[:, i], -float("inf")),
+                        indices[:, i],
+                        candidate_logits,
+                        axis=-1,
+                    )
+                    if corrected_logits
+                    else None
                 )
             tokens.append(previous)
-            corrected.append(step_logits)
+            if corrected_logits:
+                corrected.append(step_logits)
         confidence = None
         if self.confidence_head is not None:
             inputs = hidden
@@ -267,7 +309,11 @@ class DSparkModel(nn.Module):
                     axis=-1,
                 )
             confidence = self.confidence_head(inputs)
-        return mx.stack(tokens, axis=1), mx.stack(corrected, axis=1), confidence
+        return (
+            mx.stack(tokens, axis=1),
+            mx.stack(corrected, axis=1) if corrected_logits else None,
+            confidence,
+        )
 
     def draft(
         self,
@@ -276,9 +322,15 @@ class DSparkModel(nn.Module):
         *,
         num_draft_tokens: int,
         draft_topk: int | None = None,
-    ) -> tuple[mx.array, mx.array, mx.array | None]:
+        corrected_logits: bool = True,
+    ) -> tuple[mx.array, mx.array | None, mx.array | None]:
         hidden = self.block_hidden(anchors, features, num_draft_tokens=num_draft_tokens)
-        return self.greedy_proposal(hidden, anchors, draft_topk=draft_topk)
+        return self.greedy_proposal(
+            hidden,
+            anchors,
+            draft_topk=draft_topk,
+            corrected_logits=corrected_logits,
+        )
 
     @staticmethod
     def validate_draft_topk(draft_topk: int | None, vocab_size: int) -> None:

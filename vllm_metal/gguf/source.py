@@ -31,6 +31,14 @@ _SUPPORTED_REMOTE_TAGS = frozenset(
         "Q4_1",
         "Q5_0",
         "Q5_1",
+        "Q2_K",
+        "Q2_K_S",
+        "Q2_K_M",
+        "Q2_K_L",
+        "Q3_K",
+        "Q3_K_S",
+        "Q3_K_M",
+        "Q3_K_L",
         "Q4_K_S",
         "Q4_K_M",
         "Q4_K_L",
@@ -99,6 +107,15 @@ class RemoteGGUFReference:
                 f"Remote GGUF tag {self.quant_type!r} is not supported by "
                 f"vllm-metal; supported tags: {supported}."
             )
+        # vLLM pins the engine revision to the config repo's commit; resolving
+        # it here re-resolves the requested revision for this weights repo.
+        revision = HfApi().resolve_revision(
+            self.repo_id,
+            revision=revision,
+            cache_dir=cache_dir,
+            local_files_only=hf_constants.HF_HUB_OFFLINE,
+            token=token,
+        )
         snapshot_dir = None
         if hf_constants.HF_HUB_OFFLINE:
             snapshot_dir = Path(
