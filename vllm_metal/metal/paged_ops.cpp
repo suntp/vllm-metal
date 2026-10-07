@@ -986,7 +986,9 @@ static void dispatch_paged_attention_v2_online(
       : gqa_test_partition > 0 ? gqa_test_partition
       : gqa_decode_plan_for_lengths(
             num_heads, num_kv_heads, head_size,
-            num_seqs == 1 ? gqa_decode_length_plan(std::array<int, 1>{max_seq_len}) : gqa_length_plan,
+            num_seqs == 1
+                ? gqa_decode_length_plan(std::array<int, 1>{max_seq_len})
+                : gqa_length_plan,
             detected_gpu_core_count(), block_size, d.get_architecture(), max_seq_len);
   const int64_t gqa_partitions = gqa_partition_size > 0
       ? (static_cast<int64_t>(max_seq_len) + gqa_partition_size - 1) /
@@ -2300,7 +2302,7 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
         nb::arg("max_seq_len"), nb::arg("gpu_cores"), nb::arg("block_size") = 16,
         "Default GQA partition for a supported decode geometry, or zero. "
-        "Geometry and occupancy planning only; dtype, feature and resource "
+        "Geometry, work and scratch-budget planning; dtype, feature and reducer "
         "eligibility are enforced separately by gqa_decode dispatch.");
   m.def("gqa_decode_batch_partition_size", &gqa_decode_batch_plan_for_shape,
         nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
@@ -2309,7 +2311,8 @@ NB_MODULE(_paged_ops, m) {
         "GQA partition from per-request KV lengths, or zero. Empty gpu_arch "
         "uses the executing GPU; an explicit architecture is a read-only planning "
         "input and does not override dispatch. max_seq_len optionally supplies "
-        "the allocation upper bound. Dispatch separately checks features and resources.");
+        "the allocation upper bound for the scratch budget. Dispatch separately "
+        "checks features and compiled reducer resources.");
   m.def("last_gqa_partition_size", []() {
     return g_last_gqa_partition.load(std::memory_order_relaxed);
   }, "Partition selected by the most recent recorded paged eval, or zero "
@@ -2323,7 +2326,7 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
         nb::arg("max_seq_len"), nb::arg("gpu_cores"), nb::arg("block_size") = 16,
         "Measured default scope with a conservative grid guard; geometry "
-        "and occupancy planning only. Functional dispatch checks dtype, "
+        "work and scratch-budget planning. Functional dispatch checks dtype, "
         "feature and resource eligibility separately.");
   m.def("min_decode_grid", &min_decode_grid,
         "Decode-grid threshold (threadgroups) below which split-KV decode "
