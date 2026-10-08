@@ -976,18 +976,33 @@ def sdpa_forward(
                 num_decode_tokens=ctx.num_decode_tokens,
                 max_decode_context_len=ctx.max_decode_context_len,
             )
+        num_decode = ctx.num_decode_requests
+        ordinary_decode_rows = (
+            not ctx.gqa_disabled
+            and num_decode == ctx.num_decode_tokens
+            and ctx.verify_window_q == 1
+        )
         if (
             capabilities["gqa_length_plan"]
-            and not ctx.gqa_disabled
-            and ctx.num_decode_requests > 1
-            and ctx.num_decode_requests
-            == ctx.num_decode_tokens
-            == q_3d.shape[0]
-            == len(ctx.context_lens)
-            and ctx.verify_window_q == 1
+            and ordinary_decode_rows
+            and num_decode > 1
+            and num_decode == q_3d.shape[0] == len(ctx.context_lens)
         ):
             if ctx.gqa_length_plan is None:
                 ctx.gqa_length_plan = ops.gqa_decode_length_plan(ctx.context_lens)
+            paged_kwargs["gqa_length_plan"] = ctx.gqa_length_plan
+        elif (
+            capabilities["gqa_mixed_decode_plan"]
+            and ordinary_decode_rows
+            and 0 < num_decode < len(ctx.context_lens)
+            and q_3d.shape[0] > num_decode
+        ):
+            # Mixed batch: describe only the leading decode rows. Native code
+            # uses it when it splits those rows from the prefill kernel.
+            if ctx.gqa_length_plan is None:
+                ctx.gqa_length_plan = ops.gqa_decode_length_plan(
+                    ctx.context_lens[:num_decode]
+                )
             paged_kwargs["gqa_length_plan"] = ctx.gqa_length_plan
         ops.paged_attention_primitive(
             q_3d,
