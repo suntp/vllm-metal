@@ -827,9 +827,13 @@ static void dispatch_paged_attention_v2_online(
   // Tiled kernel for prefill batches, matching vLLM Triton's 2D/3D dispatch
   // split.  Pure-decode batches (every sequence has exactly 1 query token)
   // use the original per-token kernel.
+  // A mixed batch's decode prefix (decode_only_rows > 0) is a pure decode
+  // batch of its leading num_decode_requests sequences: cu_seqlens_q[0..D]
+  // is 0..D, so every per-sequence view below stops at D.
   int total_q_tokens = decode_only_rows > 0
       ? decode_only_rows : static_cast<int>(query.shape(0));
-  int num_seqs = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
+  int num_seqs = decode_only_rows > 0
+      ? num_decode_requests : static_cast<int>(cu_seqlens_q.shape(0)) - 1;
   bool has_prefill = decode_only_rows == 0 && total_q_tokens > num_seqs;
   bool dtype_ok = query.dtype() != float32
                && query.dtype() == key_cache.dtype();
@@ -865,15 +869,25 @@ static void dispatch_paged_attention_v2_online(
     // that bound also covers the prefill rows and may be a whole allocation
     // bound, which the prefill kernels ignore but split-KV would plan for.
     const int decode_max_seq_len = std::min(max_seq_len, max_decode_context_len);
+    // A caller-supplied plan for exactly the decode prefix (validated at the
+    // binding against max_seq_len and max_decode_context_len) opts the prefix
+    // into GQA and tightens the bound to the plan's longest decode row.
+    const bool prefix_plan = gqa_length_plan.num_requests == num_decode_requests;
     dispatch_paged_attention_v2_online(
         out, query, key_cache, value_cache,
         num_kv_heads, scale, softcap,
         block_tables, seq_lens, cu_seqlens_q,
-        block_size, decode_max_seq_len, sliding_window, window_seqlen_q, s,
+        block_size,
+        prefix_plan ? gqa_length_plan.max_length : decode_max_seq_len,
+        sliding_window, window_seqlen_q, s,
         key_scale_cache, value_scale_cache, key_zero_cache, v_centroids,
         use_turboquant, k_bits, v_bits, sinks, nullptr,
         num_decode_requests, num_decode_tokens, max_decode_context_len,
-        num_decode_tokens, gqa_disabled);
+        num_decode_tokens, gqa_disabled, 0,
+        prefix_plan ? gqa_length_plan : GqaDecodeLengthPlan{});
+    // Keep the decode prefix's GQA selection visible in the diagnostics.
+    const int decode_partition = g_last_gqa_partition.load(std::memory_order_relaxed);
+    const int decode_requests = g_last_gqa_requests.load(std::memory_order_relaxed);
     // Decode rows lead the batch, so the first prefill sequence starts at
     // q-block cu_seqlens_q[D] / BQ + D with D = num_decode_requests.
     if (use_nax) {
@@ -883,7 +897,8 @@ static void dispatch_paged_attention_v2_online(
           block_tables, seq_lens, cu_seqlens_q,
           block_size, sliding_window,
           num_decode_tokens / kNaxBQ + num_decode_requests, s, sinks);
-      record_paged_dispatch(PagedDispatch::MixedNaxPrefillDecode);
+      record_paged_dispatch(PagedDispatch::MixedNaxPrefillDecode,
+                            decode_partition, decode_requests);
       return;
     }
     const int q_block_offset =
@@ -894,7 +909,8 @@ static void dispatch_paged_attention_v2_online(
         block_tables, seq_lens, cu_seqlens_q,
         block_size, max_seq_len, sliding_window, q_block_offset,
         *tile_config, s, sinks, mm_prefix_ranges);
-    record_paged_dispatch(PagedDispatch::MixedPrefillDecode);
+    record_paged_dispatch(PagedDispatch::MixedPrefillDecode,
+                          decode_partition, decode_requests);
     return;
   }
 
@@ -990,9 +1006,9 @@ static void dispatch_paged_attention_v2_online(
 
   // Ordinary decode has exactly one query row per request. Scheduler counts
   // distinguish it from expanded verification and one-token prefill segments.
-  // Mixed decode prefixes remain on their established route.
+  // A mixed batch's decode prefix qualifies only with its own length plan.
   const bool gqa_decode_rows =
-      decode_only_rows == 0 && total_q_tokens == num_seqs &&
+      total_q_tokens == num_seqs &&
       ((num_seqs == 1 &&
         (num_decode_requests == -1 || num_decode_requests == 1)) ||
        (num_seqs > 1 && num_decode_requests == num_seqs &&
@@ -1013,7 +1029,7 @@ static void dispatch_paged_attention_v2_online(
       : gqa_test_partition > 0 ? gqa_test_partition
       : gqa_decode_plan_for_lengths(
             num_heads, num_kv_heads, head_size,
-            num_seqs == 1
+            num_seqs == 1 && decode_only_rows == 0
                 ? gqa_decode_length_plan(std::array<int, 1>{max_seq_len})
                 : gqa_length_plan,
             detected_gpu_core_count(), block_size, d.get_architecture(), max_seq_len);
@@ -1349,15 +1365,27 @@ static array paged_attention_primitive_fn(
     throw std::invalid_argument("pass only one of gqa_length_plan and gqa_context_lens");
   const auto lengths = gqa_length_plan
       ? *gqa_length_plan : gqa_decode_length_plan(gqa_context_lens);
-  if ((gqa_length_plan || !gqa_context_lens.empty()) &&
-      (query.ndim() != 3 || seq_lens.ndim() != 1 || cu_seqlens_q.ndim() != 1 ||
-       lengths.num_requests == 0 || lengths.num_requests != query.shape(0) ||
-       lengths.num_requests != seq_lens.shape(0) ||
-       lengths.num_requests + 1 != cu_seqlens_q.shape(0) ||
-       lengths.max_length > max_seq_len)) {
-    throw std::invalid_argument(
-        "gqa_context_lens or gqa_length_plan requires one positive length per "
-        "decode row, bounded by max_seq_len");
+  if (gqa_length_plan || !gqa_context_lens.empty()) {
+    const bool shaped = query.ndim() == 3 && seq_lens.ndim() == 1 &&
+        cu_seqlens_q.ndim() == 1 && lengths.num_requests > 0 &&
+        lengths.max_length <= max_seq_len &&
+        seq_lens.shape(0) + 1 == cu_seqlens_q.shape(0);
+    const bool whole_decode = shaped &&
+        lengths.num_requests == query.shape(0) &&
+        lengths.num_requests == seq_lens.shape(0);
+    // Or the leading ordinary decode rows of a mixed batch.
+    const bool decode_prefix = shaped &&
+        lengths.num_requests == num_decode_requests &&
+        num_decode_tokens == num_decode_requests &&
+        num_decode_requests < seq_lens.shape(0) &&
+        lengths.max_length <= max_decode_context_len;
+    if (!whole_decode && !decode_prefix) {
+      throw std::invalid_argument(
+          "gqa_context_lens or gqa_length_plan requires one positive length per "
+          "decode row (every row of a decode batch, or the leading ordinary "
+          "decode rows of a mixed batch), bounded by max_seq_len and "
+          "max_decode_context_len");
+    }
   }
   if (sinks != nullptr) {
     // Upstream MLX refuses the same combination
@@ -2424,6 +2452,7 @@ NB_MODULE(_paged_ops, m) {
     caps["decode_routing_metadata"] = true;
     caps["gqa_batch_context_lens"] = true;
     caps["gqa_length_plan"] = true;
+    caps["gqa_mixed_decode_plan"] = true;
     return caps;
   }, "Capabilities of the public paged attention interface. Private test "
      "kernels do not imply an enabled production route.");
