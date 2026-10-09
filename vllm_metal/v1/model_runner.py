@@ -60,8 +60,11 @@ from vllm_metal.attention.context import (
     get_context,
     prepare_grouped,
 )
+from vllm_metal.attention.impls.gdn_lazy import GDNLazyKernels
+from vllm_metal.attention.impls.gdn_spec import apply_spec_decode_acceptance
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.attention.impls.mm_prefix import image_block_path
+from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
 from vllm_metal.config import get_config
@@ -558,6 +561,14 @@ class MetalModelRunner:
 
     def _verify_window_mismatch(self) -> str | None:
         """Why spec-verify windows stay expanded, or ``None`` when they merge."""
+        if self.is_hybrid and self.vllm_config.speculative_config is not None:
+            # Hybrid speculative verification REQUIRES the window layout: the
+            # GDN state scan needs one segment per request (the expanded
+            # layout splits a verify window into per-row segments, so request
+            # boundaries — and with them the per-request state slots — are
+            # unrecoverable from cu_seqlens). The opt-in below stays for
+            # non-hybrid models.
+            return None
         if not envs.VLLM_METAL_SPEC_VERIFY_WINDOW:
             return "VLLM_METAL_SPEC_VERIFY_WINDOW is off"
         if self.is_mla:
@@ -1351,6 +1362,11 @@ class MetalModelRunner:
             self._spec_decode_controller.active_spec_decode_tokens(scheduler_output),
             self._paged_request_seq_lens,
         )
+        # Any GDN verify-span stash left from a prior step is stale (consumed
+        # or dropped when that step's verification resolved); start clean.
+        hybrid_runtime = self._paged_attention_runtime
+        if isinstance(hybrid_runtime, HybridPagedAttentionRuntime):
+            hybrid_runtime.state_cache.spec_verify_stash = None
         num_decode_tokens = sum(segment.num_query_tokens for segment in decode_segments)
         has_pooling_work = self._has_paged_pooling_work(prefill_reqs, decode_reqs)
 
@@ -1941,6 +1957,23 @@ class MetalModelRunner:
         for pr in prefill_reqs:
             self._paged_request_seq_lens[pr.req_id] = pr.start_pos + len(pr.token_ids)
 
+        # ---- roll hybrid GDN state back to the accepted depth ----
+        # The verify forward staged each GDN layer's span-final state as a
+        # deferred update over the untouched pre-span state. Requests that
+        # rejected a draft committed fewer rows than their span, so the staged
+        # state must be re-scanned at the accepted depth. Full-span requests
+        # keep the staged update as-is (the common, zero-cost case).
+        hybrid_runtime = self._paged_attention_runtime
+        if isinstance(hybrid_runtime, HybridPagedAttentionRuntime):
+            state_cache = hybrid_runtime.state_cache
+            if state_cache.spec_verify_stash is not None:
+                committed_rows = [len(ids) for ids in decode_token_ids] + [
+                    len(pr.token_ids) for pr in prefill_reqs
+                ]
+                apply_spec_decode_acceptance(
+                    state_cache, GDNLazyKernels.shared(), committed_rows
+                )
+
         # ---- prompt logprobs for requests that asked for them ----
         self._gather_prefill_prompt_logprobs(
             batch,
@@ -2021,12 +2054,44 @@ class MetalModelRunner:
             num_decode_segments=num_decode_segments,
             num_speculative_tokens=num_speculative_tokens,
             finished_req_ids=scheduler_output.finished_req_ids,
+            draft_caps=self._hybrid_draft_caps(decode_segments, decode_token_ids, prefill_reqs),
         )
         self._draft_token_ids = (
             self._drafter.propose(draft_ctx) if self._drafter is not None else None
         )
 
         return batch, scheduler_output
+
+    def _hybrid_draft_caps(
+        self,
+        decode_segments: Sequence[PagedDecodeSegment],
+        decode_token_ids: Sequence[Sequence[int]],
+        prefill_reqs: Sequence[PrefillRequest],
+    ) -> dict[str, int] | None:
+        """Cap each request's next draft length at the state-block boundary.
+
+        Under align-mode state caching a verify span that crosses into the
+        next state block leaves the crossed block's checkpoint at the wrong
+        depth (the span-final state, not the state at the block end), so a
+        later prefix hit would restore corrupted GDN state. Keeping the span
+        inside the block that starts it makes every checkpoint exact by
+        construction. Per-request state modes (``none``) have no checkpoints
+        to protect and return ``None``.
+        """
+        hybrid_runtime = self._paged_attention_runtime
+        if not isinstance(hybrid_runtime, HybridPagedAttentionRuntime):
+            return None
+        stride = hybrid_runtime.state_checkpoint_stride
+        if not stride or stride <= 1:
+            return None
+        caps: dict[str, int] = {}
+        for segment, committed in zip(decode_segments, decode_token_ids):
+            next_span_start = segment.cache_start_pos + len(committed)
+            caps[segment.req_id] = max(stride - (next_span_start % stride) - 1, 0)
+        for pr in prefill_reqs:
+            last_prompt_pos = pr.start_pos + len(pr.token_ids) - 1
+            caps[pr.req_id] = max(stride - (last_prompt_pos % stride) - 1, 0)
+        return caps or None
 
     def _gather_prefill_prompt_logprobs(
         self,

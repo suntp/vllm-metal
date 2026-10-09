@@ -197,10 +197,30 @@ class TestSpecDecodePolicy:
                 speculative_config=_gemma4_mtp_speculative_config(),
             )
 
-    def test_hybrid_scheduled_tokens_are_rejected(self) -> None:
-        with pytest.raises(NotImplementedError, match="hybrid models"):
+    def test_hybrid_scheduled_tokens_are_accepted(self) -> None:
+        # Hybrid GDN targets verify through packed decode spans with a
+        # post-verify state fixup (gdn_spec), so the handoff validates.
+        SpeculativeDecodeController().validate_supported(
+            _scheduler_output(scheduled_spec_decode_tokens={"r0": [1]}),
+            [("r0", _request_state())],
+            is_hybrid=True,
+        )
+
+    def test_hybrid_rejects_invalid_draft_token_sentinel(self) -> None:
+        with pytest.raises(NotImplementedError, match="invalid draft-token"):
             SpeculativeDecodeController().validate_supported(
-                _scheduler_output(scheduled_spec_decode_tokens={"r0": [1]}),
+                _scheduler_output(scheduled_spec_decode_tokens={"r0": [7, -1]}),
+                [("r0", _request_state())],
+                is_hybrid=True,
+            )
+
+    def test_hybrid_rejects_scheduler_invalid_spec_tokens(self) -> None:
+        with pytest.raises(NotImplementedError, match="scheduler-invalid"):
+            SpeculativeDecodeController().validate_supported(
+                _scheduler_output(
+                    scheduled_spec_decode_tokens={"r0": [-1]},
+                    num_invalid_spec_tokens={"r0": 1},
+                ),
                 [("r0", _request_state())],
                 is_hybrid=True,
             )

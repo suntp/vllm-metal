@@ -141,11 +141,10 @@ class SpeculativeDecodeController:
         }
         has_invalid_spec_tokens = any(count > 0 for count in invalid_counts.values())
 
-        if (active_spec_tokens or has_invalid_spec_tokens) and is_hybrid:
-            raise NotImplementedError(
-                "Speculative decode verification is not supported for hybrid "
-                "models on Metal yet."
-            )
+        # Hybrid GDN targets verify through the same packed decode segments:
+        # full-attention layers take the extra query rows and the GDN layers
+        # run their state scan over the span, with the acceptance fixup in
+        # gdn_spec rolling partial accepts back to the accepted depth.
 
         decode_req_ids = {req_id for req_id, _ in decode_reqs}
         unexpected_req_ids = sorted(set(spec_tokens) - decode_req_ids)
