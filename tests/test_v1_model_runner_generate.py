@@ -2532,11 +2532,6 @@ class TestVerifyLayoutLog:
             ),
             (
                 "1",
-                {"is_hybrid": True},
-                "window mode does not support hybrid models",
-            ),
-            (
-                "1",
                 {
                     "model_config": SimpleNamespace(
                         runner_type="generate",
@@ -2547,7 +2542,7 @@ class TestVerifyLayoutLog:
                 "head size 512 exceeds the window mode's 256",
             ),
         ],
-        ids=["off", "mla", "hybrid", "head-size"],
+        ids=["off", "mla", "head-size"],
     )
     def test_expanded_layout_names_the_reason(
         self, monkeypatch, window_env, runner_kwargs, reason
@@ -2560,6 +2555,13 @@ class TestVerifyLayoutLog:
             f"Metal: spec-decode verify uses the expanded per-token layout ({reason})"
             in lines
         )
+
+    def test_hybrid_spec_forces_window_layout(self, monkeypatch) -> None:
+        # Hybrid verification needs per-request segments, so the window
+        # layout is forced regardless of the opt-in env.
+        monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", "0")
+        lines = self._warm_up(monkeypatch, make_stub_runner(is_hybrid=True))
+        assert "Metal: spec-decode verify uses the window layout" in lines
 
     def test_no_line_without_speculative_decoding(self, monkeypatch) -> None:
         lines = self._warm_up(monkeypatch, make_stub_runner(), speculative=False)
