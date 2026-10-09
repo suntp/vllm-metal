@@ -36,10 +36,18 @@ def _inputs(total_tokens: int, *, n_hk=2, n_hv=4, d_k=32, d_v=8):
 
 def _scan(lazy, cache, slot_ids, cu, q, k, v, g, beta, *, defer=True):
     request = GDNRecurrentPrefillRequest(
-        q=q, k=k, v=v, g=g, beta=beta,
-        state_cache=cache, cache_idx=0, slot_ids=list(slot_ids),
-        output_dtype=q.dtype, cu_seqlens=list(cu),
-        compute_dtype=None, defer_state_scatter=defer,
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        state_cache=cache,
+        cache_idx=0,
+        slot_ids=list(slot_ids),
+        output_dtype=q.dtype,
+        cu_seqlens=list(cu),
+        compute_dtype=None,
+        defer_state_scatter=defer,
     )
     out = lazy.try_recurrent_prefill(request)
     assert out is not None
@@ -108,8 +116,15 @@ class TestAcceptanceFixup:
         rows = [0, 1, 2, 5, 6, 7]
         cu_ref = [0, keep, 2 * keep]
         _scan(
-            lazy, cache2, slot_ids, cu_ref,
-            q[:, rows], k[:, rows], v[:, rows], g[:, rows], beta[:, rows],
+            lazy,
+            cache2,
+            slot_ids,
+            cu_ref,
+            q[:, rows],
+            k[:, rows],
+            v[:, rows],
+            g[:, rows],
+            beta[:, rows],
         )
         expected = cache2.pending_recurrent_states[0]
 
@@ -117,10 +132,19 @@ class TestAcceptanceFixup:
         stash = GDNSpecVerifyStep()
         cache.spec_verify_stash = stash
         stash_spec_verify_layer(
-            cache, stash,
-            cache_idx=0, slot_ids=slot_ids, cu_seqlens=cu,
-            span_lengths=(span, span), compute_dtype=None,
-            q=q, k=k, v=v, g=g, beta=beta, mixed_qkv=mixed_qkv,
+            cache,
+            stash,
+            cache_idx=0,
+            slot_ids=slot_ids,
+            cu_seqlens=cu,
+            span_lengths=(span, span),
+            compute_dtype=None,
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            mixed_qkv=mixed_qkv,
         )
         assert apply_spec_decode_acceptance(cache, lazy, [keep, keep])
 
@@ -137,8 +161,13 @@ class TestAcceptanceFixup:
         mx.random.seed(1)
         lazy = GDNLazyKernels(enabled=True)
         cache = make_state_cache(
-            num_layers=1, max_seqs=4, conv_kernel_dim=4, conv_dim=64,
-            num_v_heads=4, value_head_dim=8, key_head_dim=32,
+            num_layers=1,
+            max_seqs=4,
+            conv_kernel_dim=4,
+            conv_dim=64,
+            num_v_heads=4,
+            value_head_dim=8,
+            key_head_dim=32,
         )
         slot_ids = [0]
         span = 4
@@ -153,9 +182,19 @@ class TestAcceptanceFixup:
         stash = GDNSpecVerifyStep()
         cache.spec_verify_stash = stash
         stash_spec_verify_layer(
-            cache, stash, cache_idx=0, slot_ids=slot_ids, cu_seqlens=cu,
-            span_lengths=(span,), compute_dtype=None,
-            q=q, k=k, v=v, g=g, beta=beta, mixed_qkv=mixed_qkv,
+            cache,
+            stash,
+            cache_idx=0,
+            slot_ids=slot_ids,
+            cu_seqlens=cu,
+            span_lengths=(span,),
+            compute_dtype=None,
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            mixed_qkv=mixed_qkv,
         )
         # All drafts accepted: committed rows equal the span; no re-scan.
         assert not apply_spec_decode_acceptance(cache, lazy, [span])
@@ -167,8 +206,13 @@ class TestAcceptanceFixup:
         mx.random.seed(2)
         lazy = GDNLazyKernels(enabled=True)
         cache = make_state_cache(
-            num_layers=1, max_seqs=4, conv_kernel_dim=4, conv_dim=64,
-            num_v_heads=4, value_head_dim=8, key_head_dim=32,
+            num_layers=1,
+            max_seqs=4,
+            conv_kernel_dim=4,
+            conv_dim=64,
+            num_v_heads=4,
+            value_head_dim=8,
+            key_head_dim=32,
         )
         slot = 2
         slot_ids = [slot]
@@ -182,9 +226,19 @@ class TestAcceptanceFixup:
         stash = GDNSpecVerifyStep()
         cache.spec_verify_stash = stash
         stash_spec_verify_layer(
-            cache, stash, cache_idx=0, slot_ids=slot_ids, cu_seqlens=cu,
-            span_lengths=(span,), compute_dtype=None,
-            q=q, k=k, v=v, g=g, beta=beta, mixed_qkv=mixed_qkv,
+            cache,
+            stash,
+            cache_idx=0,
+            slot_ids=slot_ids,
+            cu_seqlens=cu,
+            span_lengths=(span,),
+            compute_dtype=None,
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            mixed_qkv=mixed_qkv,
         )
         keep = 2
         assert apply_spec_decode_acceptance(cache, lazy, [keep])
@@ -203,8 +257,13 @@ class TestAcceptanceFixup:
         mx.random.seed(3)
         lazy = GDNLazyKernels(enabled=True)
         cache = make_state_cache(
-            num_layers=1, max_seqs=4, conv_kernel_dim=4, conv_dim=64,
-            num_v_heads=4, value_head_dim=8, key_head_dim=32,
+            num_layers=1,
+            max_seqs=4,
+            conv_kernel_dim=4,
+            conv_dim=64,
+            num_v_heads=4,
+            value_head_dim=8,
+            key_head_dim=32,
         )
         slot_ids = [0, 1]
         spans = (4, 2)
@@ -216,14 +275,22 @@ class TestAcceptanceFixup:
 
         # Reference per-request truncated scans from the same base.
         cache2 = make_state_cache(
-            num_layers=1, max_seqs=4, conv_kernel_dim=4, conv_dim=64,
-            num_v_heads=4, value_head_dim=8, key_head_dim=32,
+            num_layers=1,
+            max_seqs=4,
+            conv_kernel_dim=4,
+            conv_dim=64,
+            num_v_heads=4,
+            value_head_dim=8,
+            key_head_dim=32,
         )
         cache2.conv_states[0] = cache.conv_states[0]
         cache2.recurrent_states[0] = cache.recurrent_states[0]
         keep = (3, 1)
         _scan(
-            lazy, cache2, slot_ids, [0, 3, 4],
+            lazy,
+            cache2,
+            slot_ids,
+            [0, 3, 4],
             q[:, [0, 1, 2, 4]],  # rows 0-2 of r0, row 0 of r1
             k[:, [0, 1, 2, 4]],
             v[:, [0, 1, 2, 4]],
@@ -235,9 +302,19 @@ class TestAcceptanceFixup:
         stash = GDNSpecVerifyStep()
         cache.spec_verify_stash = stash
         stash_spec_verify_layer(
-            cache, stash, cache_idx=0, slot_ids=slot_ids, cu_seqlens=cu,
-            span_lengths=spans, compute_dtype=None,
-            q=q, k=k, v=v, g=g, beta=beta, mixed_qkv=mixed_qkv,
+            cache,
+            stash,
+            cache_idx=0,
+            slot_ids=slot_ids,
+            cu_seqlens=cu,
+            span_lengths=spans,
+            compute_dtype=None,
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            mixed_qkv=mixed_qkv,
         )
         assert apply_spec_decode_acceptance(cache, lazy, list(keep))
         got = cache.pending_recurrent_states[0]

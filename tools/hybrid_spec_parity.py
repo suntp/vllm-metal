@@ -151,10 +151,7 @@ def run_child(model, enable_spec, prefix_caching, queue):
             results[tag] = list(out.outputs[0].token_ids)
             if not enable_spec:
                 ties[tag] = [
-                    {
-                        t: v.logprob
-                        for t, v in (lp or {}).items()
-                    }
+                    {t: v.logprob for t, v in (lp or {}).items()}
                     for lp in out.outputs[0].logprobs
                 ]
         outs = llm.generate([{"prompt_token_ids": t} for _, t in batch], sp)
@@ -187,17 +184,13 @@ def _classify_mismatch(ref, spec, ref_ties):
     profiling shapes. A divergence where the spec arm's token ties the
     reference's choice within 1e-4 is that artifact, not corruption.
     """
-    for i, (r, s) in enumerate(zip(ref, spec)):
+    for i, (r, s) in enumerate(zip(ref, spec, strict=False)):
         if r == s:
             continue
         step_ties = ref_ties[i] if i < len(ref_ties) else {}
         chosen = step_ties.get(r)
         alt = step_ties.get(s)
-        if (
-            chosen is not None
-            and alt is not None
-            and abs(chosen - alt) < 1e-4
-        ):
+        if chosen is not None and alt is not None and abs(chosen - alt) < 1e-4:
             return "tie"
         return "real"
     return "tie" if ref != spec else None
@@ -254,14 +247,19 @@ def run_pair(model, prefix_caching):
     partial = sum(1 for span, n in verify if 1 < n < span)
     rejected = sum(1 for span, n in verify if n == 1 and span > 1)
     drafted_tokens = sum(n for _, n in verify)
-    return len(reference), mismatches, tie_flips, {
-        "rounds": rounds,
-        "hits": len(hits),
-        "full": full,
-        "partial": partial,
-        "first_reject": rejected,
-        "committed": drafted_tokens,
-    }
+    return (
+        len(reference),
+        mismatches,
+        tie_flips,
+        {
+            "rounds": rounds,
+            "hits": len(hits),
+            "full": full,
+            "partial": partial,
+            "first_reject": rejected,
+            "committed": drafted_tokens,
+        },
+    )
 
 
 def main() -> int:

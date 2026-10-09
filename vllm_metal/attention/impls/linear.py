@@ -406,10 +406,7 @@ class GDNPagedAttentionWrapper(nn.Module):
     ) -> bool:
         return (
             self._lazy_kernels_enabled()
-            and (
-                state.num_decode_requests < state.num_requests
-                or state.is_spec_verify
-            )
+            and (state.num_decode_requests < state.num_requests or state.is_spec_verify)
             and state.total_tokens > state.num_requests
         )
 
@@ -419,12 +416,8 @@ class GDNPagedAttentionWrapper(nn.Module):
     def _should_defer_conv_prefill_containing_state(
         self, state: _GDNForwardState
     ) -> bool:
-        return (
-            self._lazy_kernels_enabled()
-            and (
-                state.num_decode_requests < state.num_requests
-                or state.is_spec_verify
-            )
+        return self._lazy_kernels_enabled() and (
+            state.num_decode_requests < state.num_requests or state.is_spec_verify
         )
 
     def _should_try_conv_prefill_containing_lazy(self, state: _GDNForwardState) -> bool:
@@ -436,10 +429,7 @@ class GDNPagedAttentionWrapper(nn.Module):
         # larger.
         return (
             self._lazy_kernels_enabled()
-            and (
-                state.num_decode_requests < state.num_requests
-                or state.is_spec_verify
-            )
+            and (state.num_decode_requests < state.num_requests or state.is_spec_verify)
             and self._gdn_lazy_policy.should_try_conv_prefill_lazy()
         )
 

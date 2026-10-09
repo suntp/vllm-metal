@@ -2054,7 +2054,9 @@ class MetalModelRunner:
             num_decode_segments=num_decode_segments,
             num_speculative_tokens=num_speculative_tokens,
             finished_req_ids=scheduler_output.finished_req_ids,
-            draft_caps=self._hybrid_draft_caps(decode_segments, decode_token_ids, prefill_reqs),
+            draft_caps=self._hybrid_draft_caps(
+                decode_segments, decode_token_ids, prefill_reqs
+            ),
         )
         self._draft_token_ids = (
             self._drafter.propose(draft_ctx) if self._drafter is not None else None
@@ -2085,7 +2087,7 @@ class MetalModelRunner:
         if not stride or stride <= 1:
             return None
         caps: dict[str, int] = {}
-        for segment, committed in zip(decode_segments, decode_token_ids):
+        for segment, committed in zip(decode_segments, decode_token_ids, strict=True):
             next_span_start = segment.cache_start_pos + len(committed)
             caps[segment.req_id] = max(stride - (next_span_start % stride) - 1, 0)
         for pr in prefill_reqs:
