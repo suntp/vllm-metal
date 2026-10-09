@@ -161,7 +161,7 @@ def _rescan_layer_to_accepted(
     def slice_span(arr: mx.array) -> mx.array:
         rows = [
             arr[0, start : start + length]
-            for start, length in zip(original_starts, committed_rows)
+            for start, length in zip(original_starts, committed_rows, strict=True)
         ]
         return mx.concatenate(rows, axis=0)[None]
 
@@ -209,15 +209,12 @@ def _rescan_layer_to_accepted(
     # The conv tail at the accepted depth is the last (kernel - 1) rows of
     # (depth-0 conv state + accepted span prefix) — pure slicing, no kernel.
     conv_state = state_cache.conv_states[layer_stash.cache_idx]
-    slot_ids_arr = mx.array(layer_stash.slot_ids, dtype=mx.int32)
     state_len = conv_state.shape[1]
     tails = []
     for req_idx, (slot, start) in enumerate(
-        zip(layer_stash.slot_ids, original_starts)
+        zip(layer_stash.slot_ids, original_starts, strict=True)
     ):
-        prefix = layer_stash.mixed_qkv[
-            0, start : start + committed_rows[req_idx]
-        ]
+        prefix = layer_stash.mixed_qkv[0, start : start + committed_rows[req_idx]]
         window = mx.concatenate([conv_state[slot], prefix], axis=0)
         tails.append(window[-state_len:])
     state_cache.set_pending_conv_state(

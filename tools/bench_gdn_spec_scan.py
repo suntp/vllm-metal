@@ -32,16 +32,26 @@ def make_state_cache(**kwargs):
     num_layers = kwargs.get("num_layers", 1)
     max_seqs = kwargs["max_seqs"]
     conv_states = [
-        mx.zeros((max_seqs, kwargs["conv_kernel_dim"] - 1, kwargs["conv_dim"]),
-                 dtype=mx.float32)
+        mx.zeros(
+            (max_seqs, kwargs["conv_kernel_dim"] - 1, kwargs["conv_dim"]),
+            dtype=mx.float32,
+        )
         for _ in range(num_layers)
     ]
     recurrent_states = [
-        mx.zeros((max_seqs, kwargs["num_v_heads"], kwargs["value_head_dim"],
-                  kwargs["key_head_dim"]), dtype=mx.float32)
+        mx.zeros(
+            (
+                max_seqs,
+                kwargs["num_v_heads"],
+                kwargs["value_head_dim"],
+                kwargs["key_head_dim"],
+            ),
+            dtype=mx.float32,
+        )
         for _ in range(num_layers)
     ]
     return PagedStateCache([conv_states, recurrent_states])
+
 
 # Qwen3.8-27B GDN geometry (matches the 2026-10-08 30k bench appendix).
 N_HK, N_HV, D_K, D_V = 16, 48, 128, 128
@@ -75,9 +85,11 @@ def main() -> None:
     kernels = GDNLazyKernels(enabled=True)
     assert kernels.enabled, "lazy GDN kernels unavailable"
 
-    print(f"geometry: Hk={N_HK} Hv={N_HV} Dk={D_K} Dv={D_V} "
-          f"conv_dim={CONV_DIM} recurrent/slot/layer="
-          f"{N_HV * D_V * D_K * 4 / 1e6:.2f}MB fp32")
+    print(
+        f"geometry: Hk={N_HK} Hv={N_HV} Dk={D_K} Dv={D_V} "
+        f"conv_dim={CONV_DIM} recurrent/slot/layer="
+        f"{N_HV * D_V * D_K * 4 / 1e6:.2f}MB fp32"
+    )
 
     # --- 1) decode kernel: B requests x 1 token each (today's path) ---
     for num_requests in (1, 8):
@@ -93,13 +105,22 @@ def main() -> None:
         q, k, v, g, beta = make_inputs(num_requests)
         slot_ids = list(range(num_requests))
         req = GDNRecurrentDecodeRequest(
-            q=q, k=k, v=v, g=g, beta=beta,
-            state_cache=cache, cache_idx=0, slot_ids=slot_ids,
-            output_dtype=DTYPE, threadgroup_dv=4,
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            state_cache=cache,
+            cache_idx=0,
+            slot_ids=slot_ids,
+            output_dtype=DTYPE,
+            threadgroup_dv=4,
         )
-        ms = bench(lambda: kernels.try_recurrent_decode(req))
-        print(f"decode kernel  B={num_requests:<2} T=1      : {ms:7.3f} ms "
-              f"({ms / num_requests:.3f} ms/req)")
+        ms = bench(lambda req=req: kernels.try_recurrent_decode(req))
+        print(
+            f"decode kernel  B={num_requests:<2} T=1      : {ms:7.3f} ms "
+            f"({ms / num_requests:.3f} ms/req)"
+        )
 
     # --- 2) prefill scan kernel: one segment of T tokens (verify span) ---
     cache = make_state_cache(
@@ -117,15 +138,23 @@ def main() -> None:
             q, k, v, g, beta = make_inputs(total)
             cu = [i * t for i in range(num_reqs + 1)]
             req = GDNRecurrentPrefillRequest(
-                q=q, k=k, v=v, g=g, beta=beta,
-                state_cache=cache, cache_idx=0,
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                state_cache=cache,
+                cache_idx=0,
                 slot_ids=list(range(num_reqs)),
-                output_dtype=DTYPE, cu_seqlens=cu,
-                compute_dtype=DTYPE, defer_state_scatter=True,
+                output_dtype=DTYPE,
+                cu_seqlens=cu,
+                compute_dtype=DTYPE,
+                defer_state_scatter=True,
             )
-            ms = bench(lambda: kernels.try_recurrent_prefill(req))
-            print(f"scan kernel    B={num_reqs} segT={t}    : {ms:7.3f} ms "
-                  f"({total} tok)")
+            ms = bench(lambda req=req: kernels.try_recurrent_prefill(req))
+            print(
+                f"scan kernel    B={num_reqs} segT={t}    : {ms:7.3f} ms ({total} tok)"
+            )
 
     # Conv state at spec spans is a tiny [B, T, conv_dim] window; its cost is
     # dominated by the recurrent scan above and is exercised end-to-end by the
