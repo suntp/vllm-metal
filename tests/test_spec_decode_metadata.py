@@ -198,13 +198,23 @@ class TestSpecDecodePolicy:
             )
 
     def test_hybrid_scheduled_tokens_are_accepted(self) -> None:
-        # Hybrid GDN targets verify through packed decode spans with a
-        # post-verify state fixup (gdn_spec), so the handoff validates.
+        # Hybrid GDN targets verify n-gram drafts through packed decode spans
+        # with a post-verify state fixup (gdn_spec), so the handoff validates.
         SpeculativeDecodeController().validate_supported(
             _scheduler_output(scheduled_spec_decode_tokens={"r0": [1]}),
             [("r0", _request_state())],
             is_hybrid=True,
+            speculative_config=SimpleNamespace(method="ngram"),
         )
+
+    def test_hybrid_rejects_non_ngram_speculator(self) -> None:
+        with pytest.raises(NotImplementedError, match="ngram method only"):
+            SpeculativeDecodeController().validate_supported(
+                _scheduler_output(scheduled_spec_decode_tokens={"r0": [1]}),
+                [("r0", _request_state())],
+                is_hybrid=True,
+                speculative_config=SimpleNamespace(method="draft_model"),
+            )
 
     def test_hybrid_rejects_invalid_draft_token_sentinel(self) -> None:
         with pytest.raises(NotImplementedError, match="invalid draft-token"):
@@ -212,6 +222,7 @@ class TestSpecDecodePolicy:
                 _scheduler_output(scheduled_spec_decode_tokens={"r0": [7, -1]}),
                 [("r0", _request_state())],
                 is_hybrid=True,
+                speculative_config=SimpleNamespace(method="ngram"),
             )
 
     def test_hybrid_rejects_scheduler_invalid_spec_tokens(self) -> None:
@@ -223,6 +234,7 @@ class TestSpecDecodePolicy:
                 ),
                 [("r0", _request_state())],
                 is_hybrid=True,
+                speculative_config=SimpleNamespace(method="ngram"),
             )
 
     def test_rejects_invalid_draft_token_sentinel(self) -> None:

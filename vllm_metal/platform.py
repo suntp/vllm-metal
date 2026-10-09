@@ -677,13 +677,13 @@ class MetalPlatform(Platform):
             if (
                 cache_config.enable_prefix_caching
                 and vllm_config.speculative_config is not None
-                and vllm_config.speculative_config.method in ("dflash", "dspark")
+                and vllm_config.speculative_config.method != "ngram"
             ):
-                # n-gram / draft-model / MTP hybrid verification stages GDN
-                # state per verify span and caps drafts at the state-block
-                # boundary (gdn_spec), keeping align-mode checkpoints exact;
-                # the block-draft methods schedule their own KV and stay
-                # unsupported with prefix caching.
+                # n-gram hybrid verification stages GDN state per verify span
+                # and caps drafts at the state-block boundary (gdn_spec),
+                # keeping align-mode checkpoints exact. The other speculators
+                # are not validated on hybrid targets yet, so they keep the
+                # APC downgrade.
                 cls._disable_hybrid_prefix_caching(
                     vllm_config,
                     "draft-state rollback across mamba state blocks "
