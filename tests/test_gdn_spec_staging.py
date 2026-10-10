@@ -10,6 +10,7 @@ import pytest
 from tests.stub_runner import make_state_cache
 from vllm_metal.attention.impls.gdn_lazy import (
     GDNLazyKernels,
+    GDNRecurrentDecodeRequest,
     GDNRecurrentPrefillRequest,
 )
 from vllm_metal.attention.impls.gdn_spec import (
@@ -319,3 +320,93 @@ class TestAcceptanceFixup:
         assert apply_spec_decode_acceptance(cache, lazy, list(keep))
         got = cache.pending_recurrent_states[0]
         np.testing.assert_allclose(np.array(got), np.array(expected), atol=1e-4)
+
+    def test_all_first_reject_rescans_via_decode_kernel(self) -> None:
+        _require_metal()
+        mx.random.seed(4)
+        lazy = GDNLazyKernels(enabled=True)
+        cache = make_state_cache(
+            num_layers=1,
+            max_seqs=4,
+            conv_kernel_dim=4,
+            conv_dim=64,
+            num_v_heads=4,
+            value_head_dim=8,
+            key_head_dim=32,
+        )
+        slot_ids = [1, 3]
+        span = 4
+        cu = [0, span, 2 * span]
+        q, k, v, g, beta = _inputs(2 * span)
+        mixed_qkv = mx.random.normal((1, 2 * span, 64))
+
+        _scan(lazy, cache, slot_ids, cu, q, k, v, g, beta)
+
+        # Every request rejected its first draft: the accepted state is one
+        # row per request, which routes the fixup to the T=1 decode kernel
+        # (the prefill scan requires total > num_requests). Reference: a
+        # direct decode scan over each request's kept first span row (rows 0
+        # and span) from the same untouched base state.
+        cache2 = make_state_cache(
+            num_layers=1,
+            max_seqs=4,
+            conv_kernel_dim=4,
+            conv_dim=64,
+            num_v_heads=4,
+            value_head_dim=8,
+            key_head_dim=32,
+        )
+        cache2.conv_states[0] = cache.conv_states[0]
+        cache2.recurrent_states[0] = cache.recurrent_states[0]
+        kept = [0, span]
+        reference = lazy.try_recurrent_decode(
+            GDNRecurrentDecodeRequest(
+                q=q[:, kept],
+                k=k[:, kept],
+                v=v[:, kept],
+                g=g[:, kept],
+                beta=beta[:, kept],
+                state_cache=cache2,
+                cache_idx=0,
+                slot_ids=slot_ids,
+                output_dtype=q.dtype,
+            )
+        )
+        assert reference is not None
+        expected = cache2.pending_recurrent_states[0]
+        assert expected is not None
+
+        stash = GDNSpecVerifyStep()
+        cache.spec_verify_stash = stash
+        stash_spec_verify_layer(
+            stash,
+            cache_idx=0,
+            slot_ids=slot_ids,
+            cu_seqlens=cu,
+            span_lengths=(span, span),
+            compute_dtype=None,
+            decode_threadgroup_dv=4,
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            mixed_qkv=mixed_qkv,
+        )
+        assert apply_spec_decode_acceptance(cache, lazy, [1, 1])
+        got = cache.pending_recurrent_states[0]
+        np.testing.assert_allclose(np.array(got), np.array(expected), atol=1e-4)
+
+        # The conv tail at depth 1 is the last (kernel - 1) rows of
+        # (depth-0 conv state + the kept first span row).
+        state_len = cache.conv_states[0].shape[1]
+        for row, (slot, start) in enumerate(zip(slot_ids, kept, strict=True)):
+            window = mx.concatenate(
+                [cache.conv_states[0][slot], mixed_qkv[0, start : start + 1]], axis=0
+            )
+            expected_tail = window[-state_len:].astype(cache.conv_states[0].dtype)
+            np.testing.assert_allclose(
+                np.array(cache.pending_conv_states[0][row]),
+                np.array(expected_tail),
+                atol=1e-3,
+            )
