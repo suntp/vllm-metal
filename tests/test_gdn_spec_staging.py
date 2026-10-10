@@ -132,13 +132,13 @@ class TestAcceptanceFixup:
         stash = GDNSpecVerifyStep()
         cache.spec_verify_stash = stash
         stash_spec_verify_layer(
-            cache,
             stash,
             cache_idx=0,
             slot_ids=slot_ids,
             cu_seqlens=cu,
             span_lengths=(span, span),
             compute_dtype=None,
+            decode_threadgroup_dv=4,
             q=q,
             k=k,
             v=v,
@@ -182,13 +182,13 @@ class TestAcceptanceFixup:
         stash = GDNSpecVerifyStep()
         cache.spec_verify_stash = stash
         stash_spec_verify_layer(
-            cache,
             stash,
             cache_idx=0,
             slot_ids=slot_ids,
             cu_seqlens=cu,
             span_lengths=(span,),
             compute_dtype=None,
+            decode_threadgroup_dv=4,
             q=q,
             k=k,
             v=v,
@@ -226,13 +226,13 @@ class TestAcceptanceFixup:
         stash = GDNSpecVerifyStep()
         cache.spec_verify_stash = stash
         stash_spec_verify_layer(
-            cache,
             stash,
             cache_idx=0,
             slot_ids=slot_ids,
             cu_seqlens=cu,
             span_lengths=(span,),
             compute_dtype=None,
+            decode_threadgroup_dv=4,
             q=q,
             k=k,
             v=v,
@@ -302,13 +302,13 @@ class TestAcceptanceFixup:
         stash = GDNSpecVerifyStep()
         cache.spec_verify_stash = stash
         stash_spec_verify_layer(
-            cache,
             stash,
             cache_idx=0,
             slot_ids=slot_ids,
             cu_seqlens=cu,
             span_lengths=spans,
             compute_dtype=None,
+            decode_threadgroup_dv=4,
             q=q,
             k=k,
             v=v,

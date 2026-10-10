@@ -205,7 +205,20 @@ class TestSpecDecodePolicy:
             [("r0", _request_state())],
             is_hybrid=True,
             speculative_config=SimpleNamespace(method="ngram"),
+            hybrid_family="gdn",
         )
+
+    def test_hybrid_rejects_non_gdn_state_family(self) -> None:
+        # The verify-span staging and acceptance rollback live in the GDN
+        # state wrapper only; other hybrid families have no rollback.
+        with pytest.raises(NotImplementedError, match="GDN state family only"):
+            SpeculativeDecodeController().validate_supported(
+                _scheduler_output(scheduled_spec_decode_tokens={"r0": [1]}),
+                [("r0", _request_state())],
+                is_hybrid=True,
+                speculative_config=SimpleNamespace(method="ngram"),
+                hybrid_family="mamba2",
+            )
 
     def test_hybrid_rejects_non_ngram_speculator(self) -> None:
         with pytest.raises(NotImplementedError, match="ngram method only"):

@@ -562,12 +562,34 @@ class MetalModelRunner:
     def _verify_window_mismatch(self) -> str | None:
         """Why spec-verify windows stay expanded, or ``None`` when they merge."""
         if self.is_hybrid and self.vllm_config.speculative_config is not None:
-            # Hybrid speculative verification REQUIRES the window layout: the
-            # GDN state scan needs one segment per request (the expanded
+            # Hybrid GDN speculative verification REQUIRES the window layout:
+            # the GDN state scan needs one segment per request (the expanded
             # layout splits a verify window into per-row segments, so request
             # boundaries — and with them the per-request state slots — are
-            # unrecoverable from cu_seqlens). The opt-in below stays for
+            # unrecoverable from cu_seqlens). The forced window mode is a
+            # GDN-family capability: the other hybrid state families have no
+            # span staging, and the head bound below applies to the forced
+            # mode just as it does to the opt-in one. The opt-in stays for
             # non-hybrid models.
+            family = (
+                self.hybrid_runtime_plan.family.label
+                if self.hybrid_runtime_plan is not None
+                else None
+            )
+            if family != "gdn":
+                return (
+                    "window mode does not support non-GDN hybrid state "
+                    f"families (this target is {family!r})"
+                )
+            head_dims = self.head_dim_per_layer
+            max_head_dim = (
+                max(head_dims) if head_dims else self.model_config.get_head_size()
+            )
+            if max_head_dim > PA_WINDOW_MAX_HEAD_SIZE:
+                return (
+                    f"head size {max_head_dim} exceeds the window mode's "
+                    f"{PA_WINDOW_MAX_HEAD_SIZE}"
+                )
             return None
         if not envs.VLLM_METAL_SPEC_VERIFY_WINDOW:
             return "VLLM_METAL_SPEC_VERIFY_WINDOW is off"
@@ -2073,12 +2095,12 @@ class MetalModelRunner:
         """Cap each request's next draft length at the state-block boundary.
 
         Under align-mode state caching a verify span that crosses into the
-        next state block leaves the crossed block's checkpoint at the wrong
-        depth (the span-final state, not the state at the block end), so a
-        later prefix hit would restore corrupted GDN state. Keeping the span
-        inside the block that starts it makes every checkpoint exact by
-        construction. Per-request state modes (``none``) have no checkpoints
-        to protect and return ``None``.
+        next state block parks its span-final state on the block crossed
+        INTO, leaving the crossed (now full) block's checkpoint at its
+        pre-span depth, so a later prefix hit would restore stale GDN state.
+        Keeping the span inside the block that starts it makes every
+        checkpoint exact by construction. Per-request state modes (``none``)
+        have no checkpoints to protect and return ``None``.
         """
         hybrid_runtime = self._paged_attention_runtime
         if not isinstance(hybrid_runtime, HybridPagedAttentionRuntime):
@@ -2091,8 +2113,12 @@ class MetalModelRunner:
             next_span_start = segment.cache_start_pos + len(committed)
             caps[segment.req_id] = max(stride - (next_span_start % stride) - 1, 0)
         for pr in prefill_reqs:
-            last_prompt_pos = pr.start_pos + len(pr.token_ids) - 1
-            caps[pr.req_id] = max(stride - (last_prompt_pos % stride) - 1, 0)
+            # The first verify span's rows start one past the prompt's last
+            # row: the sampled token sits at start_pos + len(token_ids)
+            # (mirroring _paged_request_seq_lens), so the boundary anchor is
+            # that position, not the prompt's last row.
+            next_span_start = pr.start_pos + len(pr.token_ids)
+            caps[pr.req_id] = max(stride - (next_span_start % stride) - 1, 0)
         return caps or None
 
     def _gather_prefill_prompt_logprobs(
@@ -2243,6 +2269,11 @@ class MetalModelRunner:
             is_hybrid=self.is_hybrid,
             use_async_scheduling=self.use_async_scheduling,
             speculative_config=self.vllm_config.speculative_config,
+            hybrid_family=(
+                self.hybrid_runtime_plan.family.label
+                if self.hybrid_runtime_plan is not None
+                else None
+            ),
         )
 
     def _run_vision_encoders(
