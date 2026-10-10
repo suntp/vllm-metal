@@ -70,13 +70,17 @@ def make_inputs(total_tokens: int):
 
 
 def bench(fn, iters: int = 50, warmup: int = 10) -> float:
+    """Time ``fn``; it returns the arrays to evaluate.
+
+    Both kernel paths defer the state scatter, parking it as a pending lazy
+    array beside the scan output — evaluate both so the state update is
+    actually timed (evaluating the output alone can miss it).
+    """
     for _ in range(warmup):
-        out = fn()
-        mx.eval(out)
+        mx.eval(*fn())
     start = time.perf_counter()
     for _ in range(iters):
-        out = fn()
-        mx.eval(out)
+        mx.eval(*fn())
     return (time.perf_counter() - start) / iters * 1e3  # ms
 
 
@@ -116,7 +120,12 @@ def main() -> None:
             output_dtype=DTYPE,
             threadgroup_dv=4,
         )
-        ms = bench(lambda req=req: kernels.try_recurrent_decode(req))
+        ms = bench(
+            lambda req=req, cache=cache: (
+                kernels.try_recurrent_decode(req),
+                cache.pending_recurrent_states[0],
+            )
+        )
         print(
             f"decode kernel  B={num_requests:<2} T=1      : {ms:7.3f} ms "
             f"({ms / num_requests:.3f} ms/req)"
@@ -151,7 +160,12 @@ def main() -> None:
                 compute_dtype=DTYPE,
                 defer_state_scatter=True,
             )
-            ms = bench(lambda req=req: kernels.try_recurrent_prefill(req))
+            ms = bench(
+                lambda req=req, cache=cache: (
+                    kernels.try_recurrent_prefill(req),
+                    cache.pending_recurrent_states[0],
+                )
+            )
             print(
                 f"scan kernel    B={num_reqs} segT={t}    : {ms:7.3f} ms ({total} tok)"
             )

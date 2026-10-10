@@ -46,7 +46,8 @@ linear-attention hybrids) as of this change:
   pre-span state (see `vllm_metal/attention/impls/gdn_spec.py`). A full
   acceptance keeps the staged update at zero extra cost.
 - Hybrid verification requires the lazy GDN kernels
-  (`VLLM_METAL_GDN_LAZY_KERNELS`, on by default).
+  (`VLLM_METAL_GDN_LAZY_KERNELS`, on by default); disabling them is rejected
+  at startup.
 - With align-mode prefix caching, per-request drafts are capped at the
   state-block boundary so prefix checkpoints stay exact; the cap costs a few
   percent of average draft depth.
@@ -60,7 +61,9 @@ linear-attention hybrids) as of this change:
   workload shape before enabling.
 
 Draft-model and MTP methods on hybrid targets remain unsupported until their
-proposers honor the same state staging.
+proposers honor the same state staging. Unsupported hybrid speculative
+pairings — a non-ngram method, or a non-GDN hybrid state family (mamba2, KDA,
+shortconv) — are rejected at startup, not at the first verification.
 
 ## Gemma4 MTP
 

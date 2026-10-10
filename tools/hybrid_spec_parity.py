@@ -74,6 +74,15 @@ def build_cases(tok, block_size: int):
         singles.append((f"div_{i}", ids_a[:mid_len] + sids))
         singles.append((f"div_b_{i}", ids_b[:mid_len] + sids))
 
+    # Boundary probes for the align-arm draft cap: the prompt ends 2 tokens
+    # before a state-block boundary, so the first post-prefill verify span is
+    # trimmed by the cap (a one-row crossing would leave the crossed block's
+    # checkpoint shallow); the block-aligned re-ask then forces a prefix hit
+    # that restores exactly that checkpoint, so a corrupted depth diverges.
+    if 2 * block_size + 48 <= 2048 and len(ids_a) > 2 * block_size:
+        singles.append(("edge_tail", ids_a[: 2 * block_size - 2]))
+        singles.append(("edge_restore", ids_a[: 2 * block_size]))
+
     batch = [
         (f"batch_{i}", ids_a[:short_len] + sids)
         for i, sids in enumerate(
@@ -120,6 +129,11 @@ def run_child(model, enable_spec, prefix_caching, queue):
             "enable_prefix_caching": prefix_caching,
             "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
             "max_num_batched_tokens": 2048,
+            # Pin the block size: the platform otherwise resolves it to
+            # different values with speculation on vs off, and every
+            # block-size-derived prompt below (the boundary probes in
+            # particular) must be token-identical across arms.
+            "block_size": 160,
         }
         if enable_spec:
             kwargs["speculative_config"] = {

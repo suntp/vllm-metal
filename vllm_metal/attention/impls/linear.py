@@ -185,7 +185,6 @@ class GDNPagedAttentionWrapper(nn.Module):
             stash = GDNSpecVerifyStep()
             state_cache.spec_verify_stash = stash
         stash_spec_verify_layer(
-            state_cache,
             stash,
             cache_idx=self._gdn_cache_idx,
             slot_ids=state.slot_ids,
@@ -195,6 +194,7 @@ class GDNPagedAttentionWrapper(nn.Module):
                 for i in range(state.num_requests)
             ),
             compute_dtype=self._recurrent_prefill_compute_dtype(),
+            decode_threadgroup_dv=self._recurrent_decode_threadgroup_dv(),
             q=q,
             k=k,
             v=v,

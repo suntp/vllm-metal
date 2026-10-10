@@ -41,6 +41,7 @@ class GDNSpecVerifyStash:
     cu_seqlens: list[int]
     span_lengths: tuple[int, ...]
     compute_dtype: mx.Dtype | None
+    decode_threadgroup_dv: int
     q: mx.array
     k: mx.array
     v: mx.array
@@ -59,13 +60,7 @@ class GDNSpecVerifyStep:
         return bool(self.layers)
 
 
-def clear_spec_verify_stash(state_cache: PagedStateCache) -> None:
-    """Drop any stashed verify activations (start of step, or after use)."""
-    state_cache.spec_verify_stash = None
-
-
 def stash_spec_verify_layer(
-    state_cache: PagedStateCache,
     stash: GDNSpecVerifyStep,
     *,
     cache_idx: int,
@@ -73,6 +68,7 @@ def stash_spec_verify_layer(
     cu_seqlens: list[int],
     span_lengths: tuple[int, ...],
     compute_dtype: mx.Dtype | None,
+    decode_threadgroup_dv: int,
     q: mx.array,
     k: mx.array,
     v: mx.array,
@@ -87,6 +83,7 @@ def stash_spec_verify_layer(
             cu_seqlens=list(cu_seqlens),
             span_lengths=tuple(span_lengths),
             compute_dtype=compute_dtype,
+            decode_threadgroup_dv=decode_threadgroup_dv,
             q=q,
             k=k,
             v=v,
@@ -197,6 +194,7 @@ def _rescan_layer_to_accepted(
             cache_idx=layer_stash.cache_idx,
             slot_ids=layer_stash.slot_ids,
             output_dtype=layer_stash.q.dtype,
+            threadgroup_dv=layer_stash.decode_threadgroup_dv,
         )
         rescan = lazy.try_recurrent_decode(request)
     if rescan is None:
