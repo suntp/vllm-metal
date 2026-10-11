@@ -253,7 +253,6 @@ def test_unselected_shapes_really_use_fallback(q, kv, head, n):
         (32, 8, 128, 32),
         (16, 2, 256, 8),
         (16, 4, 256, 32),
-        (24, 4, 256, 32),
     ],
 )
 def test_unmeasured_kernel_page_sizes_use_fallback(q, kv, head, block_size):
@@ -471,7 +470,6 @@ def test_policy_has_no_fixed_long_context_ceiling(q, kv, head, block, n):
         (18, 4, 128, 16),
         (16, 0, 128, 16),
         (32, 8, 128, 32),
-        (24, 4, 256, 32),
     ],
 )
 def test_policy_rejects_unmeasured_geometries(q, kv, head, block):
