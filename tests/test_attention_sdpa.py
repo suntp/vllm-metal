@@ -69,6 +69,13 @@ def _clear_attention_context() -> Iterator[None]:
     clear_context()
 
 
+@pytest.fixture(autouse=True)
+def _force_paged_prefill_kernel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests capture paged-kernel calls; the contiguous prefill path
+    legitimately bypasses them, so pin it off."""
+    monkeypatch.setenv("VLLM_METAL_SDPA_CONTIGUOUS_PREFILL", "0")
+
+
 class _FakeLinear:
     """Minimal linear-like callable with a ``.weight`` attribute.
 
@@ -1817,3 +1824,111 @@ class TestPhiAttention:
         assert captured["scale"] == pytest.approx(head_dim**-0.5)
         # The output ran through PhiAttention.dense, not a missing o_proj.
         assert out is not None
+
+
+class TestContiguousPrefillPath:
+    """Routing and numerics for the contiguous flash-SDPA prefill read path."""
+
+    _NH = 2
+    _NKH = 2
+    _HD = 64
+    _HIDDEN = _NH * _HD
+    _SEQ = 64
+    _BS = 8
+    _NB = _SEQ // _BS
+
+    def _inner(self) -> SimpleNamespace:
+        def w(rows: int) -> mx.array:
+            return mx.random.normal((rows, self._HIDDEN)) * 0.05
+
+        return SimpleNamespace(
+            n_heads=self._NH,
+            n_kv_heads=self._NKH,
+            scale=self._HD**-0.5,
+            q_proj=_FakeLinear(w(self._NH * self._HD)),
+            k_proj=_FakeLinear(w(self._NKH * self._HD)),
+            v_proj=_FakeLinear(w(self._NKH * self._HD)),
+            rope=_identity_rope,
+            o_proj=lambda t: t,
+        )
+
+    def _ctx(self) -> PagedAttentionContext:
+        return PagedAttentionContext(
+            slot_mapping=list(range(self._SEQ)),
+            block_tables=[list(range(self._NB))],
+            context_lens=[self._SEQ],
+            offsets=[],
+            cu_seqlens=[0, self._SEQ],
+        )
+
+    def _cache(self) -> MetalPagedKVCache:
+        return MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=self._NKH,
+            head_dim=self._HD,
+            num_blocks=self._NB,
+            block_size=self._BS,
+            dtype=mx.float16,
+        )
+
+    def _fake_ops(self, calls: list) -> type:
+        class _FakeOps(_PagedOpsCapsOff):
+            def reshape_and_cache(self, _k, _v, key_cache, value_cache, _sm):
+                return key_cache, value_cache
+
+            def paged_attention_primitive(self, *args, **kwargs) -> None:
+                calls.append(args)
+
+        return _FakeOps
+
+    def test_eligible_prefill_skips_paged_kernel(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_SDPA_CONTIGUOUS_PREFILL", "1")
+        monkeypatch.setattr(sdpa_mod, "_MIN_FAST_PATH_FLOPS", 0.0)
+        calls: list = []
+        x = mx.random.normal((1, self._SEQ, self._HIDDEN))
+        with patch.object(
+            sdpa_mod, "get_ops", return_value=self._fake_ops(calls)()
+        ):
+            out, _ = sdpa_forward(
+                self._inner(), x, self._ctx(), self._cache(), layer_idx=0
+            )
+        mx.eval(out)
+        assert out.shape == (1, self._SEQ, self._HIDDEN)
+        assert not calls
+
+    def test_flops_floor_falls_back_to_paged_kernel(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_SDPA_CONTIGUOUS_PREFILL", "1")
+        monkeypatch.setattr(
+            sdpa_mod, "_MIN_FAST_PATH_FLOPS", float("inf")
+        )
+        calls: list = []
+        x = mx.random.normal((1, self._SEQ, self._HIDDEN))
+        with (
+            patch.object(sdpa_mod, "get_ops", return_value=self._fake_ops(calls)()),
+            patch.object(
+                sdpa_mod,
+                "truncate_padded_output",
+                return_value=mx.zeros((1, self._SEQ, self._HIDDEN)),
+            ),
+        ):
+            sdpa_forward(self._inner(), x, self._ctx(), self._cache(), layer_idx=0)
+        assert calls
+
+    def test_matches_paged_kernel_numerically(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        inner = self._inner()
+        x = mx.random.normal((1, self._SEQ, self._HIDDEN))
+        cache = self._cache()
+        monkeypatch.setenv("VLLM_METAL_SDPA_CONTIGUOUS_PREFILL", "0")
+        out_paged, _ = sdpa_forward(inner, x, self._ctx(), cache, layer_idx=0)
+        mx.eval(out_paged)
+        monkeypatch.setenv("VLLM_METAL_SDPA_CONTIGUOUS_PREFILL", "1")
+        monkeypatch.setattr(sdpa_mod, "_MIN_FAST_PATH_FLOPS", 0.0)
+        out_contig, _ = sdpa_forward(inner, x, self._ctx(), cache, layer_idx=0)
+        mx.eval(out_contig)
+        assert mx.allclose(out_paged, out_contig, atol=2e-2, rtol=2e-2)

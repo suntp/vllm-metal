@@ -31,6 +31,7 @@ All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -541,6 +542,117 @@ def _float32_sinks(inner: nn.Module) -> mx.array | None:
     return cached[1]
 
 
+_ENV_CONTIGUOUS_PREFILL = "VLLM_METAL_SDPA_CONTIGUOUS_PREFILL"
+
+
+def _contiguous_prefill_enabled() -> bool:
+    """Read per call so one process can A/B the switch."""
+    return os.environ.get(_ENV_CONTIGUOUS_PREFILL, "0") == "1"
+
+
+# Per-request causal-effective attention FLOPs below which the contiguous
+# path's fixed costs (gather, transposes, per-request loop) outweigh the
+# kernel win.  Calibrated on M5 Max; see threshold_probe.py.
+_MIN_FAST_PATH_FLOPS = 1.5e10
+
+
+def _mlx_flash_wide_head_ok() -> bool:
+    """MLX < 0.32.2 has no working GQA flash path for head_dim > 128."""
+    try:
+        parts = [
+            int("".join(ch for ch in p if ch.isdigit()))
+            for p in mx.__version__.split(".")[:3]
+        ]
+    except ValueError:
+        return False
+    return tuple(parts) >= (0, 32, 2)
+
+
+def _contiguous_prefill_attention(
+    q_3d: mx.array,
+    k_cache: mx.array,
+    v_cache: mx.array,
+    block_tables: mx.array,
+    seq_lens: mx.array,
+    cu_seqlens: mx.array,
+    block_size: int,
+    num_kv_heads: int,
+    scale: float,
+    sliding_window: int,
+    sinks: mx.array | None,
+    softcap: float,
+    ctx: PagedAttentionContext,
+) -> mx.array | None:
+    """Contiguous flash-SDPA prefill read path, or None to stay paged.
+
+    The K/V cache stays paged; only the attention *read* changes: prefix
+    blocks are gathered into a contiguous buffer (the current chunk's K/V are
+    already contiguous in the cache after the scatter above), and one flash
+    SDPA replaces the paged prefill kernel.  Returns None for anything the
+    flash kernel cannot express: sinks, softcap, sliding window,
+    bidirectional segments, dtype mismatches, and decode or mixed batches.
+    """
+    if not _contiguous_prefill_enabled():
+        return None
+    if (
+        sinks is not None
+        or softcap > 0
+        or sliding_window >= 0
+        or ctx.segment_bidi_ranges is not None
+        or ctx.verify_window_q != 1
+        or ctx.num_decode_requests > 0
+    ):
+        return None
+    if q_3d.dtype not in (mx.bfloat16, mx.float16) or k_cache.dtype != q_3d.dtype:
+        return None
+    total_q, n_heads, head_dim = q_3d.shape
+    num_seqs = seq_lens.shape[0]
+    if total_q <= num_seqs:
+        return None  # decode-shaped batch
+    if head_dim > 128 and not _mlx_flash_wide_head_ok():
+        return None
+
+    lens = seq_lens.tolist()
+    cus = cu_seqlens.tolist()
+    # Gate on per-request causal-effective attention FLOPs.  Measured on M5
+    # Max across (24q/4kv/hd256) and (32q/8kv/hd128): the contiguous path
+    # never loses in-kernel (worst case ~1.0 at ~15 GFLOP); below the floor
+    # the extra per-request work (gather, transpose, Python) dominates.
+    for i in range(num_seqs):
+        lq = cus[i + 1] - cus[i]
+        if lq <= 1:
+            return None  # mixed decode row; leave the batch to the paged path
+        if 4 * n_heads * head_dim * lq * (lens[i] - lq / 2) < _MIN_FAST_PATH_FLOPS:
+            return None
+    # The cache may be viewed at the vLLM block size; the expanded block
+    # tables index kernel blocks in the flat kernel-block view.
+    k_flat = k_cache.reshape(-1, block_size, num_kv_heads, head_dim)
+    v_flat = v_cache.reshape(-1, block_size, num_kv_heads, head_dim)
+    parts = []
+    for i in range(num_seqs):
+        qs, qe = cus[i], cus[i + 1]
+        n_ctx = lens[i]
+        nblk = (n_ctx + block_size - 1) // block_size
+        blk = block_tables[i, :nblk]
+        k_all = k_flat[blk].reshape(nblk * block_size, num_kv_heads, head_dim)[
+            :n_ctx
+        ]
+        v_all = v_flat[blk].reshape(nblk * block_size, num_kv_heads, head_dim)[
+            :n_ctx
+        ]
+        # q rows are the trailing tokens of the request, so the non-square
+        # right-aligned causal mask is the correct prefill semantics.
+        y = mx.fast.scaled_dot_product_attention(
+            q_3d[qs:qe].transpose(1, 0, 2)[None],
+            k_all.transpose(1, 0, 2)[None],
+            v_all.transpose(1, 0, 2)[None],
+            scale=scale,
+            mask="causal",
+        )
+        parts.append(y[0].transpose(1, 0, 2))
+    return parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=0)
+
+
 def sdpa_forward(
     inner: nn.Module,
     x: mx.array,
@@ -803,7 +915,26 @@ def sdpa_forward(
         {} if mm_prefix_ranges is None else {"mm_prefix_ranges": mm_prefix_ranges}
     )
     out = mx.array(0)
-    if kv_cache.turboquant:
+    contig_out = None
+    if not kv_cache.turboquant:
+        contig_out = _contiguous_prefill_attention(
+            q_3d,
+            kernel_k_cache,
+            kernel_v_cache,
+            block_tables,
+            seq_lens,
+            cu_seqlens_q,
+            kernel_block_size,
+            cache_kv_heads,
+            attn_scale,
+            layer_sliding_window,
+            sinks,
+            attn_softcap,
+            ctx,
+        )
+    if contig_out is not None:
+        out = contig_out
+    elif kv_cache.turboquant:
         # Preserve the compressed primitive's layout and rejection contracts
         # for decode, short continuations, verification, sinks and image rows.
         kernel_key_scale = new_key_scale_cache
