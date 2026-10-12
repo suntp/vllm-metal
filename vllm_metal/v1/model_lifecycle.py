@@ -629,6 +629,17 @@ class ModelLifecycle:
                         "GDN requires matching model/cache dtypes or "
                         "--mamba-ssm-cache-dtype float32."
                     )
+                # Verify scans round state only at the span end; low-precision
+                # decode rounds after every token, producing a different state.
+                if (
+                    self._runner.vllm_config.speculative_config is not None
+                    and ssm != torch.float32
+                ):
+                    raise NotImplementedError(
+                        "Speculative decoding on hybrid GDN targets requires "
+                        "float32 recurrent state; pass "
+                        "--mamba-ssm-cache-dtype float32."
+                    )
             self._runner.hybrid_runtime_plan = plan
 
     def _install_runtime_extensions(

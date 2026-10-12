@@ -541,19 +541,25 @@ class MetalModelRunner:
     def merge_verify_windows(self) -> bool:
         """Whether spec-verify windows stay one cu_seqlens segment.
 
-        Window mode is opt-in (VLLM_METAL_SPEC_VERIFY_WINDOW): its win is
-        chip- and shape-dependent, so the default keeps the expanded
-        per-token verify layout, which is the pre-window behavior bit for
-        bit.  Even opted in, it is True only for models the decode
-        kernel's window mode serves: MLA native decode and the GDN
-        pure-decode check admit only one-row segments, and heads past
-        PA_WINDOW_MAX_HEAD_SIZE would leave the decode kernel for the
-        tiled one.  The head bound uses the resolved per-layer maximum:
-        variable-head models widen their full-attention layers past the
-        config head size (head_dim_per_layer), and every layer of the
-        step shares one verify layout.
+        Non-hybrid models opt into window mode with
+        VLLM_METAL_SPEC_VERIFY_WINDOW; unsupported shapes keep the expanded
+        per-token layout. Hybrid GDN speculation requires one segment per
+        request for state rollback, so an unsupported window layout must
+        fail instead. The head bound uses the resolved per-layer maximum,
+        since every layer shares the same verify layout.
         """
-        return self._verify_window_mismatch() is None
+        mismatch = self._verify_window_mismatch()
+        if (
+            mismatch is not None
+            and self.is_hybrid
+            and self.vllm_config.speculative_config is not None
+        ):
+            raise NotImplementedError(
+                "Speculative decoding on hybrid models requires the GDN "
+                f"window layout: {mismatch}. The expanded per-token layout "
+                "cannot preserve per-request recurrent state."
+            )
+        return mismatch is None
 
     def _verify_window_mismatch(self) -> str | None:
         """Why spec-verify windows stay expanded, or ``None`` when they merge."""
@@ -1341,6 +1347,12 @@ class MetalModelRunner:
             logger.warning("Model not loaded, skipping warm-up")
             return
 
+        if (
+            self._paged_attention_runtime is not None
+            and self.vllm_config.speculative_config is not None
+        ):
+            self._log_verify_layout()
+
         logger.info("Warming up model...")
 
         dummy_tokens = mx.array([[1, 2, 3]], dtype=mx.int32)
@@ -1351,18 +1363,15 @@ class MetalModelRunner:
             self._paged_attention_runtime.warm_up()
             if getattr(self._multimodal_adapter, "bidirectional_layer_kinds", None):
                 self._log_image_block_path()
-            if self.vllm_config.speculative_config is not None:
-                self._log_verify_layout()
 
     def _log_verify_layout(self) -> None:
-        """Say at startup which layout spec-verify windows take."""
-        mismatch = self._verify_window_mismatch()
-        if mismatch is None:
+        """Validate and log the startup layout for speculative verification."""
+        if self.merge_verify_windows:
             logger.info("Metal: spec-decode verify uses the window layout")
         else:
             logger.info(
                 "Metal: spec-decode verify uses the expanded per-token layout (%s)",
-                mismatch,
+                self._verify_window_mismatch(),
             )
 
     def _log_image_block_path(self) -> None:
@@ -2001,8 +2010,8 @@ class MetalModelRunner:
         # The verify forward staged each GDN layer's span-final state as a
         # deferred update over the untouched pre-span state. Requests that
         # rejected a draft committed fewer rows than their span, so the staged
-        # state must be re-scanned at the accepted depth. Full-span requests
-        # keep the staged update as-is (the common, zero-cost case).
+        # state must be re-scanned at the accepted depth. If every request
+        # accepts its full span, the staged updates need no re-scan.
         hybrid_runtime = self._paged_attention_runtime
         if isinstance(hybrid_runtime, HybridPagedAttentionRuntime):
             state_cache = hybrid_runtime.state_cache

@@ -2470,8 +2470,7 @@ class TestStartPagedForwardSelectiveLogits:
 class TestMergeVerifyWindows:
     """merge_verify_windows derivation: the runtime decision behind which
     models keep spec-verify windows merged (window mode) vs expanded.
-    Window mode is opt-in, so the flag gates everything; with it set the
-    model-class exclusions still apply."""
+    Non-hybrid models opt in; their model-class exclusions still apply."""
 
     def test_false_by_default_without_opt_in(self) -> None:
         assert make_stub_runner().merge_verify_windows is False
@@ -2576,7 +2575,7 @@ class TestVerifyLayoutLog:
         lines = self._warm_up(monkeypatch, runner)
         assert "Metal: spec-decode verify uses the window layout" in lines
 
-    def test_non_gdn_hybrid_spec_stays_expanded(self, monkeypatch) -> None:
+    def test_non_gdn_hybrid_spec_rejects_before_warm_up(self, monkeypatch) -> None:
         # The forced window layout is a GDN-family capability: other hybrid
         # state families have no span staging to recover per-request slots.
         monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", "0")
@@ -2584,19 +2583,33 @@ class TestVerifyLayoutLog:
             is_hybrid=True,
             hybrid_runtime_plan=make_nemotron_hybrid_plan("M*"),
         )
-        lines = self._warm_up(monkeypatch, runner)
-        assert any(
-            "window mode does not support non-GDN hybrid state families" in line
-            for line in lines
-        )
+        with pytest.raises(
+            NotImplementedError,
+            match="window mode does not support non-GDN hybrid state families",
+        ):
+            self._warm_up(monkeypatch, runner)
+        runner._dummy_forward_outputs.assert_not_called()
+        runner._paged_attention_runtime.warm_up.assert_not_called()
 
-    def test_hybrid_spec_window_respects_head_bound(self, monkeypatch) -> None:
-        # The forced layout must not skip the window kernel's head bound.
-        monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", "0")
+    @pytest.mark.parametrize("window_env", ["0", "1"])
+    @pytest.mark.parametrize(
+        ("config_head_size", "head_dims"),
+        [(512, []), (128, [128, 512])],
+        ids=["config-head-size", "per-layer-head-size"],
+    )
+    def test_hybrid_spec_rejects_unsupported_head_before_warm_up(
+        self, monkeypatch, window_env, config_head_size, head_dims
+    ) -> None:
+        # Expanded rows lose the per-request state mapping; the head bound
+        # must reject the configuration before any warm-up forward runs.
+        monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", window_env)
         runner = make_stub_runner(
             model_config=SimpleNamespace(
-                runner_type="generate", get_head_size=lambda: 512, is_hybrid=True
+                runner_type="generate",
+                get_head_size=lambda: config_head_size,
+                is_hybrid=True,
             ),
+            head_dim_per_layer=head_dims,
             hybrid_runtime_plan=make_gdn_hybrid_plan(
                 2,
                 [1],
@@ -2607,15 +2620,27 @@ class TestVerifyLayoutLog:
                 key_head_dim=64,
             ),
         )
-        lines = self._warm_up(monkeypatch, runner)
-        assert any(
-            "head size 512 exceeds the window mode's 256" in line for line in lines
-        )
+        with pytest.raises(
+            NotImplementedError, match="head size 512 exceeds the window mode's 256"
+        ):
+            self._warm_up(monkeypatch, runner)
+        runner._dummy_forward_outputs.assert_not_called()
+        runner._paged_attention_runtime.warm_up.assert_not_called()
+        with pytest.raises(NotImplementedError, match="requires the GDN window layout"):
+            _ = runner.merge_verify_windows
 
-    def test_no_line_without_speculative_decoding(self, monkeypatch) -> None:
-        lines = self._warm_up(monkeypatch, make_stub_runner(), speculative=False)
+    @pytest.mark.parametrize("is_hybrid", [False, True])
+    def test_no_line_without_speculative_decoding(self, monkeypatch, is_hybrid) -> None:
+        runner = make_stub_runner(
+            model_config=SimpleNamespace(
+                runner_type="generate", get_head_size=lambda: 512, is_hybrid=is_hybrid
+            ),
+        )
+        lines = self._warm_up(monkeypatch, runner, speculative=False)
 
         assert not any("spec-decode verify" in line for line in lines)
+        runner._dummy_forward_outputs.assert_called_once()
+        runner._paged_attention_runtime.warm_up.assert_called_once()
 
 
 class TestHybridDraftCaps:

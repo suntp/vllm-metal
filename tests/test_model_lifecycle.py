@@ -1318,6 +1318,65 @@ class TestResolveModelDims:
                 lifecycle.resolve_model_dims()
             assert runner.hybrid_runtime_plan is None
 
+    @pytest.mark.parametrize(
+        ("model_dtype", "ssm_dtype", "supported"),
+        [
+            (torch.bfloat16, "auto", False),
+            (torch.float16, "auto", False),
+            (torch.bfloat16, "bfloat16", False),
+            (torch.float16, "float16", False),
+            (torch.bfloat16, "float32", True),
+            (torch.float16, "float32", True),
+            (torch.float32, "auto", True),
+        ],
+    )
+    def test_gdn_speculative_decode_requires_float32_recurrent_state(
+        self, model_dtype, ssm_dtype, supported
+    ) -> None:
+        lifecycle, runner = _make_lifecycle(
+            model_args=_GDN_HYBRID_ARGS,
+            model_config=_runner_model_config(is_hybrid=True, dtype=model_dtype),
+        )
+        runner.cache_config.mamba_ssm_cache_dtype = ssm_dtype
+        runner.vllm_config.speculative_config = SimpleNamespace(method="ngram")
+
+        if supported:
+            lifecycle.resolve_model_dims()
+            assert runner.hybrid_runtime_plan.state_dtypes[1] == torch.float32
+        else:
+            with pytest.raises(
+                NotImplementedError, match="--mamba-ssm-cache-dtype float32"
+            ):
+                lifecycle.resolve_model_dims()
+            assert runner.hybrid_runtime_plan is None
+
+    def test_gdn_speculative_decode_accepts_auto_resolved_to_float32(self) -> None:
+        model_cls = SimpleNamespace(
+            get_mamba_state_dtype_from_config=lambda _: (
+                torch.bfloat16,
+                torch.float32,
+            )
+        )
+        registry = SimpleNamespace(
+            resolve_model_cls=lambda *_args, **_kwargs: (model_cls, "override")
+        )
+        lifecycle, runner = _make_lifecycle(
+            model_args=_GDN_HYBRID_ARGS,
+            model_config=_runner_model_config(
+                is_hybrid=True, dtype=torch.bfloat16, registry=registry
+            ),
+        )
+        runner.cache_config.mamba_ssm_cache_dtype = "auto"
+        runner.vllm_config.speculative_config = SimpleNamespace(method="ngram")
+
+        lifecycle.resolve_model_dims()
+
+        assert runner.cache_config.mamba_ssm_cache_dtype == "auto"
+        assert runner.hybrid_runtime_plan.state_dtypes == (
+            torch.bfloat16,
+            torch.float32,
+        )
+
     def test_routing_follows_the_typed_field_not_the_args(self) -> None:
         runner = self._resolve(_GDN_HYBRID_ARGS, is_hybrid=False)
 

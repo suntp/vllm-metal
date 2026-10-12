@@ -9,7 +9,7 @@ acceptance paths (a full-span accept and a partial accept), so the GDN state
 staging/fixup in ``gdn_spec`` is on the tested path, not just configured.
 
 Arm pairs run under both mamba cache modes: ``none`` (per-request state) and
-``align`` (block-checkpointed state with the draft block-boundary cap).
+``align`` (dense block checkpoints with the draft block-boundary cap).
 
 Usage:
     python tools/hybrid_spec_parity.py --model /path/to/Qwen3.5-0.8B
@@ -18,15 +18,18 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import multiprocessing as mp
 import os
 import queue as queue_mod
 import sys
 import time
+from pathlib import Path
 
 MODEL_DEFAULT = os.environ.get("QWEN35_MODEL_PATH", "Qwen/Qwen3.5-0.8B")
 GPU_MEMORY_UTILIZATION = 0.5
 NUM_SPECULATIVE_TOKENS = 3
+SAMPLING_KWARGS = {"temperature": 0, "max_tokens": 48, "ignore_eos": True}
 
 CORPUS_A = (
     "The vLLM Metal backend executes transformer inference on Apple "
@@ -51,7 +54,8 @@ SUFFIXES = (
 
 
 def _child_env() -> None:
-    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    # The spies must run in the same process as the engine.
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
 
 def build_cases(tok, block_size: int):
@@ -74,15 +78,6 @@ def build_cases(tok, block_size: int):
         singles.append((f"div_{i}", ids_a[:mid_len] + sids))
         singles.append((f"div_b_{i}", ids_b[:mid_len] + sids))
 
-    # Boundary probes for the align-arm draft cap: the prompt ends 2 tokens
-    # before a state-block boundary, so the first post-prefill verify span is
-    # trimmed by the cap (a one-row crossing would leave the crossed block's
-    # checkpoint shallow); the block-aligned re-ask then forces a prefix hit
-    # that restores exactly that checkpoint, so a corrupted depth diverges.
-    if 2 * block_size + 48 <= 2048 and len(ids_a) > 2 * block_size:
-        singles.append(("edge_tail", ids_a[: 2 * block_size - 2]))
-        singles.append(("edge_restore", ids_a[: 2 * block_size]))
-
     batch = [
         (f"batch_{i}", ids_a[:short_len] + sids)
         for i, sids in enumerate(
@@ -92,41 +87,98 @@ def build_cases(tok, block_size: int):
     return singles, batch
 
 
-def run_child(model, enable_spec, prefix_caching, queue):
+def build_restore_prompt(prompt, generated, checkpoint):
+    """Leave one uncached token beyond the checkpoint restored by the consumer."""
+    history = prompt + generated
+    if len(history) < checkpoint + 1:
+        raise ValueError("boundary producer did not generate enough tokens")
+    return history[: checkpoint + 1]
+
+
+def run_child(model, enable_spec, prefix_caching, queue, canonical_prompts=None):
     _child_env()
     from vllm import LLM, SamplingParams
 
+    import vllm_metal.v1.ngram_proposer as ng_mod
     import vllm_metal.v1.spec_decode as sd_mod
 
-    # Spy: record (span_len, committed) for every greedy verify round.
-    verify_stats: list[tuple[int, int]] = []
+    active_tag = "initialization"
+    verify_stats: list[dict] = []
     orig = sd_mod.SpeculativeDecodeController.verify_greedy
 
     def spy(self, logits, decode_reqs, decode_segments):
         out = orig(self, logits, decode_reqs, decode_segments)
         for segment, ids in zip(decode_segments, out, strict=True):
-            verify_stats.append((segment.num_query_tokens, len(ids)))
+            verify_stats.append(
+                {
+                    "case": active_tag,
+                    "start": segment.cache_start_pos,
+                    "span": segment.num_query_tokens,
+                    "committed": len(ids),
+                }
+            )
         return out
 
     sd_mod.SpeculativeDecodeController.verify_greedy = spy
     # Reach spy: admissions' num_computed_tokens prove the cached arms really
     # restored a prefix (a genuine hit), not just a config that fell back.
-    admissions: list[int] = []
+    admissions: list[dict] = []
     import vllm_metal.v1.model_runner as mr_mod
 
     orig_hnr = mr_mod.MetalModelRunner._handle_new_requests
 
     def hnr_spy(self, batch, new_reqs, scheduler_output):
-        admissions.extend(req.num_computed_tokens for req in new_reqs)
+        admissions.extend(
+            {"case": active_tag, "computed": req.num_computed_tokens}
+            for req in new_reqs
+        )
         return orig_hnr(self, batch, new_reqs, scheduler_output)
 
     mr_mod.MetalModelRunner._handle_new_requests = hnr_spy
+    orig_propose = ng_mod.NgramProposer.propose
+    orig_lookup = ng_mod.VllmNgramProposer.propose
+    raw_drafts: list[list[int]] = []
+    cap_events: list[dict] = []
+
+    def lookup_spy(self, *args, **kwargs):
+        nonlocal raw_drafts
+        out = orig_lookup(self, *args, **kwargs)
+        raw_drafts = out
+        return out
+
+    def propose_spy(self, ctx):
+        nonlocal raw_drafts
+        raw_drafts = []
+        out = orig_propose(self, ctx)
+        # This probe has exactly one request. Observe the real lookup once;
+        # re-running it would not prove which draft the proposer actually used.
+        if active_tag == "edge_tail" and ctx.draft_caps and raw_drafts:
+            assert len(raw_drafts) == 1 and len(ctx.draft_caps) == 1
+            req_id, cap = next(iter(ctx.draft_caps.items()))
+            final = (
+                dict(zip(out.req_ids, out.draft_token_ids, strict=True)) if out else {}
+            )
+            cap_events.append(
+                {
+                    "start": len(ctx.request_states[req_id].token_ids) - 1,
+                    "raw": len(raw_drafts[0]),
+                    "cap": cap,
+                    "drafts": len(final.get(req_id, [])),
+                }
+            )
+        return out
+
+    ng_mod.VllmNgramProposer.propose = lookup_spy
+    ng_mod.NgramProposer.propose = propose_spy
     try:
         kwargs = {
             "model": model,
             "max_model_len": 2048,
             "max_num_seqs": 4,
             "enable_prefix_caching": prefix_caching,
+            # The boundary probe restores a generated checkpoint, which the
+            # default semantic-only retention policy is allowed to discard.
+            "prefix_cache_retention_interval": None,
             "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
             "max_num_batched_tokens": 2048,
             # Pin the block size: the platform otherwise resolves it to
@@ -145,69 +197,141 @@ def run_child(model, enable_spec, prefix_caching, queue):
         llm = LLM(**kwargs)
 
         tok = llm.get_tokenizer()
-        block_size = llm.llm_engine.vllm_config.cache_config.block_size
+        cache_config = llm.llm_engine.vllm_config.cache_config
+        block_size = cache_config.block_size
         singles, batch = build_cases(tok, block_size)
-        # The reference arm collects top logprobs so the comparison can tell
-        # exact-tie argmax flips (reduction-order noise on tied logits, a
-        # known greedy artifact) apart from genuine state corruption. The
-        # spec arm must not request logprobs: any logprobs request parks the
-        # greedy-only drafter.
-        sp = SamplingParams(temperature=0, max_tokens=48, ignore_eos=True)
-        if not enable_spec:
-            sp = SamplingParams(
-                temperature=0, max_tokens=48, ignore_eos=True, logprobs=5
-            )
+        # Requesting logprobs changes the greedy sampling path and disables
+        # n-gram drafting. Both arms must use these identical settings.
+        sp = SamplingParams(**SAMPLING_KWARGS)
 
         results: dict[str, list[int]] = {}
-        ties: dict[str, dict] = {}
-        for tag, token_ids in singles:
+        prompts: dict[str, list[int]] = {}
+
+        def generate_single(tag, token_ids):
+            nonlocal active_tag
+            active_tag = tag
+            if canonical_prompts is not None:
+                token_ids = canonical_prompts[tag]
+            prompts[tag] = list(token_ids)
             out = llm.generate([{"prompt_token_ids": token_ids}], sp)[0]
             results[tag] = list(out.outputs[0].token_ids)
-            if not enable_spec:
-                ties[tag] = [
-                    {t: v.logprob for t, v in (lp or {}).items()}
-                    for lp in out.outputs[0].logprobs
-                ]
+
+        for tag, token_ids in singles:
+            generate_single(tag, token_ids)
+        if canonical_prompts is not None:
+            batch = [(tag, canonical_prompts[tag]) for tag, _ in batch]
+        active_tag = "batch"
+        prompts.update(batch)
         outs = llm.generate([{"prompt_token_ids": t} for _, t in batch], sp)
         for (tag, _), out in zip(batch, outs, strict=True):
             results[tag] = list(out.outputs[0].token_ids)
-            if not enable_spec:
-                ties[tag] = [
-                    {t: v.logprob for t, v in (lp or {}).items()}
-                    for lp in out.outputs[0].logprobs
-                ]
+
+        # Isolate the producer so an earlier case cannot supply its checkpoint.
+        # Use the resolved block size: the platform may round the requested size.
+        checkpoint = 2 * block_size
+        if checkpoint + 1 + SAMPLING_KWARGS["max_tokens"] > kwargs["max_model_len"]:
+            raise ValueError("resolved block size is too large for the boundary probe")
+        if prefix_caching and not llm.reset_prefix_cache():
+            raise RuntimeError("could not isolate the boundary producer's prefix cache")
+        edge_prompt = tok(CORPUS_A)["input_ids"][: checkpoint - 2]
+        generate_single("edge_tail", edge_prompt)
+        # The reference produces the canonical consumer IDs. The speculative
+        # child reuses them even if its producer diverges, so inputs stay equal.
+        restore_prompt = (
+            canonical_prompts["edge_restore"]
+            if canonical_prompts is not None
+            else build_restore_prompt(
+                prompts["edge_tail"], results["edge_tail"], checkpoint
+            )
+        )
+        generate_single("edge_restore", restore_prompt)
     finally:
         sd_mod.SpeculativeDecodeController.verify_greedy = orig
         mr_mod.MetalModelRunner._handle_new_requests = orig_hnr
+        ng_mod.NgramProposer.propose = orig_propose
+        ng_mod.VllmNgramProposer.propose = orig_lookup
 
     queue.put(
         {
             "tokens": results,
+            "prompts": prompts,
+            "block_size": block_size,
+            "prefix_cache_retention_interval": cache_config.prefix_cache_retention_interval,
+            "sampling": SAMPLING_KWARGS,
             "verify": verify_stats,
-            "ties": ties,
             "admissions": admissions,
+            "caps": cap_events,
         }
     )
 
 
-def _classify_mismatch(ref, spec, ref_ties):
-    """Whether a divergent spec token was an exact-tie alternative.
+def compare_arms(reference, spec, prefix_caching):
+    """Require exact outputs on identical inputs and observed boundary coverage."""
+    errors = []
+    for key in ("prompts", "sampling", "block_size", "prefix_cache_retention_interval"):
+        if reference[key] != spec[key]:
+            errors.append(f"arms differ in {key}")
+    mismatches = {}
+    for tag in sorted(reference["tokens"].keys() | spec["tokens"].keys()):
+        ref_ids, spec_ids = reference["tokens"].get(tag), spec["tokens"].get(tag)
+        if ref_ids != spec_ids:
+            mismatches[tag] = {"ref": ref_ids, "spec": spec_ids}
+    if mismatches:
+        errors.append(f"{len(mismatches)} exact token mismatches")
+    for label, arm in (("reference", reference), ("spec", spec)):
+        if arm["tokens"].keys() != arm["prompts"].keys() or not arm["tokens"]:
+            errors.append(f"{label} has missing case outputs")
+        if any(
+            len(ids) != SAMPLING_KWARGS["max_tokens"] for ids in arm["tokens"].values()
+        ):
+            errors.append(f"{label} has incomplete generation")
 
-    Repetitive corpora produce exact logprob ties; greedy argmax then picks
-    by reduction-order noise, which differs with the speculative-config
-    profiling shapes. A divergence where the spec arm's token ties the
-    reference's choice within 1e-4 is that artifact, not corruption.
-    """
-    for i, (r, s) in enumerate(zip(ref, spec, strict=False)):
-        if r == s:
-            continue
-        step_ties = ref_ties[i] if i < len(ref_ties) else {}
-        chosen = step_ties.get(r)
-        alt = step_ties.get(s)
-        if chosen is not None and alt is not None and abs(chosen - alt) < 1e-4:
-            return "tie"
-        return "real"
-    return "tie" if ref != spec else None
+    verify = spec["verify"]
+    full = sum(v["span"] > 1 and v["committed"] == v["span"] for v in verify)
+    partial = sum(1 < v["committed"] < v["span"] for v in verify)
+    rejected = sum(v["committed"] == 1 and v["span"] > 1 for v in verify)
+    if not full or not (partial + rejected):
+        errors.append("need full acceptance and partial/first-reject verification")
+
+    checkpoint = 2 * reference["block_size"]
+    if prefix_caching:
+        for label, arm in (("reference", reference), ("spec", spec)):
+            cold = [
+                a["computed"] for a in arm["admissions"] if a["case"] == "edge_tail"
+            ]
+            hits = [
+                a["computed"] for a in arm["admissions"] if a["case"] == "edge_restore"
+            ]
+            if cold != [0] or hits != [checkpoint]:
+                errors.append(
+                    f"{label} boundary admissions: producer={cold}, consumer={hits}; "
+                    f"expected [0] and [{checkpoint}]"
+                )
+        if not any(
+            e["start"] == checkpoint - 2 and e["raw"] > e["cap"] == e["drafts"] == 1
+            for e in spec["caps"]
+        ):
+            errors.append("boundary probe did not trim a real draft to one token")
+        if not any(
+            v["case"] == "edge_tail"
+            and v["start"] == checkpoint - 2
+            and v["span"] == v["committed"] == 2
+            for v in verify
+        ):
+            errors.append("boundary probe did not fully accept the capped two-row span")
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "mismatches": mismatches,
+        "cases": len(reference["tokens"]),
+        "block_size": reference["block_size"],
+        "rounds": len(verify),
+        "full": full,
+        "partial": partial,
+        "first_reject": rejected,
+        "committed": sum(v["committed"] for v in verify),
+        "hits": sum(a["computed"] > 0 for a in spec["admissions"]),
+    }
 
 
 def run_pair(model, prefix_caching):
@@ -216,7 +340,14 @@ def run_pair(model, prefix_caching):
     for enable in (False, True):
         queue = ctx.Queue()
         proc = ctx.Process(
-            target=run_child, args=(model, enable, prefix_caching, queue)
+            target=run_child,
+            args=(
+                model,
+                enable,
+                prefix_caching,
+                queue,
+                arms[False]["prompts"] if enable else None,
+            ),
         )
         proc.start()
         try:
@@ -237,77 +368,51 @@ def run_pair(model, prefix_caching):
             proc.join(timeout=60)
             if proc.is_alive():
                 proc.terminate()
+                proc.join(timeout=10)
         if proc.exitcode != 0:
             raise RuntimeError(f"child exited with {proc.exitcode}")
 
-    reference, spec = arms[False]["tokens"], arms[True]["tokens"]
-    ref_ties = arms[False]["ties"]
-    mismatches: dict[str, dict] = {}
-    tie_flips = 0
-    for key in reference:
-        if reference[key] == spec[key]:
-            continue
-        verdict = _classify_mismatch(reference[key], spec[key], ref_ties.get(key, []))
-        if verdict == "tie":
-            tie_flips += 1
-            continue
-        mismatches[key] = {"ref": reference[key], "spec": spec[key]}
-
-    verify = arms[True]["verify"]
-    rounds = len(verify)
-    admissions = arms[True]["admissions"]
-    hits = [n for n in admissions if n > 0]
-    full = sum(1 for span, n in verify if n == span)
-    partial = sum(1 for span, n in verify if 1 < n < span)
-    rejected = sum(1 for span, n in verify if n == 1 and span > 1)
-    drafted_tokens = sum(n for _, n in verify)
-    return (
-        len(reference),
-        mismatches,
-        tie_flips,
-        {
-            "rounds": rounds,
-            "hits": len(hits),
-            "full": full,
-            "partial": partial,
-            "first_reject": rejected,
-            "committed": drafted_tokens,
-        },
-    )
+    return {
+        "summary": compare_arms(arms[False], arms[True], prefix_caching),
+        "reference": arms[False],
+        "spec": arms[True],
+    }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=MODEL_DEFAULT)
+    parser.add_argument(
+        "--output", type=Path, help="Save token IDs and coverage evidence as JSON"
+    )
     args = parser.parse_args()
 
     ok = True
+    reports = {"model": args.model, "modes": {}}
     for prefix_caching in (False, True):
         mode = "align" if prefix_caching else "none"
-        n_cases, mismatches, tie_flips, stats = run_pair(args.model, prefix_caching)
-        full_ok = stats["full"] > 0 and (stats["partial"] + stats["first_reject"]) > 0
-        hit_ok = stats["hits"] > 0 if prefix_caching else True
-        arm_ok = not mismatches and full_ok and stats["rounds"] > 0 and hit_ok
-        ok &= arm_ok
+        report = run_pair(args.model, prefix_caching)
+        reports["modes"][mode] = report
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(json.dumps(reports, indent=2) + "\n")
+        stats = report["summary"]
+        ok &= stats["ok"]
         print(
-            f"[{mode}] cases={n_cases} verify_rounds={stats['rounds']} "
+            f"[{mode}] cases={stats['cases']} block_size={stats['block_size']} "
+            f"verify_rounds={stats['rounds']} "
             f"prefix_hits={stats['hits']} "
             f"full={stats['full']} partial={stats['partial']} "
             f"first_reject={stats['first_reject']} "
             f"committed={stats['committed']} "
-            f"tie_flips={tie_flips} mismatches={len(mismatches)} "
-            f"{'PASS' if arm_ok else 'FAIL'}",
+            f"mismatches={len(stats['mismatches'])} "
+            f"{'PASS' if stats['ok'] else 'FAIL'}",
             flush=True,
         )
-        for key, diff in list(mismatches.items())[:3]:
-            print(f"  mismatch {key}: ref={diff['ref'][:12]} spec={diff['spec'][:12]}")
-        if not full_ok:
-            print(
-                "  acceptance-path coverage missing: need at least one full "
-                "accept and one partial/rejected round"
-            )
-        if not hit_ok:
-            print("  cached arm admitted no prefix restore (no genuine hit)")
+        for error in stats["errors"]:
+            print(f"  {error}")
+        for key, diff in list(stats["mismatches"].items())[:3]:
+            print(f"  mismatch {key}: ref={diff['ref']} spec={diff['spec']}")
     print("PARITY PASS" if ok else "PARITY FAIL")
     return 0 if ok else 1
 

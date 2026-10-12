@@ -7,15 +7,13 @@ request, so every GDN layer's recurrent scan advances the request's state
 span-final state as *pending* instead of scattering it into the stable pool,
 which keeps the pre-forward state (the depth-0 rollback point) intact.
 
-When every scheduled draft for a request is accepted, the span-final state is
-exactly the state after the last committed token: the pending update is
-already correct and nothing runs here. When a request rejects a draft, the
+When every request accepts its scheduled drafts, the pending updates are
+already correct and no re-scan runs. When a request rejects a draft, its
 committed prefix ends ``accepted + 1`` rows into the span, so
-:func:`apply_spec_decode_acceptance` re-scans each GDN layer over truncated
-spans (reading the untouched depth-0 state) and replaces the pending update.
-The truncated re-scan reuses the per-layer projections stashed during the
-verify forward, and the scan kernel's flat cost in span length makes the
-partial-accept path cheap.
+:func:`apply_spec_decode_acceptance` re-scans each GDN layer over the kept
+prefixes of all requests, including any prefill spans, and replaces the
+pending updates. The re-scan reads the untouched depth-0 state and reuses
+the per-layer projections stashed during the verify forward.
 """
 
 from __future__ import annotations
@@ -116,8 +114,8 @@ def apply_spec_decode_acceptance(
     """Rewrite pending GDN state to the accepted depth after verification.
 
     ``committed_rows[i]`` is the number of span rows request ``i`` committed
-    (accepted drafts plus the residual/bonus row). Full-span requests keep the
-    span-final pending state; any partial request forces a truncated re-scan
+    (accepted drafts plus the residual/bonus row). An all-full-span batch keeps
+    its pending state; any partial request forces a re-scan of all requests
     for every layer. Returns whether a re-scan ran.
     """
     stash = state_cache.spec_verify_stash
