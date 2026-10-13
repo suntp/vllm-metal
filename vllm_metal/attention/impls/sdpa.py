@@ -31,14 +31,14 @@ All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
 from __future__ import annotations
 
 import math
-import os
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import mlx.core as mx
 import mlx.nn as nn
 from vllm.logger import init_logger
 
+from vllm_metal import envs
 from vllm_metal.attention.attention_contracts import (
     DEFAULT_ATTENTION_CONTRACT,
     AttentionContract,
@@ -542,30 +542,9 @@ def _float32_sinks(inner: nn.Module) -> mx.array | None:
     return cached[1]
 
 
-_ENV_CONTIGUOUS_PREFILL = "VLLM_METAL_SDPA_CONTIGUOUS_PREFILL"
-
-
-def _contiguous_prefill_enabled() -> bool:
-    """Read per call so one process can A/B the switch."""
-    return os.environ.get(_ENV_CONTIGUOUS_PREFILL, "0") == "1"
-
-
-# Per-request causal-effective attention FLOPs below which the contiguous
-# path's fixed costs (gather, transposes, per-request loop) outweigh the
-# kernel win.  Calibrated on M5 Max; see threshold_probe.py.
+# Conservative per-request floor from M5 Max measurements at D128/D256.
+# This is an admission policy, not a measured crossover for every device.
 _MIN_FAST_PATH_FLOPS = 1.5e10
-
-
-def _mlx_flash_wide_head_ok() -> bool:
-    """MLX < 0.32.2 has no working GQA flash path for head_dim > 128."""
-    try:
-        parts = [
-            int("".join(ch for ch in p if ch.isdigit()))
-            for p in mx.__version__.split(".")[:3]
-        ]
-    except ValueError:
-        return False
-    return tuple(parts) >= (0, 32, 2)
 
 
 def _contiguous_prefill_attention(
@@ -583,16 +562,8 @@ def _contiguous_prefill_attention(
     softcap: float,
     ctx: PagedAttentionContext,
 ) -> mx.array | None:
-    """Contiguous flash-SDPA prefill read path, or None to stay paged.
-
-    The K/V cache stays paged; only the attention *read* changes: prefix
-    blocks are gathered into a contiguous buffer (the current chunk's K/V are
-    already contiguous in the cache after the scatter above), and one flash
-    SDPA replaces the paged prefill kernel.  Returns None for anything the
-    flash kernel cannot express: sinks, softcap, sliding window,
-    bidirectional segments, dtype mismatches, and decode or mixed batches.
-    """
-    if not _contiguous_prefill_enabled():
+    """Gather each eligible request's paged K/V for fused causal SDPA."""
+    if not envs.VLLM_METAL_SDPA_CONTIGUOUS_PREFILL or envs.VLLM_METAL_DISABLE_NAX:
         return None
     if (
         sinks is not None
@@ -603,25 +574,31 @@ def _contiguous_prefill_attention(
         or ctx.num_decode_requests > 0
     ):
         return None
-    if q_3d.dtype not in (mx.bfloat16, mx.float16) or k_cache.dtype != q_3d.dtype:
+    if (
+        q_3d.dtype not in (mx.bfloat16, mx.float16)
+        or k_cache.dtype != q_3d.dtype
+        or v_cache.dtype != q_3d.dtype
+    ):
         return None
     total_q, n_heads, head_dim = q_3d.shape
     num_seqs = seq_lens.shape[0]
     if total_q <= num_seqs:
         return None  # decode-shaped batch
-    if head_dim > 128 and not _mlx_flash_wide_head_ok():
+    # MLX 0.32.2's full-attention fused geometries. D192 defaults to the
+    # unfused implementation; D512 has no fused implementation at all.
+    if head_dim not in (64, 72, 80, 96, 128, 256):
+        return None
+    if head_dim == 256 and not get_ops().nax_supported():
         return None
 
-    lens = seq_lens.tolist()
-    cus = cu_seqlens.tolist()
-    # Gate on per-request causal-effective attention FLOPs.  Measured on M5
-    # Max across (24q/4kv/hd256) and (32q/8kv/hd128): the contiguous path
-    # never loses in-kernel (worst case ~1.0 at ~15 GFLOP); below the floor
-    # the extra per-request work (gather, transpose, Python) dominates.
+    lens = cast(list[int], seq_lens.tolist())
+    cus = cast(list[int], cu_seqlens.tolist())
     for i in range(num_seqs):
         lq = cus[i + 1] - cus[i]
-        if lq <= 1:
-            return None  # mixed decode row; leave the batch to the paged path
+        # Stay out of MLX's vector-attention route and its GQA limits.
+        # D256's NAX full-attention policy additionally requires Q >= 1024.
+        if lq <= 8 or (head_dim == 256 and lq < 1024):
+            return None
         if 4 * n_heads * head_dim * lq * (lens[i] - lq / 2) < _MIN_FAST_PATH_FLOPS:
             return None
     # The cache may be viewed at the vLLM block size; the expanded block
@@ -634,12 +611,8 @@ def _contiguous_prefill_attention(
         n_ctx = lens[i]
         nblk = (n_ctx + block_size - 1) // block_size
         blk = block_tables[i, :nblk]
-        k_all = k_flat[blk].reshape(nblk * block_size, num_kv_heads, head_dim)[
-            :n_ctx
-        ]
-        v_all = v_flat[blk].reshape(nblk * block_size, num_kv_heads, head_dim)[
-            :n_ctx
-        ]
+        k_all = k_flat[blk].reshape(nblk * block_size, num_kv_heads, head_dim)[:n_ctx]
+        v_all = v_flat[blk].reshape(nblk * block_size, num_kv_heads, head_dim)[:n_ctx]
         # q rows are the trailing tokens of the request, so the non-square
         # right-aligned causal mask is the correct prefill semantics.
         y = mx.fast.scaled_dot_product_attention(
@@ -648,6 +621,10 @@ def _contiguous_prefill_attention(
             v_all.transpose(1, 0, 2)[None],
             scale=scale,
             mask="causal",
+            # Never silently expand an H x Q x KV score matrix if MLX's
+            # dispatch heuristics change. The gates above keep unsupported
+            # geometries on the paged path.
+            force_fused=True,
         )
         parts.append(y[0].transpose(1, 0, 2))
     return parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=0)
