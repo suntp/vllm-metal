@@ -1164,6 +1164,9 @@ class TestLazyRecurrentPrefill:
             (mx.float16, None, mx.float32, 24, 4),
             (mx.bfloat16, None, mx.bfloat16, 128, 8),
             (mx.bfloat16, mx.float32, mx.float32, 24, 4),
+            pytest.param(
+                mx.bfloat16, mx.float32, mx.float32, 128, 6, id="gqa3-bf16-fp32"
+            ),
         ],
     )
     def test_packed_prefill_matches_generic_with_ragged_strided_state(
@@ -1239,15 +1242,22 @@ class TestLazyRecurrentPrefill:
             rtol = {mx.float32: 2e-5, mx.float16: 1e-3, mx.bfloat16: 1e-2}[result_dtype]
             np.testing.assert_allclose(packed, generic, rtol=rtol, atol=2e-6)
 
+    @pytest.mark.parametrize(
+        ("n_hk", "n_hv", "d_v"),
+        [(1, 2, 24), pytest.param(2, 6, 128, id="gqa3-fp32")],
+    )
     def test_packed_prefill_continuation_and_deferred_decode_match_full_sequence(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        n_hk: int,
+        n_hv: int,
+        d_v: int,
     ) -> None:
         """Reordered prefill publishes prior updates; decode consumes compact state."""
         _require_metal()
         mx.random.seed(8)
-        d_k, d_v, n_hv = 128, 24, 2
-        q, k = [mx.random.normal((1, 12, 1, d_k)) for _ in range(2)]
+        d_k = 128
+        q, k = [mx.random.normal((1, 12, n_hk, d_k)) for _ in range(2)]
         q = q / mx.linalg.norm(q, axis=-1, keepdims=True) / d_k**0.5
         k = k / mx.linalg.norm(k, axis=-1, keepdims=True)
         v = mx.random.normal((1, 12, n_hv, d_v)) * 0.1
@@ -1667,21 +1677,35 @@ class TestLazyRecurrentPrefill:
         assert fake_kernel.output_dtypes == [mx.float32, mx.float32]
 
     @pytest.mark.parametrize(
-        ("d_k", "d_v", "cu_seqlens"),
-        [(32, 4, [0, 2, 5]), (32, 4, [0, 1, 3]), (128, 24, [0, 1, 4])],
+        ("d_k", "d_v", "n_hk", "n_hv", "cu_seqlens"),
+        [
+            (32, 4, 1, 1, [0, 2, 5]),
+            (32, 4, 1, 1, [0, 1, 3]),
+            (128, 24, 1, 1, [0, 1, 4]),
+            pytest.param(128, 128, 2, 6, [0, 1, 4], id="gqa3-fp32"),
+        ],
     )
     def test_matches_cpp_recurrent_path_for_prefill(
-        self, d_k: int, d_v: int, cu_seqlens: list[int]
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        d_k: int,
+        d_v: int,
+        n_hk: int,
+        n_hv: int,
+        cu_seqlens: list[int],
     ) -> None:
         # Arrange
         _require_metal()
+        monkeypatch.setenv("VLLM_METAL_PACKED_GDN_PREFILL", "1")
         mx.random.seed(2)
         total_tokens = cu_seqlens[-1]
-        n_hk = 1
-        n_hv = 1
         slot_ids = [1, 0]
-        cache_lazy = _make_state_cache(value_head_dim=d_v, key_head_dim=d_k)
-        cache_cpp = _make_state_cache(value_head_dim=d_v, key_head_dim=d_k)
+        cache_lazy = _make_state_cache(
+            num_v_heads=n_hv, value_head_dim=d_v, key_head_dim=d_k
+        )
+        cache_cpp = _make_state_cache(
+            num_v_heads=n_hv, value_head_dim=d_v, key_head_dim=d_k
+        )
         initial_state = np.array(mx.random.normal(cache_lazy.recurrent_states[0].shape))
         cache_lazy.recurrent_states[0] = mx.array(initial_state)
         cache_cpp.recurrent_states[0] = mx.array(initial_state)
