@@ -2099,6 +2099,7 @@ class TestContiguousPrefillPath:
         [
             pytest.param(64, 32, ((17, 67), (33, 95)), id="prefix-small-pages"),
             pytest.param(128, 544, ((35, 559), (17, 97)), id="chunk-large-pages"),
+            pytest.param(256, 784, ((1024, 1573), (1568, 2387)), id="nax-d256-prefix"),
         ],
     )
     def test_upstream_gqa_prefix_matches_independent_causal_reference(
@@ -2110,6 +2111,8 @@ class TestContiguousPrefillPath:
         request_lengths: tuple[tuple[int, int], ...],
     ) -> None:
         """Keep prefixes, page translation, tail masking and row order observable."""
+        if head_dim == 256 and not sdpa_mod.get_ops().nax_supported():
+            pytest.skip("D256 fused prefill requires NAX hardware")
         mx.random.seed(11)
         monkeypatch.setattr(sdpa_mod, "_MIN_FAST_PATH_FLOPS", 0.0)
         n_heads, n_kv_heads = 8, 2
