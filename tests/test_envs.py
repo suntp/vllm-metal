@@ -103,6 +103,8 @@ def test_a_bad_value_names_the_variable_and_the_value(
         # Boolean switches: "1" on, anything else off (documented contract).
         ("VLLM_METAL_DECODE_PIPELINE", "1", True),
         ("VLLM_METAL_DECODE_PIPELINE", "0", False),
+        ("VLLM_METAL_PACKED_GDN_PREFILL", "1", True),
+        ("VLLM_METAL_PACKED_GDN_PREFILL", "0", False),
         ("VLLM_METAL_MLA_KERNEL", "1", True),
         ("VLLM_METAL_BUILD_FROM_SOURCE", "yes", False),
     ],
@@ -119,6 +121,7 @@ def test_a_good_value_parses(
     ("name", "expected"),
     [
         ("VLLM_METAL_GDN_LAZY_KERNELS", True),
+        ("VLLM_METAL_PACKED_GDN_PREFILL", True),
         ("VLLM_METAL_DECODE_PIPELINE", True),
         ("VLLM_METAL_COMPILED_MLP", False),
         ("VLLM_METAL_NATIVE_SAMPLING", False),

@@ -17,9 +17,17 @@ _GDN_CONV1D_V2_SOURCE = _read_v2_metal_source("gdn_conv1d_silu_decode.metal")
 _GDN_CONV1D_PREFILL_V2_SOURCE = _read_v2_metal_source("gdn_conv1d_silu_prefill.metal")
 _GDN_RECURRENT_DECODE_V2_SOURCE = _read_v2_metal_source("gdn_recurrent_decode.metal")
 _GDN_RECURRENT_PREFILL_V2_SOURCE = _read_v2_metal_source("gdn_recurrent_prefill.metal")
+_GDN_RECURRENT_PREFILL_PACKED_V2_SOURCE = _read_v2_metal_source(
+    "gdn_recurrent_prefill_packed.metal"
+)
 _RECURRENT_SIMDGROUP_WIDTH = 32
 _RECURRENT_MAX_KEY_HEAD_DIM = 256
 _RECURRENT_PREFILL_THREADGROUP_DV = 4
+_RECURRENT_PREFILL_PACKED_THREADGROUP_DV = 2
+# The packed prefill kernel gives each lane Dk/4 state elements and packs
+# 32/4 value rows per SIMD-group, so it needs Dk == 128 and Dv % 8 == 0.
+_RECURRENT_PREFILL_PACKED_KEY_HEAD_DIM = 128
+_RECURRENT_PREFILL_PACKED_ROWS_PER_SIMDGROUP = 8
 
 
 @dataclass(frozen=True)
@@ -97,6 +105,7 @@ class GDNLazyKernels:
         conv_prefill_kernel: Any | None = None,
         recurrent_decode_kernel: Any | None = None,
         recurrent_prefill_kernel: Any | None = None,
+        recurrent_prefill_packed_kernel: Any | None = None,
     ) -> None:
         self._enabled = enabled
         if not enabled:
@@ -104,6 +113,7 @@ class GDNLazyKernels:
             self._conv_prefill_kernel = None
             self._recurrent_decode_kernel = None
             self._recurrent_prefill_kernel = None
+            self._recurrent_prefill_packed_kernel = None
             return
 
         self._conv_kernel = (
@@ -171,6 +181,26 @@ class GDNLazyKernels:
                 ],
                 ["y", "state_out"],
                 _GDN_RECURRENT_PREFILL_V2_SOURCE,
+            )
+        )
+        self._recurrent_prefill_packed_kernel = (
+            recurrent_prefill_packed_kernel
+            if recurrent_prefill_packed_kernel is not None
+            else self._make_kernel(
+                "gdn_recurrent_prefill_packed_v2",
+                [
+                    "q",
+                    "k",
+                    "v",
+                    "g",
+                    "beta",
+                    "state_in",
+                    "cu_seqlens",
+                    "slot_mapping",
+                    "num_requests",
+                ],
+                ["y", "state_out"],
+                _GDN_RECURRENT_PREFILL_PACKED_V2_SOURCE,
             )
         )
 
@@ -489,15 +519,37 @@ class GDNLazyKernels:
             ("Hk", n_hk),
             ("Hv", n_hv),
         ]
-        y_out, state_updates = self._recurrent_prefill_kernel(
-            inputs=kernel_inputs,
-            template=template,
-            grid=(_RECURRENT_SIMDGROUP_WIDTH, d_v, num_requests * n_hv),
-            threadgroup=(
+        use_packed_prefill = (
+            self._recurrent_prefill_packed_kernel is not None
+            and d_k == _RECURRENT_PREFILL_PACKED_KEY_HEAD_DIM
+            and d_v % _RECURRENT_PREFILL_PACKED_ROWS_PER_SIMDGROUP == 0
+            and envs.VLLM_METAL_PACKED_GDN_PREFILL
+        )
+        if use_packed_prefill:
+            prefill_kernel = self._recurrent_prefill_packed_kernel
+            grid = (
+                _RECURRENT_SIMDGROUP_WIDTH,
+                d_v // _RECURRENT_PREFILL_PACKED_ROWS_PER_SIMDGROUP,
+                num_requests * n_hv,
+            )
+            threadgroup = (
+                _RECURRENT_SIMDGROUP_WIDTH,
+                _RECURRENT_PREFILL_PACKED_THREADGROUP_DV,
+                1,
+            )
+        else:
+            prefill_kernel = self._recurrent_prefill_kernel
+            grid = (_RECURRENT_SIMDGROUP_WIDTH, d_v, num_requests * n_hv)
+            threadgroup = (
                 _RECURRENT_SIMDGROUP_WIDTH,
                 _RECURRENT_PREFILL_THREADGROUP_DV,
                 1,
-            ),
+            )
+        y_out, state_updates = prefill_kernel(
+            inputs=kernel_inputs,
+            template=template,
+            grid=grid,
+            threadgroup=threadgroup,
             output_shapes=[(total_tokens, n_hv, d_v), (num_requests, n_hv, d_v, d_k)],
             output_dtypes=[kernel_dtype, state_dtype],
         )
