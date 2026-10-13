@@ -292,8 +292,10 @@ class GDNPagedAttentionWrapper(nn.Module):
         self, a: mx.array, b: mx.array, state: _GDNForwardState
     ) -> tuple[mx.array, mx.array]:
         # === Step 4: Gating (stateless) ===
-        # compute_g returns float32; cast to match kernel dispatch dtype.
-        g = compute_g(self._inner.A_log, a, self._inner.dt_bias).astype(state.x.dtype)
+        # A half-precision decay can round to 1 even with an FP32 state.
+        recurrent = self._gdn_state_cache.recurrent_states[self._gdn_cache_idx]
+        gate_dtype = mx.result_type(state.x, recurrent)
+        g = compute_g(self._inner.A_log, a, self._inner.dt_bias).astype(gate_dtype)
         beta = mx.sigmoid(b).astype(state.x.dtype)
         return g, beta
 
