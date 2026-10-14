@@ -292,7 +292,9 @@ class GDNPagedAttentionWrapper(nn.Module):
         self, a: mx.array, b: mx.array, state: _GDNForwardState
     ) -> tuple[mx.array, mx.array]:
         # === Step 4: Gating (stateless) ===
-        # A half-precision decay can round to 1 even with an FP32 state.
+        # g uses the promoted dtype of the activation and the recurrent state, so
+        # an FP32 state never receives a decay rounded to 1 in half precision.
+        # beta keeps the activation dtype.
         recurrent = self._gdn_state_cache.recurrent_states[self._gdn_cache_idx]
         gate_dtype = mx.result_type(state.x, recurrent)
         g = compute_g(self._inner.A_log, a, self._inner.dt_bias).astype(gate_dtype)
