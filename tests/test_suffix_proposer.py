@@ -6,8 +6,10 @@ runs entirely off an InputBatch-shaped stub, so most tests drive
 ``propose`` against a recording fake of that upstream class (no
 ``arctic_inference`` install needed) and lock in the marshalling: stub
 fields, per-request deltas, non-drafting rows kept alive, preemption
-rollback, cap trimming, and bookkeeping lifecycle. One integration test
-exercises the real arctic suffix tree when the package is importable.
+rollback, width/cap/length trimming, prefill rows, and bookkeeping
+lifecycle. ``TestSuffixRealTree`` exercises the real arctic suffix tree
+(lifecycle across preemption and finish, verify-span round trip) when
+the package is importable.
 """
 
 from __future__ import annotations
@@ -28,11 +30,14 @@ from vllm_metal.v1.suffix_proposer import SuffixProposer
 class _FakeVllmSuffix:
     """Records upstream-facing calls; drafts mirror the fed deltas."""
 
-    def __init__(self) -> None:
+    def __init__(self, num_speculative_tokens: int = 3) -> None:
+        self.num_speculative_tokens = num_speculative_tokens
         self.calls: list[tuple[int, object, list[list[int]]]] = []
         self.extra_draft: dict[int, list[int]] = {}
 
     def propose(self, num_speculative_tokens, input_batch, sampled_token_ids):
+        # Upstream asserts the configured width.
+        assert num_speculative_tokens == self.num_speculative_tokens
         self.calls.append(
             (num_speculative_tokens, input_batch, [list(s) for s in sampled_token_ids])
         )
@@ -56,6 +61,29 @@ def _request_state(
         prompt_len=prompt_len,
         sampling_params=SamplingParams(temperature=temperature),
         generated_tokens=1,
+        block_ids=[[0]],
+    )
+
+
+def _real_proposer(*, num_speculative_tokens: int = 4) -> SuffixProposer:
+    pytest.importorskip(
+        "arctic_inference.suffix_decoding", reason="arctic_inference not installed"
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="suffix",
+            num_speculative_tokens=num_speculative_tokens,
+            suffix_decoding_max_tree_depth=24,
+            suffix_decoding_max_spec_factor=1.0,
+            suffix_decoding_min_token_prob=0.0,
+            suffix_decoding_max_cached_requests=10000,
+        ),
+        model_config=SimpleNamespace(max_model_len=512),
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1),
+    )
+    return SuffixProposer.build(
+        vllm_config=vllm_config, controller=SpeculativeDecodeController()
     )
 
 
@@ -75,6 +103,7 @@ def _proposer(
         scheduler_config=SimpleNamespace(max_num_seqs=4),
         parallel_config=SimpleNamespace(tensor_parallel_size=1),
     )
+    fake.num_speculative_tokens = num_speculative_tokens
     with patch.object(suffix_mod, "_build_vllm_suffix", return_value=fake):
         return SuffixProposer.build(
             vllm_config=vllm_config,
@@ -126,8 +155,9 @@ class TestSuffixMarshalling:
         )
 
         _, stub, sampled = fake.calls[0]
-        # Both live requests are rows (keeps the sampled request's tree from
-        # being archived), but only the greedy row carries a delta.
+        # Both scheduled requests are rows (upstream archives any active
+        # tree missing from the batch), but only the greedy row carries a
+        # delta; the sampled row never starts a tree.
         assert stub.req_ids == ["greedy", "sampled"]
         assert sampled == [[3, 4], []]
         assert drafts is not None
@@ -140,8 +170,9 @@ class TestSuffixMarshalling:
         state0 = _request_state([1, 2, 3, 4, 5, 6], prompt_len=2)
         proposer.propose(_context(decode_reqs=[("r0", state0)]))
 
-        # Preempted and recomputed shorter than what was already fed: the
-        # anchor resets and the delta is empty rather than negative.
+        # Recomputed shorter than what was already fed (without a release
+        # in between): the anchor resets and the delta is empty rather than
+        # negative.
         state1 = _request_state([1, 2, 3, 4], prompt_len=2)
         drafts = proposer.propose(_context(decode_reqs=[("r0", state1)]))
         _, _, sampled = fake.calls[1]
@@ -234,3 +265,174 @@ class TestSuffixRealTree:
         # A request whose suffix never appeared drafts nothing.
         fresh = _request_state([31, 32, 33, 34], prompt_len=2)
         assert proposer.propose(_context(decode_reqs=[("r1", fresh)])) is None
+
+
+class TestSuffixBatchShape:
+    def test_prefill_rows_are_in_the_stub_and_final_chunk_drafts(self) -> None:
+        fake = _FakeVllmSuffix()
+        proposer = _proposer(fake)
+        decoding = _request_state([1, 2, 3, 4], prompt_len=2)
+        final = _request_state([7, 8, 9, 10, 11], prompt_len=4)
+        chunk = _request_state([20, 21, 22], prompt_len=6)
+        prefills = [
+            SimpleNamespace(req_id="final", start_pos=0, token_ids=[7, 8, 9, 10]),
+            SimpleNamespace(req_id="chunk", start_pos=0, token_ids=[20, 21, 22]),
+        ]
+
+        drafts = proposer.propose(
+            _context(
+                decode_reqs=[("dec", decoding)],
+                prefill_reqs=prefills,
+                prefill_result_modes=["new_final", "intermediate"],
+                request_states={"dec": decoding, "final": final, "chunk": chunk},
+            )
+        )
+
+        _, stub, sampled = fake.calls[0]
+        assert stub.req_ids == ["dec", "final", "chunk"]
+        # The final chunk feeds its first sampled token; the intermediate
+        # chunk is present (keeps any live tree) with no delta.
+        assert sampled == [[3, 4], [11], []]
+        assert drafts is not None
+        assert drafts.req_ids == ["dec", "final"]
+
+    def test_scheduled_width_below_configured_truncates(self) -> None:
+        fake = _FakeVllmSuffix()
+        fake.extra_draft = {0: [1, 2, 3, 4]}
+        proposer = _proposer(fake, num_speculative_tokens=4)
+        state = _request_state([1, 2, 3, 4, 5], prompt_len=2)
+
+        drafts = proposer.propose(
+            _context(decode_reqs=[("r0", state)], num_speculative_tokens=2)
+        )
+
+        assert fake.calls[0][0] == 4  # configured width to upstream
+        assert drafts is not None
+        assert drafts.draft_token_ids == [[1, 2]]
+
+    def test_remaining_output_tokens_bound_the_draft(self) -> None:
+        fake = _FakeVllmSuffix()
+        fake.extra_draft = {0: [1, 2, 3]}
+        proposer = _proposer(fake)
+        state = _request_state([1, 2, 3, 4, 5], prompt_len=2)
+        state.sampling_params = SamplingParams(temperature=0.0, max_tokens=4)
+        state.generated_tokens = 2
+
+        drafts = proposer.propose(_context(decode_reqs=[("r0", state)]))
+        assert drafts is not None
+        assert drafts.draft_token_ids == [[1]]
+
+        state.generated_tokens = 3
+        assert proposer.propose(_context(decode_reqs=[("r0", state)])) is None
+
+    def test_absent_request_is_refed_from_the_prompt(self) -> None:
+        fake = _FakeVllmSuffix()
+        proposer = _proposer(fake)
+        other = _request_state([9, 9, 9], prompt_len=1)
+        state = _request_state([1, 2, 3, 4, 5], prompt_len=2)
+        proposer.propose(_context(decode_reqs=[("r0", state), ("o", other)]))
+        # r0 missing for a step: upstream archives its tree.
+        proposer.propose(_context(decode_reqs=[("o", other)]))
+        assert "r0" not in proposer._last_len
+
+        state = _request_state([1, 2, 3, 4, 5, 6], prompt_len=2)
+        proposer.propose(_context(decode_reqs=[("r0", state), ("o", other)]))
+        assert fake.calls[-1][2][0] == [3, 4, 5, 6]
+
+
+class TestSuffixRealLifecycle:
+    _PROMPT = [1, 2, 3, 4, 5, 6, 7, 8]
+    _RESPONSE = [20, 21, 22, 23, 24, 25]
+
+    def test_preempted_then_resumed_request_keeps_its_response(self) -> None:
+        proposer = _real_proposer()
+        cache = proposer._vllm.suffix_cache
+        history = self._PROMPT + self._RESPONSE
+        proposer.propose(
+            _context(decode_reqs=[("b", _request_state(history, prompt_len=8))])
+        )
+
+        # Preempted: released (archived) and absent while waiting.
+        proposer.release_requests({"b"})
+        assert "b" not in cache.active_requests
+        assert "b" in cache.cached_requests
+
+        # Resumed: the recompute's final prefill chunk samples [20] again.
+        resumed = _request_state(history + [20], prompt_len=8)
+        drafts = proposer.propose(
+            _context(
+                prefill_reqs=[
+                    SimpleNamespace(req_id="b", start_pos=0, token_ids=history)
+                ],
+                request_states={"b": resumed},
+            )
+        )
+        assert drafts is not None
+        assert drafts.draft_token_ids[0][0] == 21
+
+    def test_finish_archives_immediately(self) -> None:
+        proposer = _real_proposer()
+        cache = proposer._vllm.suffix_cache
+        state = _request_state(self._PROMPT + [1, 2], prompt_len=8)
+        proposer.propose(_context(decode_reqs=[("c", state)]))
+        assert "c" in cache.active_requests
+
+        proposer.release_requests({"c"})
+
+        assert "c" not in cache.active_requests
+        assert "c" in cache.cached_requests
+        assert "c" not in proposer._last_len
+
+    def test_final_prefill_chunk_drafts(self) -> None:
+        proposer = _real_proposer()
+        state = _request_state(self._PROMPT + [1], prompt_len=8)
+        drafts = proposer.propose(
+            _context(
+                prefill_reqs=[
+                    SimpleNamespace(req_id="a", start_pos=0, token_ids=self._PROMPT)
+                ],
+                request_states={"a": state},
+            )
+        )
+        assert drafts is not None
+        assert drafts.draft_token_ids[0][0] == 2
+
+    def test_mixed_batch_variable_drafts_round_trip_through_verify(self) -> None:
+        mx = pytest.importorskip("mlx.core")
+        proposer = _real_proposer()
+        controller = SpeculativeDecodeController()
+        long_req = _request_state([1, 2, 10, 11, 12, 13, 14, 10, 11, 12], prompt_len=7)
+        short_req = _request_state([5, 6, 7, 30, 5], prompt_len=4)
+        sampled = _request_state([40, 41, 42], prompt_len=2, temperature=1.0)
+        decode_reqs = [("long", long_req), ("short", short_req), ("s", sampled)]
+
+        drafts = proposer.propose(_context(decode_reqs=decode_reqs))
+        assert drafts is not None
+        by_id = dict(zip(drafts.req_ids, drafts.draft_token_ids, strict=True))
+        assert "s" not in by_id
+        assert by_id["long"] == [13, 14, 10]
+        assert len(by_id["short"]) != len(by_id["long"])
+
+        # Next step: verify through the shared greedy span path. The target
+        # accepts the first long draft then diverges; accepts all of short.
+        greedy_reqs = decode_reqs[:2]
+        segments = controller.build_decode_segments(
+            greedy_reqs, by_id, {"long": 9, "short": 4}
+        )
+        vocab = 64
+        rows = sum(seg.num_query_tokens for seg in segments)
+        targets = [13, 50, 0, 0] + [*by_id["short"], 60]
+        assert len(targets) == rows
+        logits = mx.zeros((1, rows, vocab))
+        logits[0, mx.arange(rows), mx.array(targets)] = 1.0
+        out = controller.verify_greedy(logits, greedy_reqs, segments)
+        assert out == [[13, 50], [*by_id["short"], 60]]
+
+        # Commit the verified tokens; the next propose feeds exactly them.
+        long_req.token_ids += out[0]
+        short_req.token_ids += out[1]
+        proposer.propose(_context(decode_reqs=greedy_reqs))
+        assert proposer._last_len == {
+            "long": len(long_req.token_ids),
+            "short": len(short_req.token_ids),
+        }
