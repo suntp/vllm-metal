@@ -132,15 +132,22 @@ class SuffixProposer(NoOwnKVProposer):
         return False
 
     def release_requests(self, req_ids: set[str]) -> None:
-        # The trees are archived by upstream's lifecycle (a request missing
-        # from the batch is stopped into the global cache); only the length
-        # bookkeeping is ours to drop, and it must not outlive the id.
+        # Finished, preempted and resumed ids. Archive their trees now rather
+        # than on the next propose call that happens to run (an idle server
+        # may never make one). A preempted/resumed request loses nothing: its
+        # next drafting step re-feeds the response since the prompt boundary.
         for req_id in req_ids:
-            self._last_len.pop(req_id, None)
+            self._stop(req_id)
+
+    def _stop(self, req_id: str) -> None:
+        self._last_len.pop(req_id, None)
+        cache = getattr(self._vllm, "suffix_cache", None)
+        if cache is not None and req_id in cache.active_requests:
+            cache.stop_request(req_id)
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
         for req_id in ctx.finished_req_ids:
-            self._last_len.pop(req_id, None)
+            self._stop(req_id)
 
         if ctx.num_speculative_tokens <= 0:
             return None
