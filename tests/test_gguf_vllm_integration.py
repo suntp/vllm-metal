@@ -76,6 +76,11 @@ _AWQ_QUANTIZATION_CONFIG = {
     "version": "gemm",
 }
 
+# Config-building tests here name many architectures; inspect them in process
+# instead of one vLLM import each. The entry-point test below runs in its own
+# interpreter and so still exercises the real registry subprocess.
+pytestmark = pytest.mark.usefixtures("inspect_vllm_models_in_process")
+
 
 @pytest.fixture(autouse=True)
 def _registered() -> None:
@@ -426,6 +431,12 @@ def test_entry_point_mounts_without_manual_register(
     repo_root = Path(vllm_integration.__file__).resolve().parents[2]
     env = dict(os.environ)
     env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{tmp_path}"
+    # The local case starts from an empty cache root so vLLM's real
+    # per-architecture registry subprocess runs (the in-process fixture skips
+    # it for the other tests); one cold architecture is enough to cover it.
+    cache_root = tmp_path / "vllm-cache"
+    if not offline_remote:
+        env["VLLM_CACHE_ROOT"] = str(cache_root)
     if offline_remote:
         gguf_file = "Qwen/Qwen3-0.6B-GGUF:Q8_0"
         env["HF_HUB_OFFLINE"] = "1"
@@ -447,6 +458,10 @@ def test_entry_point_mounts_without_manual_register(
 
     assert result.returncode == 0, result.stderr[-2000:]
     assert f"EP-OK gguf {gguf_file}" in result.stdout
+    if not offline_remote:
+        assert any((cache_root / "modelinfos").glob("*.json")), (
+            "registry subprocess did not populate the cold cache"
+        )
 
 
 def test_remote_reference_grammar() -> None:

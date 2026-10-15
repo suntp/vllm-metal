@@ -18,15 +18,20 @@ if TYPE_CHECKING:
 os.environ["MLX_ENABLE_TF32"] = "0"  # Keep FP32 parity checks strict on M5.
 
 
-@pytest.fixture(scope="session", autouse=True)
-def _inspect_vllm_models_in_process():
-    """Skip vLLM's per-architecture registry subprocess on a cold cache.
+@pytest.fixture(scope="session")
+def inspect_vllm_models_in_process():
+    """Opt-in: skip vLLM's per-architecture registry subprocess.
 
     ``ModelRegistry`` inspects each architecture in a fresh interpreter (to
     keep CUDA out of the parent) and caches the result under
     ``VLLM_CACHE_ROOT``. CI starts cold, so every config-building test that
-    names a new architecture paid a full vLLM import. There is no CUDA here,
+    names a new architecture pays a full vLLM import. There is no CUDA here,
     and the test process has vLLM imported already.
+
+    This bypasses the real subprocess path, so it is not autouse: only
+    modules that build many configs request it, and
+    ``test_entry_point_mounts_without_manual_register`` keeps the real path
+    covered with an empty cache root.
     """
 
     from vllm.model_executor.models import registry
