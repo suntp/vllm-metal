@@ -18,9 +18,9 @@ if TYPE_CHECKING:
 os.environ["MLX_ENABLE_TF32"] = "0"  # Keep FP32 parity checks strict on M5.
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def inspect_vllm_models_in_process():
-    """Opt-in: skip vLLM's per-architecture registry subprocess.
+    """Opt-in, per module: skip vLLM's per-architecture registry subprocess.
 
     ``ModelRegistry`` inspects each architecture in a fresh interpreter (to
     keep CUDA out of the parent) and caches the result under
@@ -28,20 +28,18 @@ def inspect_vllm_models_in_process():
     names a new architecture pays a full vLLM import. There is no CUDA here,
     and the test process has vLLM imported already.
 
-    This bypasses the real subprocess path, so it is not autouse: only
-    modules that build many configs request it, and
-    ``test_entry_point_mounts_without_manual_register`` keeps the real path
-    covered with an empty cache root.
+    This bypasses the real subprocess path, so it is not autouse and is
+    module-scoped: the original ``_run_in_subprocess`` is restored when the
+    requesting module finishes (``test_registry_subprocess_restored.py``
+    checks this). ``test_entry_point_mounts_without_manual_register`` keeps
+    the real path covered with an empty cache root.
     """
 
     from vllm.model_executor.models import registry
 
-    original = registry._run_in_subprocess
-    registry._run_in_subprocess = lambda fn: fn()
-    try:
+    with pytest.MonkeyPatch.context() as mp_patch:
+        mp_patch.setattr(registry, "_run_in_subprocess", lambda fn: fn())
         yield
-    finally:
-        registry._run_in_subprocess = original
 
 
 @pytest.fixture(scope="session")
