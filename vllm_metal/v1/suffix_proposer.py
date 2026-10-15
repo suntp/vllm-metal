@@ -56,6 +56,7 @@ from vllm_metal.v1.proposer import NoOwnKVProposer
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
+    from vllm_metal.v1.model_runner import RequestState
     from vllm_metal.v1.proposer import ProposeContext
     from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 
@@ -156,20 +157,31 @@ class SuffixProposer(NoOwnKVProposer):
         if not drafting:
             return None
 
-        # Every live decode request gets a row (keeps alive-but-not-drafting
-        # requests' trees from being archived and rebuilt); only drafting
-        # rows carry a delta and receive drafts.
-        rows = list(ctx.decode_reqs)
-        if not rows:
-            return None
+        # Every request in this step's batch gets a row -- decode rows and
+        # prefill rows alike, matching upstream's GPU runner, which hands the
+        # whole InputBatch over. Upstream stops (archives) any active tree
+        # whose id is missing from the batch, so a drafting request that sits
+        # in an intermediate prefill chunk (recompute after preemption) or
+        # cannot draft this step must still be present. Only drafting rows
+        # carry a delta and receive drafts; that includes the last prefill
+        # chunk, whose first sampled token is already committed.
+        rows: list[tuple[str, RequestState | None]] = list(ctx.decode_reqs)
+        seen = {req_id for req_id, _ in rows}
+        for prefill in ctx.prefill_reqs:
+            if prefill.req_id in seen:
+                continue
+            seen.add(prefill.req_id)
+            rows.append((prefill.req_id, ctx.request_states.get(prefill.req_id)))
         num_rows = len(rows)
         token_ids_cpu = self._token_ids_cpu[:num_rows]
         token_ids_cpu[:, :] = 0
-        num_tokens_no_spec = np.empty(num_rows, dtype=np.int32)
-        num_prompt_tokens = np.empty(num_rows, dtype=np.int32)
+        num_tokens_no_spec = np.zeros(num_rows, dtype=np.int32)
+        num_prompt_tokens = np.zeros(num_rows, dtype=np.int32)
         req_id_to_index: dict[str, int] = {}
         for i, (req_id, state) in enumerate(rows):
             req_id_to_index[req_id] = i
+            if state is None:
+                continue
             length = len(state.token_ids)
             num_tokens_no_spec[i] = length
             num_prompt_tokens[i] = state.prompt_len
@@ -182,10 +194,14 @@ class SuffixProposer(NoOwnKVProposer):
                 sampled_token_ids.append([])
                 continue
             cur = len(draft_state.token_ids)
+            # Not in _last_len means upstream holds no active tree for this
+            # id (first sighting, or archived while preempted/absent): it
+            # will (re)start the tree from the prompt, so feed the whole
+            # response so far, not just the latest delta.
             prev = self._last_len.get(req_id, draft_state.prompt_len)
             if prev > cur:
-                # Preemption rollback: the recomputed history is shorter
-                # than what was fed; re-anchor and skip the delta this step.
+                # Rollback: the recomputed history is shorter than what was
+                # fed; re-anchor and skip the delta this step.
                 prev = cur
             self._last_len[req_id] = cur
             sampled_token_ids.append(draft_state.token_ids[prev:cur])
@@ -200,6 +216,12 @@ class SuffixProposer(NoOwnKVProposer):
         drafts = self._vllm.propose(
             self._num_speculative_tokens, stub, sampled_token_ids
         )
+        # Upstream archives every active tree missing from this batch; keep
+        # the length anchors in sync so a returning id is re-fed from its
+        # prompt boundary when its tree restarts.
+        for req_id in list(self._last_len):
+            if req_id not in req_id_to_index:
+                del self._last_len[req_id]
 
         req_ids: list[str] = []
         draft_token_ids: list[list[int]] = []
