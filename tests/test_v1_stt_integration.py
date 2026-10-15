@@ -170,6 +170,7 @@ class TestWhisperRuntimeAdapterDecode:
 
         assert result[-1] == 50257
 
+    @pytest.mark.usefixtures("whisper_hub_tokenizer_cache")
     @pytest.mark.parametrize("n_vocab", [51864, 51865, 51866])
     def test_runner_uses_fallback_eot_for_tokenizer_free_snapshot(
         self, tmp_path: Path, n_vocab: int
