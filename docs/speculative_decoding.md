@@ -184,6 +184,58 @@ cache. Its benefit depends on repeated token spans in the request history.
     --speculative-config '{"method":"ngram","num_speculative_tokens":3,"prompt_lookup_min":2,"prompt_lookup_max":3}'
 ```
 
+## Suffix
+
+Suffix decoding ([Snowflake, arXiv 2411.04975](https://arxiv.org/pdf/2411.04975))
+drafts by walking a suffix tree built over the prompts and previously
+generated responses of the serving process. Like n-gram it needs no draft
+model and no KV cache; unlike n-gram it learns *across* requests, so its
+wins concentrate in agentic and templated workloads where responses re-emit
+near-identical scaffolding (tool-call envelopes, structured lists, repeated
+phrasing). Draft lengths are dynamic per request and per step, bounded by
+`num_speculative_tokens`. Targets are full-attention paged-attention models
+(hybrid GDN targets keep the ngram-only gate for now). Verification is
+greedy-only and requires `--no-async-scheduling`, like every Metal
+speculator.
+
+Follow the upstream
+[Suffix Decoding guide](https://docs.vllm.ai/en/latest/features/speculative_decoding/suffix_decoding/)
+for the tuning knobs (`suffix_decoding_max_tree_depth`,
+`suffix_decoding_max_spec_factor`, `suffix_decoding_min_token_prob`,
+`suffix_decoding_max_cached_requests`).
+
+### Installing arctic_inference on macOS
+
+The suffix tree lives in the [`arctic_inference`](https://pypi.org/project/arctic-inference/)
+package. PyPI ships an sdist only — no macOS wheels — but the suffix-tree
+core is pure C++/nanobind with no CUDA in it, so it builds from source:
+
+```bash
+  pip install nanobind grpcio-tools   # build-time dependencies
+  pip install --no-build-isolation arctic_inference
+```
+
+If the build binds the wrong interpreter (a Homebrew Python instead of the
+venv's), pin it:
+
+```bash
+  PATH="$VIRTUAL_ENV/bin:$PATH" \
+  Python_ROOT_DIR="$VIRTUAL_ENV" Python_FIND_STRATEGY=LOCATION \
+  pip install --no-build-isolation --no-deps arctic_inference
+```
+
+Serving without the package installed fails at config time with this recipe
+in the error message.
+
+### Example
+
+```bash
+  vllm serve Qwen/Qwen3-8B \
+    --max-model-len 2048 \
+    --no-async-scheduling \
+    --speculative-config '{"method":"suffix","num_speculative_tokens":3}'
+```
+
 ## Benchmarking
 
 The [DFlash guide](dflash.md) covers its experimental serving restrictions and
