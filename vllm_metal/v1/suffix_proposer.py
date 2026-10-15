@@ -95,6 +95,7 @@ class SuffixProposer(NoOwnKVProposer):
         # Upstream's propose asserts this exact value; drafts are then
         # truncated to the scheduler's per-step width (ctx).
         self._num_speculative_tokens = spec.num_speculative_tokens
+        self._max_tree_depth = spec.suffix_decoding_max_tree_depth
 
         # Same pre-allocated history buffer trick as the n-gram wrapper:
         # upstream reads rows [:num_prompt_tokens] and [start:num_tokens].
@@ -183,37 +184,43 @@ class SuffixProposer(NoOwnKVProposer):
             rows.append((prefill.req_id, ctx.request_states.get(prefill.req_id)))
         num_rows = len(rows)
         token_ids_cpu = self._token_ids_cpu[:num_rows]
-        token_ids_cpu[:, :] = 0
         num_tokens_no_spec = np.zeros(num_rows, dtype=np.int32)
         num_prompt_tokens = np.zeros(num_rows, dtype=np.int32)
         req_id_to_index: dict[str, int] = {}
+        sampled_token_ids: list[list[int]] = []
         for i, (req_id, state) in enumerate(rows):
             req_id_to_index[req_id] = i
-            if state is None:
-                continue
-            length = len(state.token_ids)
-            num_tokens_no_spec[i] = length
-            num_prompt_tokens[i] = state.prompt_len
-            token_ids_cpu[i, :length] = state.token_ids
-
-        sampled_token_ids: list[list[int]] = []
-        for req_id, _row_state in rows:
+            if state is not None:
+                num_tokens_no_spec[i] = len(state.token_ids)
+                num_prompt_tokens[i] = state.prompt_len
             draft_state = drafting.get(req_id)
             if draft_state is None:
+                # Upstream skips rows without a delta and never reads their
+                # token_ids_cpu, so nothing is copied for them.
                 sampled_token_ids.append([])
                 continue
-            cur = len(draft_state.token_ids)
+            history = draft_state.token_ids
+            cur = len(history)
             # Not in _last_len means upstream holds no active tree for this
             # id (first sighting, or archived while preempted/absent): it
             # will (re)start the tree from the prompt, so feed the whole
             # response so far, not just the latest delta.
+            starting = req_id not in self._last_len
             prev = self._last_len.get(req_id, draft_state.prompt_len)
             if prev > cur:
                 # Rollback: the recomputed history is shorter than what was
                 # fed; re-anchor and skip the delta this step.
                 prev = cur
             self._last_len[req_id] = cur
-            sampled_token_ids.append(draft_state.token_ids[prev:cur])
+            sampled_token_ids.append(history[prev:cur])
+            # Upstream reads only the prompt (when it starts a tree) and the
+            # last max_tree_depth tokens (the match pattern); copy just those
+            # instead of the whole history every step.
+            if starting:
+                prompt_len = draft_state.prompt_len
+                token_ids_cpu[i, :prompt_len] = history[:prompt_len]
+            tail = max(0, cur - self._max_tree_depth)
+            token_ids_cpu[i, tail:cur] = history[tail:cur]
 
         stub = SimpleNamespace(
             req_ids=[req_id for req_id, _ in rows],
