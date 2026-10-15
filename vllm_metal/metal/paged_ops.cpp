@@ -603,6 +603,7 @@ static void dispatch_paged_attention_nax(
 
   constexpr int kNaxBQ = 64;
   constexpr int kNaxThreads = 128;
+  constexpr int kNaxSplitMinAvgQ = 2 * kNaxBQ;
 
   int total_q_tokens = static_cast<int>(query.shape(0));
   int head_size  = static_cast<int>(query.shape(2));
@@ -614,12 +615,29 @@ static void dispatch_paged_attention_nax(
       "paged_attention_nax_" + dtype_to_metal(query.dtype()) +
       "_hs" + std::to_string(head_size) +
       "_bs" + std::to_string(block_size);
-  std::string hash_name = base_kname + "_sk" + (use_sinks ? "1" : "0");
+  // Two pipelines of the same kernel, chosen per launch by function
+  // constant 41 (nax_split_full):
+  //  - split:   complete KV tiles of full 64-row Q blocks skip bounds checks;
+  //  - unsplit: the original single guarded loop, compiled exactly as before.
+  // Containing both tile bodies changes codegen enough to slow the guarded
+  // path, so launches dominated by partial Q blocks (short prefill, cached
+  // prefix + few new tokens, small chunks) take the unsplit pipeline. The
+  // host only knows totals here, so the cut is an average of at least 128
+  // query tokens (two Q blocks) per sequence.
+  // head_size 512 stays unsplit: conservative enablement scope for this
+  // change to avoid regressing measured shapes (the split was slower on long
+  // D512 prefill; register pressure is suspected but unverified). D512 can
+  // be optimized separately later.
+  bool split_full = head_size < 512
+      && total_q_tokens >= kNaxSplitMinAvgQ * num_seqs;
+  std::string hash_name = base_kname + "_sk" + (use_sinks ? "1" : "0")
+                          + "_sf" + (split_full ? "1" : "0");
 
   auto* lib = d.get_library("paged_attention_nax_kern");
   auto* kernel = d.get_kernel(
       base_kname, lib, hash_name,
-      {{&use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)}});
+      {{&use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)},
+       {&split_full, MTL::DataType::DataTypeBool, NS::UInteger(41)}});
 
   int num_heads = static_cast<int>(query.shape(1));
   auto& enc = metal::get_command_encoder(s);
