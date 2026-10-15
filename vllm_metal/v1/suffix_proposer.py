@@ -243,10 +243,14 @@ class SuffixProposer(NoOwnKVProposer):
             cap = ctx.draft_caps.get(req_id) if ctx.draft_caps is not None else None
             if cap is not None:
                 limit = min(limit, cap)
-            if len(draft) > limit:
-                draft = draft[:limit]
-                if not draft:
-                    continue
+            max_tokens = drafting[req_id].sampling_params.max_tokens
+            if max_tokens is not None:
+                # Verification also emits a correction or bonus token, so
+                # drafts past max_tokens - 1 would be verified and discarded.
+                limit = min(limit, max_tokens - drafting[req_id].generated_tokens - 1)
+            if limit < 1:
+                continue
+            draft = draft[:limit]
             req_ids.append(req_id)
             draft_token_ids.append(list(draft))
 
