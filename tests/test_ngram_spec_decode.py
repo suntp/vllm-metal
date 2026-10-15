@@ -193,6 +193,23 @@ class TestNgramProposePropose:
         assert drafts is not None
         assert drafts.draft_token_ids == [[3, 1, 2]]
 
+    def test_remaining_output_tokens_bound_the_draft(self) -> None:
+        # max_tokens=4 with 2 generated leaves room for one draft plus the
+        # bonus token; with 3 generated there is no room and no miss is
+        # recorded.
+        proposer = _proposer(prompt_lookup_min=2, prompt_lookup_max=3)
+        state = _request_state([1, 2, 3, 1, 2, 3, 1, 2])
+        state.sampling_params = SamplingParams(temperature=0.0, max_tokens=4)
+        state.generated_tokens = 2
+
+        drafts = proposer.propose(_context(decode_reqs=[("r0", state)]))
+        assert drafts is not None
+        assert drafts.draft_token_ids == [[3]]
+
+        state.generated_tokens = 3
+        assert proposer.propose(_context(decode_reqs=[("r0", state)])) is None
+        assert proposer._miss_streak.get("r0", 0) == 0
+
     def test_empty_context_returns_none(self) -> None:
         assert _proposer().propose(_context()) is None
 
