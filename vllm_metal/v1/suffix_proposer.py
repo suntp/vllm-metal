@@ -94,8 +94,8 @@ class SuffixProposer(NoOwnKVProposer):
         self._vllm = _build_vllm_suffix(vllm_config)
         spec = vllm_config.speculative_config
         assert spec is not None
-        # Upstream's propose asserts this exact value; the scheduler-side
-        # width only gates whether drafting happens at all this step.
+        # Upstream's propose asserts this exact value; drafts are then
+        # truncated to the scheduler's per-step width (ctx).
         self._num_speculative_tokens = spec.num_speculative_tokens
 
         # Same pre-allocated history buffer trick as the n-gram wrapper:
@@ -228,9 +228,14 @@ class SuffixProposer(NoOwnKVProposer):
         for (req_id, _), draft in zip(rows, drafts, strict=True):
             if req_id not in drafting or not draft:
                 continue
+            # Upstream drafts up to the configured width (its assert pins
+            # that value); this step's scheduled width may be smaller.
+            limit = ctx.num_speculative_tokens
             cap = ctx.draft_caps.get(req_id) if ctx.draft_caps is not None else None
-            if cap is not None and len(draft) > cap:
-                draft = draft[:cap]
+            if cap is not None:
+                limit = min(limit, cap)
+            if len(draft) > limit:
+                draft = draft[:limit]
                 if not draft:
                     continue
             req_ids.append(req_id)
