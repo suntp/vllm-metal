@@ -16,30 +16,36 @@ the per-step :class:`ProposeContext` into that bookkeeping and hand back
 
 The suffix tree itself lives in the ``arctic_inference`` package (a pure
 C++/nanobind core with no CUDA in it). PyPI ships an sdist only, so on
-macOS it builds from source — the recipe is in
-``docs/speculative_decoding.md``; a missing install surfaces as a clear
-config-time error rather than an import stack.
+macOS it builds from source -- the recipe is in
+``docs/speculative_decoding.md``. A missing install is rejected by vLLM's
+own ``SpeculativeConfig`` validation before this module is reached.
 
-Two Metal-specific decisions on top of upstream's loop:
+Metal-specific decisions on top of upstream's loop:
 
-- **Every decode request stays in the stub batch, not just drafting ones.**
-  The upstream lifecycle archives a request's tree into the global cache
-  the first step it does not appear in the batch. Alive-but-not-drafting
-  requests (non-greedy sampling, logprobs) would therefore have their
-  prompt trees torn down and rebuilt — an O(prompt) cost per step of
-  coming back. Passing them as rows with empty per-step deltas keeps the
-  trees live; upstream skips them (`if not sampled_ids: continue`).
+- **Every scheduled request stays in the stub batch, not just drafting
+  ones** (decode and prefill rows, as upstream's GPU runner passes its
+  whole InputBatch). Upstream archives an active tree the first step its
+  id is missing from the batch. Rows that never drafted never start a
+  tree, so keeping them costs nothing; what the rows protect is a request
+  that has been drafting but cannot draft *this* step (an intermediate
+  prefill chunk while recomputing, a step it sampled nothing): without its
+  row its live tree would be archived and rebuilt from the prompt.
 - **Deltas, not raw sampled ids.** Upstream feeds its engine's
   last-step sampled ids into ``add_active_response``; the committed
   history in ``RequestState.token_ids`` already contains exactly those
-  tokens, so the wrapper remembers each request's last-seen length and
-  feeds the slice in between (re-initialized at ``prompt_len`` for a
-  first sighting, clamped on preemption rollback).
+  tokens, so the wrapper remembers each request's last-fed length and
+  feeds the slice in between. When upstream holds no active tree for the
+  id (first sighting, or archived while preempted) the slice starts at
+  ``prompt_len``, so a restarted tree relearns the whole response.
+- **Finished requests are archived immediately** (``release_requests`` /
+  ``finished_req_ids``) instead of on upstream's next propose call.
 
 Draft lengths are dynamic per request (the tree speculates as deep as the
-matched suffix and the probability floor allow), bounded by
-``num_speculative_tokens``; the verify half is the established greedy span
-path shared with n-gram.
+matched suffix and the probability floor allow), bounded by this step's
+scheduled width; the verify half is the established greedy span path
+shared with n-gram. Like n-gram, greedy outputs can differ from a
+no-speculation run: the verify forward has a different shape than a
+single-token decode, so near-tie logits may round differently.
 """
 
 from __future__ import annotations
@@ -67,15 +73,7 @@ def _build_vllm_suffix(vllm_config: VllmConfig):
     """Construct upstream's proposer (kept as a seam for tests to patch)."""
     from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 
-    try:
-        return SuffixDecodingProposer(vllm_config)
-    except ImportError as exc:
-        raise NotImplementedError(
-            "Suffix speculative decoding requires the arctic_inference "
-            "package. Install it with `pip install arctic_inference`; on "
-            "macOS it has no prebuilt wheel and builds from sdist — see "
-            "docs/speculative_decoding.md#suffix for the recipe."
-        ) from exc
+    return SuffixDecodingProposer(vllm_config)
 
 
 class SuffixProposer(NoOwnKVProposer):
@@ -106,9 +104,13 @@ class SuffixProposer(NoOwnKVProposer):
         logger.info(
             "Suffix speculative decoding enabled "
             "(num_speculative_tokens=%d, max_tree_depth=%d, "
+            "max_spec_factor=%g, min_token_prob=%g, max_cached_requests=%d, "
             "token_ids_cpu=(%d, %d) (%.2f MiB))",
             spec.num_speculative_tokens,
             spec.suffix_decoding_max_tree_depth,
+            spec.suffix_decoding_max_spec_factor,
+            spec.suffix_decoding_min_token_prob,
+            spec.suffix_decoding_max_cached_requests,
             max_num_seqs,
             max_model_len,
             self._token_ids_cpu.nbytes / (1024 * 1024),

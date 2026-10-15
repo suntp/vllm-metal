@@ -224,8 +224,21 @@ venv's), pin it:
   pip install --no-build-isolation --no-deps arctic_inference
 ```
 
-Serving without the package installed fails at config time with this recipe
-in the error message.
+Serving without the package installed fails at config time with vLLM's own
+error, which suggests `pip install arctic-inference==0.1.1` (vLLM's pin). That
+pin is not what this backend was tested with: the Metal path was validated
+against `arctic_inference` 0.3.0 built with the recipe above. The package is
+Apache-2.0 licensed (its `LICENSE` file, shipped in the sdist).
+
+Greedy outputs with suffix (as with n-gram) are not guaranteed to match a
+run without speculation token for token: the verify forward has a different
+shape than a single-token decode, so a near-tie logit can round the other
+way and the two runs diverge from that position on. Check equivalence by
+reporting the first divergent token position rather than an exact-match
+flag.
+
+Sleep mode (`--enable-sleep-mode`) is supported with suffix: the trees are
+host memory independent of the KV cache and persist across sleep.
 
 ### Example
 
