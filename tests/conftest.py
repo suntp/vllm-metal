@@ -87,6 +87,29 @@ def force_tiled_prefill():
         ops.set_nax_enabled(True)
 
 
+@pytest.fixture
+def nax_prefill():
+    """Route eligible prefill to NAX and record the dispatch family.
+
+    Skips off M5: the NAX kernel cannot run there, and the tiled twin of this
+    path is covered by test_mixed_batch_dispatches_decode_by_context.
+    """
+    import mlx.core as mx
+
+    from vllm_metal.metal import get_ops
+
+    ops = get_ops()
+    if not (ops.nax_supported() and ops.nax_ready()):
+        pytest.skip("NAX prefill needs an M5 GPU and the NAX metallib")
+    ops.set_nax_enabled(True)
+    previous = ops._set_paged_dispatch_diagnostics(True)
+    try:
+        yield ops
+    finally:
+        mx.synchronize()
+        ops._set_paged_dispatch_diagnostics(previous)
+
+
 @pytest.fixture(autouse=True)
 def _seed_random_generators() -> None:
     """Seed common RNGs to keep tests deterministic."""

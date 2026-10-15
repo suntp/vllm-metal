@@ -284,8 +284,15 @@ def test_prefill_and_mixed_batches_stay_off_gqa(query_lens):
 
 
 @pytest.mark.parametrize("disabled", [False, True])
-def test_split_mixed_decode_stays_on_upstream_path(disabled, force_tiled_prefill):
+@pytest.mark.parametrize("prefill_kernel", ["tiled", "nax"])
+def test_split_mixed_decode_stays_on_upstream_path(prefill_kernel, disabled, request):
     """Splitting one decode row out of a mixed batch must not enable GQA."""
+    if prefill_kernel == "tiled":
+        request.getfixturevalue("force_tiled_prefill")
+        expected_family = "mixed_prefill_decode"
+    else:
+        request.getfixturevalue("nax_prefill")
+        expected_family = "mixed_nax_prefill_decode"
     out, ref = _run_primitive(
         [8192, 128],
         mx.float16,
@@ -297,28 +304,8 @@ def test_split_mixed_decode_stays_on_upstream_path(disabled, force_tiled_prefill
         max_decode_context_len=8192,
         gqa_disabled=disabled,
     )
-    assert _dispatch_family() == "mixed_prefill_decode"
+    assert _dispatch_family() == expected_family
     assert get_ops().last_gqa_partition_size() == 0
-    _assert_close(out, ref, mx.float16)
-
-
-def test_split_nax_mixed_decode_stays_on_upstream_path():
-    """The NAX split routes its decode rows exactly like the tiled split."""
-    ops = get_ops()
-    if not (ops.nax_supported() and ops.nax_ready()):
-        pytest.skip("NAX prefill needs an M5 GPU and the NAX metallib")
-    out, ref = _run_primitive(
-        [8192, 128],
-        mx.float16,
-        interleaved=True,
-        seed=720,
-        query_lens=[1, 32],
-        num_decode_requests=1,
-        num_decode_tokens=1,
-        max_decode_context_len=8192,
-    )
-    assert _dispatch_family() == "mixed_nax_prefill_decode"
-    assert ops.last_gqa_partition_size() == 0
     _assert_close(out, ref, mx.float16)
 
 
