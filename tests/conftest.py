@@ -18,6 +18,27 @@ if TYPE_CHECKING:
 os.environ["MLX_ENABLE_TF32"] = "0"  # Keep FP32 parity checks strict on M5.
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _inspect_vllm_models_in_process():
+    """Skip vLLM's per-architecture registry subprocess on a cold cache.
+
+    ``ModelRegistry`` inspects each architecture in a fresh interpreter (to
+    keep CUDA out of the parent) and caches the result under
+    ``VLLM_CACHE_ROOT``. CI starts cold, so every config-building test that
+    names a new architecture paid a full vLLM import. There is no CUDA here,
+    and the test process has vLLM imported already.
+    """
+
+    from vllm.model_executor.models import registry
+
+    original = registry._run_in_subprocess
+    registry._run_in_subprocess = lambda fn: fn()
+    try:
+        yield
+    finally:
+        registry._run_in_subprocess = original
+
+
 @pytest.fixture
 def run_in_spawn_process(request):
     """Isolate a real engine: MLX is not fork-safe, and engines retain state.
