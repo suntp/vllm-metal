@@ -191,11 +191,14 @@ def test_each_geometry_stays_on_gqa_at_long_context(q, kv, head, block_size, n, 
 
 
 # Every unselected geometry is pinned by test_policy_rejects_unmeasured_geometries;
-# these confirm native dispatch honours the policy for each head-dim family.
+# these run a representative subset natively: one case per unshipped head dim
+# (64, 96, 256), plus MHA and an unmeasured page size on a shipped geometry.
 # MLX SDPA is the oracle because the fp32 CPU reference dominates at this length.
 @pytest.mark.parametrize(
     "q,kv,head,block_size",
     [
+        (32, 4, 64, 16),  # Head dim 64 is not a shipped GQA specialization.
+        (16, 2, 96, 16),  # Neither is head dim 96.
         (16, 4, 256, 16),  # 16/4/256 is outside default routing.
         (16, 16, 128, 16),  # MHA.
         (32, 8, 128, 8),  # Unmeasured page size on a shipped geometry.
