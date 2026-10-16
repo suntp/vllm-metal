@@ -60,6 +60,7 @@ def _base_config(**cache_overrides) -> SimpleNamespace:
             runner_type="generate",
             use_mla=False,
             quantization=None,
+            enable_sleep_mode=False,
         ),
         scheduler_config=SimpleNamespace(
             async_scheduling=False,

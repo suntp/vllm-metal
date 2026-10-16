@@ -22,7 +22,8 @@ logger = init_logger(__name__)
 
 @dataclass
 class _RegionState:
-    buffer: np.ndarray  # 1-D uint8 of num_chunks * row_stride bytes
+    mapping: mmap.mmap
+    buffer: np.ndarray  # 1-D uint8 view of mapping
     num_chunks: int
     row_stride: int
     refs: int
@@ -68,10 +69,14 @@ class MetalSharedOffloadRegion(SharedOffloadRegion):
         with _registry_lock:
             state = _registry.get(engine_id)
             if state is None:
-                # np.zeros pages in lazily, so the pool costs no RSS until
-                # chunks are stored.
+                # Anonymous memory pages in lazily, so the pool costs no RSS
+                # until chunks are stored.
+                mapping = mmap.mmap(
+                    -1, self.total_size_bytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANON
+                )
                 state = _RegionState(
-                    buffer=np.zeros(self.total_size_bytes, dtype=np.uint8),
+                    mapping=mapping,
+                    buffer=np.frombuffer(mapping, dtype=np.uint8),
                     num_chunks=num_chunks,
                     row_stride=kv_bytes_per_chunk,
                     refs=1,
@@ -106,6 +111,29 @@ class MetalSharedOffloadRegion(SharedOffloadRegion):
         self.fd = None
         self.mmap_path = None
         self._creator = False
+
+    def release_pages(self) -> None:
+        """Return the pool's pages to the OS. Their contents are lost.
+
+        The views stay valid. Call ``reuse_pages`` before writing again, or
+        the kernel can drop the writes. Best effort: a failure keeps the
+        pages, so sleep still completes.
+        """
+        if self._state is None:
+            return
+        try:
+            self._state.mapping.madvise(mmap.MADV_FREE_REUSABLE)
+        except OSError:
+            logger.warning("Could not free the KV offloading host pool", exc_info=True)
+            return
+        logger.info(
+            "Freed the KV offloading host pool (%.2f GB)", self.total_size_bytes / 1e9
+        )
+
+    def reuse_pages(self) -> None:
+        """Take back the pages freed by ``release_pages``."""
+        if self._state is not None:
+            self._state.mapping.madvise(mmap.MADV_FREE_REUSE)
 
     def cleanup(self) -> None:
         super().cleanup()

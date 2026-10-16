@@ -231,6 +231,14 @@ class MetalKVOffloadWorker(OffloadingWorker):
     def wait(self, job_ids: set[int]) -> None:
         pass  # transfers complete in submit_*
 
+    def release_host_pool(self) -> None:
+        if self.region is not None:
+            self.region.release_pages()
+
+    def restore_host_pool(self) -> None:
+        if self.region is not None:
+            self.region.reuse_pages()
+
     def shutdown(self) -> None:
         self._host.clear()
         if self.region is not None:

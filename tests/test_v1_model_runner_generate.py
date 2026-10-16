@@ -31,6 +31,7 @@ from tests.stub_runner import (
     make_stub_runner,
 )
 from vllm_metal.attention.caches.state_cache import PagedStateCache
+from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 from vllm_metal.distributed.pipeline import PipelineGroup
@@ -2469,8 +2470,7 @@ class TestStartPagedForwardSelectiveLogits:
 class TestMergeVerifyWindows:
     """merge_verify_windows derivation: the runtime decision behind which
     models keep spec-verify windows merged (window mode) vs expanded.
-    Window mode is opt-in, so the flag gates everything; with it set the
-    model-class exclusions still apply."""
+    Non-hybrid models opt in; their model-class exclusions still apply."""
 
     def test_false_by_default_without_opt_in(self) -> None:
         assert make_stub_runner().merge_verify_windows is False
@@ -2532,11 +2532,6 @@ class TestVerifyLayoutLog:
             ),
             (
                 "1",
-                {"is_hybrid": True},
-                "window mode does not support hybrid models",
-            ),
-            (
-                "1",
                 {
                     "model_config": SimpleNamespace(
                         runner_type="generate",
@@ -2547,7 +2542,7 @@ class TestVerifyLayoutLog:
                 "head size 512 exceeds the window mode's 256",
             ),
         ],
-        ids=["off", "mla", "hybrid", "head-size"],
+        ids=["off", "mla", "head-size"],
     )
     def test_expanded_layout_names_the_reason(
         self, monkeypatch, window_env, runner_kwargs, reason
@@ -2561,10 +2556,190 @@ class TestVerifyLayoutLog:
             in lines
         )
 
-    def test_no_line_without_speculative_decoding(self, monkeypatch) -> None:
-        lines = self._warm_up(monkeypatch, make_stub_runner(), speculative=False)
+    def test_hybrid_spec_forces_window_layout(self, monkeypatch) -> None:
+        # Hybrid verification needs per-request segments, so the window
+        # layout is forced regardless of the opt-in env.
+        monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", "0")
+        runner = make_stub_runner(
+            is_hybrid=True,
+            hybrid_runtime_plan=make_gdn_hybrid_plan(
+                2,
+                [1],
+                conv_kernel_dim=4,
+                conv_dim=64,
+                num_v_heads=1,
+                value_head_dim=64,
+                key_head_dim=64,
+            ),
+        )
+        lines = self._warm_up(monkeypatch, runner)
+        assert "Metal: spec-decode verify uses the window layout" in lines
+
+    def test_non_gdn_hybrid_spec_rejects_before_warm_up(self, monkeypatch) -> None:
+        # The forced window layout is a GDN-family capability: other hybrid
+        # state families have no span staging to recover per-request slots.
+        monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", "0")
+        runner = make_stub_runner(
+            is_hybrid=True,
+            hybrid_runtime_plan=make_nemotron_hybrid_plan("M*"),
+        )
+        with pytest.raises(
+            NotImplementedError,
+            match="window mode does not support non-GDN hybrid state families",
+        ):
+            self._warm_up(monkeypatch, runner)
+        runner._dummy_forward_outputs.assert_not_called()
+        runner._paged_attention_runtime.warm_up.assert_not_called()
+
+    @pytest.mark.parametrize("window_env", ["0", "1"])
+    @pytest.mark.parametrize(
+        ("config_head_size", "head_dims"),
+        [(512, []), (128, [128, 512])],
+        ids=["config-head-size", "per-layer-head-size"],
+    )
+    def test_hybrid_spec_rejects_unsupported_head_before_warm_up(
+        self, monkeypatch, window_env, config_head_size, head_dims
+    ) -> None:
+        # Expanded rows lose the per-request state mapping; the head bound
+        # must reject the configuration before any warm-up forward runs.
+        monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", window_env)
+        runner = make_stub_runner(
+            model_config=SimpleNamespace(
+                runner_type="generate",
+                get_head_size=lambda: config_head_size,
+                is_hybrid=True,
+            ),
+            head_dim_per_layer=head_dims,
+            hybrid_runtime_plan=make_gdn_hybrid_plan(
+                2,
+                [1],
+                conv_kernel_dim=4,
+                conv_dim=64,
+                num_v_heads=1,
+                value_head_dim=64,
+                key_head_dim=64,
+            ),
+        )
+        with pytest.raises(
+            NotImplementedError, match="head size 512 exceeds the window mode's 256"
+        ):
+            self._warm_up(monkeypatch, runner)
+        runner._dummy_forward_outputs.assert_not_called()
+        runner._paged_attention_runtime.warm_up.assert_not_called()
+        with pytest.raises(NotImplementedError, match="requires the GDN window layout"):
+            _ = runner.merge_verify_windows
+
+    @pytest.mark.parametrize("is_hybrid", [False, True])
+    def test_no_line_without_speculative_decoding(self, monkeypatch, is_hybrid) -> None:
+        runner = make_stub_runner(
+            model_config=SimpleNamespace(
+                runner_type="generate", get_head_size=lambda: 512, is_hybrid=is_hybrid
+            ),
+        )
+        lines = self._warm_up(monkeypatch, runner, speculative=False)
 
         assert not any("spec-decode verify" in line for line in lines)
+        runner._dummy_forward_outputs.assert_called_once()
+        runner._paged_attention_runtime.warm_up.assert_called_once()
+
+
+class TestHybridDraftCaps:
+    """``_hybrid_draft_caps`` keeps every verify span inside the state block
+    that starts it, so align-mode checkpoints stay exact by construction."""
+
+    _STRIDE = 16
+
+    def _runner(self, checkpoint_stride: int | None):
+        runner = make_stub_runner()
+        runtime = HybridPagedAttentionRuntime.__new__(HybridPagedAttentionRuntime)
+        runtime._state_manager = SimpleNamespace(checkpoint_stride=checkpoint_stride)
+        runner._paged_attention_runtime = runtime
+        return runner
+
+    @staticmethod
+    def _segment(req_id: str, cache_start_pos: int) -> mr.PagedDecodeSegment:
+        return mr.PagedDecodeSegment(
+            req_id=req_id,
+            input_token_ids=(0,),
+            start_row=0,
+            num_query_tokens=1,
+            draft_token_ids=(),
+            cache_start_pos=cache_start_pos,
+            block_ids=((0,),),
+        )
+
+    @staticmethod
+    def _prefill(req_id: str, start_pos: int, num_tokens: int) -> mr.PrefillRequest:
+        return mr.PrefillRequest(
+            req_id=req_id,
+            token_ids=[0] * num_tokens,
+            sampling_params=SamplingParams(temperature=0.0),
+            block_ids=[[0]],
+            generator=None,
+            prompt_len=start_pos + num_tokens,
+            start_pos=start_pos,
+            full_prompt_token_ids=None,
+        )
+
+    def test_decode_cap_anchors_at_next_span_start(self) -> None:
+        runner = self._runner(self._STRIDE)
+        caps = runner._hybrid_draft_caps(
+            [
+                self._segment("mid", 6),  # next span starts at 6 + 2 = 8
+                self._segment("last-row", 14),  # next span starts at 15
+                self._segment("block-start", 15),  # next span starts at 16
+            ],
+            [[1, 2], [1], [1]],
+            [],
+        )
+        assert caps == {
+            "mid": 7,  # rows 8..15 stay in block 0
+            "last-row": 0,  # row 15 fills block 0; drafts would cross
+            "block-start": 15,  # rows 16..30 fill block 1 exactly
+        }
+
+    def test_prefill_cap_anchors_one_past_the_prompt(self) -> None:
+        # The first post-prefill verify span starts at start_pos + len(tokens)
+        # (the sampled token's position), not at the prompt's last row.
+        runner = self._runner(self._STRIDE)
+        caps = runner._hybrid_draft_caps(
+            [],
+            [],
+            [
+                self._prefill("mid-block", 0, 29),  # span starts at 29
+                self._prefill("aligned", 0, 32),  # span starts at 32
+                self._prefill("block-end", 0, 31),  # span starts at 31
+            ],
+        )
+        assert caps == {
+            "mid-block": 2,  # rows 29..31 stay in block 1; 3 would cross
+            "aligned": 15,  # rows 32..46 fill block 2 exactly
+            "block-end": 0,  # row 31 fills block 1; drafts would cross
+        }
+
+    def test_mixed_decode_and_prefill_caps(self) -> None:
+        runner = self._runner(self._STRIDE)
+        caps = runner._hybrid_draft_caps(
+            [self._segment("d0", 6)],
+            [[1, 2]],
+            [self._prefill("p0", 0, 29)],
+        )
+        assert caps == {"d0": 7, "p0": 2}
+
+    def test_no_caps_without_align_checkpoints(self) -> None:
+        # Per-request state mode has no checkpoints to protect.
+        runner = self._runner(None)
+        assert (
+            runner._hybrid_draft_caps(
+                [self._segment("d0", 6)], [[1, 2]], [self._prefill("p0", 0, 29)]
+            )
+            is None
+        )
+
+    def test_no_caps_for_non_hybrid_runtime(self) -> None:
+        runner = make_stub_runner()
+        runner._paged_attention_runtime = SimpleNamespace()
+        assert runner._hybrid_draft_caps([self._segment("d0", 6)], [[1]], []) is None
 
 
 class TestLoadModelPipelineSplitOrdering:
@@ -4204,7 +4379,7 @@ class TestStateBlockIdLifecycle:
                 req_ids=["r"],
                 resumed_req_ids={"r"},
                 new_token_ids=[],
-                all_token_ids={},
+                all_token_ids={"r": [1]},
                 new_block_ids=[([50], [60], [70], [80])],
                 num_computed_tokens=[0],
                 num_output_tokens=[0],

@@ -6,10 +6,12 @@ With the project environment active, compare paged serving against a fresh refer
 
 ```bash
 python tools/check_parity.py --model Qwen/Qwen3-0.6B
+VLLM_METAL_BACKEND=mps PYTORCH_ENABLE_MPS_FALLBACK=0 \
+  python tools/check_parity.py --model Qwen/Qwen3-0.6B --top-k 5
 python tools/check_parity.py --model /path/to/checkpoint --top-k 5 --batch-size 1 2 --output-dir parity-results
 ```
 
-The tool generates the native MLX reference once and exits that process before starting one `vllm serve` instance. It checks `/health`, compares individual prompts and pairs of prompts through `/v1/completions`, then stops the server. The server's sequence limit is the largest requested batch size, and prefix caching is disabled. Each pair is submitted in one HTTP request. These are request batch sizes, not assertions about the actual GPU batch size. Both backends use the same checkpoint and input token IDs.
+The tool generates the native MLX reference once and exits that process before starting one `vllm serve` instance. It checks `/health`, compares individual prompts and pairs of prompts through `/v1/completions`, then stops the server. The server's sequence limit is the largest requested batch size, and prefix caching is disabled. Each pair is submitted in one HTTP request. These are request batch sizes, not assertions about the actual GPU batch size. Both backends use the same checkpoint and input token IDs. MPS serving disables PyTorch's optional CPU fallback.
 
 The default is the 40 prompts in `tools/parity_prompts.py`, greedy decoding, and 10 output tokens, ignoring EOS. Use `--prompt` for custom text, `--max-tokens` for output length, and `--help` for all options. Inputs are plain text without a chat template. Logs, the native reference, and a summary are saved to `--output-dir`, or a new temporary directory printed at startup. The tool selects an available localhost port automatically.
 
@@ -21,7 +23,7 @@ Exit status is 0 when all prompts pass, otherwise nonzero. No saved golden token
 
 ## Speculative decoding
 
-Use the same parity command for DFlash, DSpark, or an ordinary draft model:
+Use the same parity command with the MLX backend for DFlash, DSpark, or an ordinary draft model:
 
 ```bash
 python -m tools.check_parity \
@@ -48,13 +50,12 @@ workers, and a speculative run must exercise draft verification.
 Use `--audit-continuations` to additionally replay every emitted prefix through
 native MLX. Any strict greedy mismatch fails this audit, even if the first
 divergence passes top-k comparison. Raw outputs and reports are retained on a
-comparison failure. See [DSpark qualification](dspark.md#full-continuation-audit)
-for the audit's scope.
+comparison failure.
 
 This replaces `tools.dflash_serving_parity`: use `tools.check_parity --method
 dflash --model ...` instead, retaining the other draft options. The draft-forward
 and paged-cache diagnostics remain separate because they test different contracts.
-Measure speed separately with the [serving benchmark](dspark.md#measure-http-serving-and-memory).
+Measure speed separately with the [DSpark serving benchmark](https://github.com/vllm-project/vllm-metal/blob/main/tools/benchmark/dspark_serving_benchmark.py).
 
 ## Scheduled and requested CI
 

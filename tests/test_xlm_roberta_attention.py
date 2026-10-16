@@ -11,7 +11,7 @@ from transformers.models.xlm_roberta.modeling_xlm_roberta import (
     XLMRobertaSelfAttention as TorchXLMRobertaSelfAttention,
 )
 
-from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
+from vllm_metal.tensor_bridge import torch_to_mlx
 from vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta import (
     XLMRobertaArgs,
     XLMRobertaModel,

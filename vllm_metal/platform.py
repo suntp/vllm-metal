@@ -19,6 +19,7 @@ from vllm_metal.config import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.config.kernel import IrOpPriorityConfig
     from vllm.v1.attention.backend import AttentionBackend
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm.v1.attention.selector import AttentionSelectorConfig
@@ -143,6 +144,27 @@ class MetalPlatform(Platform):
     _dp_ray_hook_registered: bool = False
 
     @classmethod
+    def import_ir_kernels(cls) -> None:
+        super().import_ir_kernels()
+        if envs.VLLM_METAL_BACKEND == "mps":
+            import vllm_metal.pytorch_backend.normalization  # noqa: F401
+
+    @classmethod
+    def get_default_ir_op_priority(
+        cls, vllm_config: "VllmConfig"
+    ) -> "IrOpPriorityConfig":
+        if envs.VLLM_METAL_BACKEND != "mps":
+            return super().get_default_ir_op_priority(vllm_config)
+
+        from vllm.config.kernel import IrOpPriorityConfig
+
+        return IrOpPriorityConfig.with_default(
+            ["native"],
+            rms_norm=["torch_mps", "native"],
+            fused_add_rms_norm=["torch_mps", "native"],
+        )
+
+    @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         """Get the name of the Metal device.
 
@@ -159,6 +181,15 @@ class MetalPlatform(Platform):
             return f"Apple Silicon ({device})"
         except ImportError:
             return "Apple Silicon (MLX not available)"
+
+    @classmethod
+    def get_current_memory_usage(cls, device=None) -> float:
+        if envs.VLLM_METAL_BACKEND == "mps":
+            import torch
+
+            torch.mps.synchronize()
+            return torch.mps.current_allocated_memory()
+        return super().get_current_memory_usage(device)
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
@@ -309,6 +340,29 @@ class MetalPlatform(Platform):
             )
             if enabled
         ]
+        if envs.VLLM_METAL_BACKEND == "mps":
+            unsupported_controls += [
+                name
+                for name, enabled in (
+                    ("temperature", params.temperature != 0),
+                    ("presence_penalty", params.presence_penalty != 0),
+                    ("frequency_penalty", params.frequency_penalty != 0),
+                    ("repetition_penalty", params.repetition_penalty != 1),
+                    ("allowed_token_ids", bool(params.allowed_token_ids)),
+                    ("bad_words", bool(params.bad_words)),
+                )
+                if enabled
+            ]
+            unsupported_controls += [
+                name
+                for name in (
+                    "logprob_token_ids",
+                    "prompt_logprobs",
+                    "structured_outputs",
+                    "thinking_token_budget",
+                )
+                if getattr(params, name, None) is not None
+            ]
         if unsupported_controls:
             controls = ", ".join(unsupported_controls)
             raise VLLMValidationError(
@@ -465,7 +519,7 @@ class MetalPlatform(Platform):
 
         # Runs before VllmConfig validates the runner choice, so an explicit
         # request fails with the Metal constraint, not upstream's Triton check.
-        if vllm_envs.VLLM_USE_V2_MODEL_RUNNER:
+        if vllm_envs.VLLM_USE_V2_MODEL_RUNNER and envs.VLLM_METAL_BACKEND != "mps":
             raise NotImplementedError(
                 "VLLM_USE_V2_MODEL_RUNNER=1 is not supported on Metal: "
                 "MetalWorker implements the V1 model runner contract. Unset it "
@@ -514,9 +568,21 @@ class MetalPlatform(Platform):
 
         logger.debug("Metal config: %s", config)
 
+        backend = envs.VLLM_METAL_BACKEND
+        if model_config is not None and model_config.enable_sleep_mode:
+            cls._check_sleep_mode_config(vllm_config, backend)
+
         # Set worker class for Metal
+        if backend == "mps":
+            from vllm_metal.pytorch_backend.worker import configure_mps
+
+            configure_mps(vllm_config)
         if parallel_config.worker_cls == "auto":
-            parallel_config.worker_cls = "vllm_metal.v1.worker.MetalWorker"
+            parallel_config.worker_cls = (
+                "vllm_metal.pytorch_backend.worker.MPSWorker"
+                if backend == "mps"
+                else "vllm_metal.v1.worker.MetalWorker"
+            )
 
         # Resolve the executor backend. vLLM's ParallelConfig already defaults an
         # unset backend to "mp" when world_size > 1 on non-CUDA/Ray/TPU (see
@@ -670,14 +736,40 @@ class MetalPlatform(Platform):
                     "'align' for models without SupportsMambaPrefixCaching). "
                     "Use align mode: --enable-prefix-caching resolves to it."
                 )
-            if cache_config.enable_prefix_caching:
-                from vllm_metal.attention.runtime.factory import (
-                    state_family_for_model_type,
-                )
+            from vllm_metal.attention.runtime.factory import (
+                state_family_for_model_type,
+            )
 
-                state_family = state_family_for_model_type(
-                    model_config.hf_text_config.model_type
-                )
+            state_family = state_family_for_model_type(
+                model_config.hf_text_config.model_type
+            )
+            if vllm_config.speculative_config is not None:
+                spec_method = vllm_config.speculative_config.method
+                if spec_method != "ngram" or state_family.label != "gdn":
+                    # The verify-span staging and acceptance rollback live in
+                    # the GDN state wrapper only; other hybrid state families
+                    # (mamba2, KDA, shortconv) would silently corrupt their
+                    # recurrent state on a partial accept, and the other
+                    # speculators are not validated on any hybrid target.
+                    # Reject at config time rather than at the first verify
+                    # forward.
+                    raise NotImplementedError(
+                        "Speculative decoding on hybrid models on Metal is "
+                        "implemented for the ngram method on GDN-family "
+                        "targets only; this configuration pairs method "
+                        f"{spec_method!r} with the {state_family.label!r} "
+                        "state family."
+                    )
+                if not envs.VLLM_METAL_GDN_LAZY_KERNELS:
+                    # Hybrid GDN verification runs multi-token spans through
+                    # the variable-length lazy scan kernels; the eager path
+                    # only implements single-row decode.
+                    raise NotImplementedError(
+                        "ngram speculative decoding on hybrid GDN targets "
+                        "requires the lazy GDN kernels "
+                        "(VLLM_METAL_GDN_LAZY_KERNELS=0 disables them)."
+                    )
+            if cache_config.enable_prefix_caching:
                 if (
                     cache_config.mamba_cache_mode
                     not in state_family.supported_cache_modes
@@ -688,16 +780,12 @@ class MetalPlatform(Platform):
                         f"mamba_cache_mode {state_family.supported_cache_modes}, "
                         f"not {cache_config.mamba_cache_mode!r}",
                     )
-            if (
-                cache_config.enable_prefix_caching
-                and vllm_config.speculative_config is not None
-            ):
-                cls._disable_hybrid_prefix_caching(
-                    vllm_config,
-                    "draft-state rollback across mamba state blocks "
-                    "(num_speculative_blocks) is not implemented for "
-                    "speculative decoding",
-                )
+                # ngram+GDN is the one hybrid speculative configuration that
+                # keeps align-mode prefix caching: verification stages GDN
+                # state per verify span and caps drafts at the state-block
+                # boundary (gdn_spec), keeping align-mode checkpoints exact.
+                # Every other hybrid+speculative combination was rejected
+                # above, so no APC downgrade for speculators remains here.
 
         # Pipeline parallelism is supported on Metal/MLX: each stage runs in its
         # own worker process and the inter-stage activations cross the
@@ -993,6 +1081,24 @@ class MetalPlatform(Platform):
             f"Metal memory: {total_mem / 1e9:.1f}GB total, "
             f"{available_mem / 1e9:.1f}GB available"
         )
+
+    @classmethod
+    def _check_sleep_mode_config(cls, vllm_config: "VllmConfig", backend: str) -> None:
+        """Sleep mode re-creates the MLX runner's shared KV storage in place.
+        Drafters that keep their own caches or arrays derived from it are not
+        covered, and the PyTorch MPS runner has no such storage.
+        """
+        if backend != "mlx":
+            raise NotImplementedError(
+                "Sleep mode is supported on the MLX backend only "
+                f"(VLLM_METAL_BACKEND={backend!r})."
+            )
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is not None and speculative_config.method != "ngram":
+            raise NotImplementedError(
+                "Sleep mode on Metal supports only n-gram speculative decoding, "
+                f"got method={speculative_config.method!r}."
+            )
 
     @classmethod
     def _check_diffusion_config(cls, vllm_config: "VllmConfig") -> None:
@@ -1341,6 +1447,8 @@ class MetalPlatform(Platform):
         """Get the attention backend class for Metal."""
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+        if envs.VLLM_METAL_BACKEND == "mps":
+            return "vllm_metal.pytorch_backend.attention.MPSAttentionBackend"
         if selected_backend and selected_backend != AttentionBackendEnum.CPU_ATTN:
             logger.info(f"Cannot use {selected_backend} backend on Metal/MLX.")
         if attn_selector_config.use_mla:
@@ -1352,6 +1460,10 @@ class MetalPlatform(Platform):
         if attn_selector_config.use_sparse:
             raise NotImplementedError("Sparse Attention is not supported on Metal/MLX.")
         return AttentionBackendEnum.CPU_ATTN.get_path()
+
+    @classmethod
+    def is_sleep_mode_available(cls) -> bool:
+        return True
 
     @classmethod
     def is_pin_memory_available(cls) -> bool:

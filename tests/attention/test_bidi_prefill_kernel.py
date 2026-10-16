@@ -20,7 +20,7 @@ from vllm_metal.attention.impls.bidi_prefill import (
     slot_indices,
 )
 from vllm_metal.metal import get_ops
-from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
+from vllm_metal.tensor_bridge import torch_to_mlx
 
 BLOCK = 16
 HEADS, KV_HEADS, HD = 4, 2, 64

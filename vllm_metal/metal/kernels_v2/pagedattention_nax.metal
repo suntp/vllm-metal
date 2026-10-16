@@ -116,6 +116,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
     device const int *cu_seqlens_q [[buffer(19)]],
     const constant int &num_seqs [[buffer(20)]],
     const constant int &sliding_window [[buffer(21)]],
+    const constant int &q_block_offset [[buffer(30)]],
     uint3 tgp [[threadgroup_position_in_grid]],
     uint3 tgpg [[threadgroups_per_grid]],
     uint sg_idx [[simdgroup_index_in_threadgroup]])
@@ -128,7 +129,9 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
                 "an 8-token fragment half must never cross a block boundary");
 
   const int head_idx = int(tgp.x);
-  const int q_block_global_idx = int(tgp.y);
+  // Mixed batches dispatch only the prefill suffix; the host skips the
+  // q-blocks of the leading decode rows (same contract as the tiled kernel).
+  const int q_block_global_idx = int(tgp.y) + q_block_offset;
   const int num_heads = int(tgpg.x);
   const int sg = int(sg_idx);
 
@@ -425,6 +428,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
       device const int *cu_seqlens_q [[buffer(19)]],                         \
       const constant int &num_seqs [[buffer(20)]],                           \
       const constant int &sliding_window [[buffer(21)]],                     \
+      const constant int &q_block_offset [[buffer(30)]],                     \
       uint3 tgp [[threadgroup_position_in_grid]],                            \
       uint3 tgpg [[threadgroups_per_grid]],                                  \
       uint sg_idx [[simdgroup_index_in_threadgroup]]);

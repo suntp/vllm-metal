@@ -128,6 +128,7 @@ def test_unknown_core_count_keeps_measured_shape_on_baseline() -> None:
     ops._override_detected_gpu_core_count_for_test(0)
     try:
         assert ops.detected_gpu_core_count() == 0
+        assert ops.min_decode_grid() == 14 * 8
         out, ref = _run_primitive(
             [32768],
             mx.bfloat16,
@@ -135,7 +136,7 @@ def test_unknown_core_count_keeps_measured_shape_on_baseline() -> None:
             seed=37,
             num_decode_requests=1,
         )
-        _assert_fallback()
+        assert _dispatch_family() == "per_token_ps512"
         _assert_close(out, ref, mx.bfloat16)
     finally:
         _restore_test_gpu_cores()
@@ -283,8 +284,15 @@ def test_prefill_and_mixed_batches_stay_off_gqa(query_lens):
 
 
 @pytest.mark.parametrize("disabled", [False, True])
-def test_split_mixed_decode_stays_on_upstream_path(disabled, force_tiled_prefill):
+@pytest.mark.parametrize("prefill_kernel", ["tiled", "nax"])
+def test_split_mixed_decode_stays_on_upstream_path(prefill_kernel, disabled, request):
     """Splitting one decode row out of a mixed batch must not enable GQA."""
+    if prefill_kernel == "tiled":
+        request.getfixturevalue("force_tiled_prefill")
+        expected_family = "mixed_prefill_decode"
+    else:
+        request.getfixturevalue("nax_prefill")
+        expected_family = "mixed_nax_prefill_decode"
     out, ref = _run_primitive(
         [8192, 128],
         mx.float16,
@@ -296,7 +304,7 @@ def test_split_mixed_decode_stays_on_upstream_path(disabled, force_tiled_prefill
         max_decode_context_len=8192,
         gqa_disabled=disabled,
     )
-    assert _dispatch_family() == "mixed_prefill_decode"
+    assert _dispatch_family() == expected_family
     assert get_ops().last_gqa_partition_size() == 0
     _assert_close(out, ref, mx.float16)
 

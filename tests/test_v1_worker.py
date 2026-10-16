@@ -39,6 +39,9 @@ from vllm_metal.v1.cache_policy import (  # noqa: E402
     kv_pool_bytes_after_probe,
     kv_swap_tolerance_bytes,
 )
+from vllm_metal.v1.kv_offload.connector import (  # noqa: E402
+    MetalOffloadingConnector,
+)
 from vllm_metal.v1.worker import MetalWorker  # noqa: E402
 
 
@@ -296,6 +299,103 @@ class TestWorkerRunnerBoundaryDelegation:
         worker.get_cache_block_size_bytes = MagicMock(return_value=1_000_000_000)
 
         assert MetalWorker.determine_available_memory(worker) == 2_900_000_000
+
+
+class TestSleepMode:
+    """Sleep frees the KV cache in place; weights stay in unified memory."""
+
+    def _worker(self) -> tuple[MetalWorker, list[str]]:
+        calls: list[str] = []
+        runner = SimpleNamespace(
+            release_kv_cache_memory=lambda: calls.append("release"),
+            restore_kv_cache_memory=lambda: calls.append("restore"),
+        )
+        return _make_worker(runner), calls
+
+    def test_level_one_releases_kv_and_wake_restores_it(self) -> None:
+        worker, calls = self._worker()
+
+        MetalWorker.sleep(worker, level=1)
+        MetalWorker.wake_up(worker, tags=None)
+
+        assert calls == ["release", "restore"]
+
+    def test_waking_only_weights_keeps_the_kv_cache_released(self) -> None:
+        worker, calls = self._worker()
+
+        MetalWorker.sleep(worker, level=1)
+        MetalWorker.wake_up(worker, tags=["weights"])
+
+        assert calls == ["release"]
+
+    def test_unsupported_level_is_rejected_before_releasing(self) -> None:
+        worker, calls = self._worker()
+
+        with pytest.raises(NotImplementedError, match="level 1 only"):
+            MetalWorker.sleep(worker, level=2)
+
+        assert calls == []
+
+    def test_discarding_weights_is_rejected(self) -> None:
+        worker, calls = self._worker()
+
+        with pytest.raises(NotImplementedError, match="only discard the KV cache"):
+            MetalWorker.discard(worker, ("weights",))
+
+        assert calls == []
+
+
+class TestSleepReleasesHostPool:
+    """Sleep frees the KV offloading host pool with the KV cache."""
+
+    def _runner(self, monkeypatch, group, runtime=None):
+        import vllm_metal.v1.model_runner as mr
+
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: group is not None)
+        monkeypatch.setattr(mr, "get_kv_transfer_group", lambda: group)
+        return make_stub_runner(_paged_attention_runtime=runtime)
+
+    def test_releases_and_restores_the_pool(self, monkeypatch) -> None:
+        connector = MagicMock(spec=MetalOffloadingConnector)
+        runner = self._runner(monkeypatch, connector)
+
+        runner.release_kv_cache_memory()
+        connector.release_host_pool.assert_called_once_with()
+        connector.restore_host_pool.assert_not_called()
+
+        runner.restore_kv_cache_memory()
+        connector.restore_host_pool.assert_called_once_with()
+
+    def test_keeps_the_pool_if_the_kv_cache_cannot_be_freed(self, monkeypatch) -> None:
+        connector = MagicMock(spec=MetalOffloadingConnector)
+        runtime = MagicMock()
+        runtime.release_kv_memory.side_effect = NotImplementedError
+        runner = self._runner(monkeypatch, connector, runtime)
+
+        with pytest.raises(NotImplementedError):
+            runner.release_kv_cache_memory()
+        connector.release_host_pool.assert_not_called()
+
+    def test_wake_reuses_the_pool_before_the_kv_cache(self, monkeypatch) -> None:
+        parent = MagicMock()
+        parent.connector = MagicMock(spec=MetalOffloadingConnector)
+        runner = self._runner(monkeypatch, parent.connector, parent.runtime)
+
+        runner.restore_kv_cache_memory()
+
+        assert [c[0] for c in parent.mock_calls] == [
+            "connector.restore_host_pool",
+            "runtime.restore_kv_memory",
+        ]
+
+    def test_skips_the_pool_without_metal_offloading(self, monkeypatch) -> None:
+        other = MagicMock(spec=["release_host_pool", "restore_host_pool"])
+        for group in (None, other):
+            runner = self._runner(monkeypatch, group)
+            runner.release_kv_cache_memory()
+            runner.restore_kv_cache_memory()
+        other.release_host_pool.assert_not_called()
+        other.restore_host_pool.assert_not_called()
 
 
 class TestPagedAttentionPlanDiagnostics:
