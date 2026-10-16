@@ -217,6 +217,18 @@ def prepare_metallib(name: str, *, build_from_source: bool = False) -> Path:
     return path
 
 
+def _metallib_is_current(name: str, source: str) -> bool:
+    """Whether the prebuilt library and its stamp already match ``source`` —
+    the same artifact+stamp+digest condition :func:`build` checks through
+    :func:`needs_rebuild` for the ``.so``."""
+    path = metallib_path(name)
+    return (
+        path.exists()
+        and _stamp_path(path).exists()
+        and not is_stale(path, _metallib_digest(name, source))
+    )
+
+
 def build_metallibs() -> list[Path]:
     """Precompile the required libraries and optional NAX library.
 
@@ -224,19 +236,30 @@ def build_metallibs() -> list[Path]:
     prebuilt libraries, but source mode (``VLLM_METAL_BUILD_FROM_SOURCE=1``)
     compiles the shaders in-process via MLX, so a source-install dev without
     the Metal toolchain never reaches this code.
+
+    A library whose prebuilt artifact and ``.sha256`` stamp still match its
+    assembled source is kept as-is, mirroring the incremental gates on the
+    native extensions — so restoring previously built artifacts (CI caches
+    them between runs) skips the ``xcrun metal`` compile entirely.
     """
     logger.info("Building Metal shader libraries ...")
-    built = [_compile_metallib(name, _metallib_source(name)) for name in METALLIB_NAMES]
+    names = [*METALLIB_NAMES]
     if _sdk_supports_nax():
-        built.append(
-            _compile_metallib(NAX_METALLIB_NAME, _metallib_source(NAX_METALLIB_NAME))
-        )
+        names.append(NAX_METALLIB_NAME)
     else:
         logger.warning(
             "macOS SDK < %s: skipping %s",
             ".".join(map(str, _NAX_MIN_SDK)),
             NAX_METALLIB_NAME,
         )
+    built = []
+    for name in names:
+        source = _metallib_source(name)
+        if _metallib_is_current(name, source):
+            logger.info("Metal library '%s' is up to date; skipping compile", name)
+            built.append(metallib_path(name))
+        else:
+            built.append(_compile_metallib(name, source))
     return built
 
 

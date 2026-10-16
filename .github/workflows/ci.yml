@@ -42,6 +42,61 @@ jobs:
       with:
         submodules: recursive
 
+    - name: Fingerprint native build toolchain
+      id: native-toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        source scripts/lib.sh
+        # Same probe/download test.sh runs; idempotent, so `xcrun metal` is
+        # guaranteed usable here before we read its version.
+        ensure_metal_toolchain
+        ensure_uv
+        py=$(uv python find 3.12)
+        {
+          xcrun -sdk macosx metal --version
+          clang --version
+          xcrun -sdk macosx --show-sdk-version
+          "$py" -c 'import sys; print(sys.version)'
+          echo "DEVELOPER_DIR=${DEVELOPER_DIR:-}"
+          echo "MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-}"
+          # Only the pins that select compiled-against headers/ABIs.
+          grep -E '"(mlx|nanobind)==' pyproject.toml
+        } | tee /dev/stderr | shasum -a 256 | cut -c1-16 > "$RUNNER_TEMP/tc"
+        echo "hash=$(cat "$RUNNER_TEMP/tc")" >> "$GITHUB_OUTPUT"
+
+    - name: Restore cached native build artifacts
+      uses: actions/cache@v4
+      with:
+        # Artifacts travel with their .sha256 stamps, and the build itself
+        # recompiles anything whose stamp no longer matches the current
+        # sources, so an imperfect key can only cost a rebuild — never run
+        # tests against a stale binary. The key hashes only what the stamps
+        # digest (Metal/C++ sources, shader assembly, build.py/constants.py,
+        # the MPS launcher), the vLLM release tag (which pins torch), and the
+        # toolchain fingerprint above (metal/clang/SDK/Python versions, Xcode
+        # pin, deployment target, mlx/nanobind pins).
+        path: |
+          vllm_metal/metal/*.metallib
+          vllm_metal/metal/*.metallib.sha256
+          vllm_metal/metal/_paged_ops*.so
+          vllm_metal/metal/_paged_ops*.so.sha256
+          vllm_metal/metal/_paged_ops.mlx-version
+          vllm_metal/pytorch_backend/_mps_ops*.so
+          vllm_metal/pytorch_backend/_mps_ops*.so.sha256
+          vllm_metal/pytorch_backend/_mps_ops.torch-version
+        key: >-
+          native-${{ matrix.os }}-${{ runner.arch }}-${{ steps.native-toolchain.outputs.hash }}-${{ hashFiles(
+          'vllm_metal/metal/build.py',
+          'vllm_metal/metal/constants.py',
+          'vllm_metal/metal/__init__.py',
+          'vllm_metal/metal/*.cpp',
+          'vllm_metal/metal/*.h',
+          'vllm_metal/metal/kernels_v2/**',
+          'vllm_metal/pytorch_backend/mps_ops.mm',
+          '.github/vllm-release-tag.commit'
+          ) }}
+
     - name: Test
       run: |
         scripts/test.sh
