@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The in-process registry fixture must not outlive the module requesting it.
 
 ``inspect_vllm_models_in_process`` replaces vLLM's ``_run_in_subprocess`` for

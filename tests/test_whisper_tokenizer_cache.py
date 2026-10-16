@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for the ``whisper_hub_tokenizer_cache`` test fixture.
 
 A fake loader stands in for ``WhisperTokenizer.from_pretrained`` so these run

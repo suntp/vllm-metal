@@ -85,7 +85,9 @@ def whisper_hub_tokenizer_cache(
             return copy.deepcopy(_whisper_hub_tokenizers[name_or_path])
         return real(name_or_path, *args, **kwargs)
 
-    monkeypatch.setattr(WhisperTokenizer, "from_pretrained", cached_from_pretrained)
+    monkeypatch.setattr(
+        WhisperTokenizer, "from_pretrained", staticmethod(cached_from_pretrained)
+    )
 
 
 @pytest.fixture
