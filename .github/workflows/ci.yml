@@ -68,14 +68,17 @@ jobs:
     - name: Restore cached native build artifacts
       uses: actions/cache@v4
       with:
-        # Artifacts travel with their .sha256 stamps, and the build itself
-        # recompiles anything whose stamp no longer matches the current
-        # sources, so an imperfect key can only cost a rebuild — never run
-        # tests against a stale binary. The key hashes only what the stamps
-        # digest (Metal/C++ sources, shader assembly, build.py/constants.py,
-        # the MPS launcher), the vLLM release tag (which pins torch), and the
-        # toolchain fingerprint above (metal/clang/SDK/Python versions, Xcode
-        # pin, deployment target, mlx/nanobind pins).
+        # Artifacts travel with their .sha256 stamps (digests of build
+        # inputs, not checksums of the artifacts); the build recompiles
+        # anything whose stamp no longer matches the current sources.
+        # Compiler/SDK compatibility relies on two layers: the toolchain
+        # fingerprint in this key (metal/clang/SDK/Python versions, Xcode
+        # pin, deployment target, mlx/nanobind pins) and, for metallibs
+        # only, the build-side .toolchain record. The .so stamps record no
+        # compiler version, so for those the key is the only guard. The key
+        # also hashes what the stamps digest (Metal/C++ sources, shader
+        # assembly, build.py/constants.py, the MPS launcher) and the vLLM
+        # release tag (which pins torch).
         path: |
           vllm_metal/metal/*.metallib
           vllm_metal/metal/*.metallib.sha256
