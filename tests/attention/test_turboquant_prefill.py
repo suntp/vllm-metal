@@ -142,6 +142,7 @@ def test_prefill_quantization_formats(
     args, kwargs = recorded_ops[0]
     assert not kwargs.get("use_turboquant", False)
     assert kwargs["window_seqlen_q"] == case.ctx.verify_window_q == 1
+    assert kwargs["nax_split_hint"] == 0  # Two full Q blocks retain the original loop.
     assert args[1].dtype == dtype
     assert args[1].shape == (17, 16, 2, 128)
 
@@ -165,6 +166,7 @@ def test_prefill_strided_translated_pages(
     assert_parity(case)
     args, kwargs = recorded_ops[0]
     assert not kwargs.get("use_turboquant", False)
+    assert kwargs["nax_split_hint"] == int(head_dim < 512)
     kb = args[9]
     # Only ceil(valid KV / kernel block) pages, even if the scheduler page
     # contains many unused sub-blocks and the input table has spare capacity.
@@ -198,24 +200,13 @@ def test_mixed_batch_routes_and_restores_rows(recorded_ops, prefill_backend):
     assert prefill[0][6][0, 0].item() == prefill[0][6][1, 0].item()
 
 
-@pytest.mark.parametrize(
-    ("qlens", "context_lens", "hint"),
-    [
-        # 63 stays compressed, so the dequantized lane sees one 193-row
-        # sequence: three full Q blocks keep the original loop, although its
-        # batch average (193) would pass the native >= 128 fallback.
-        ((193, 63), (2241, 2111), 0),
-        ((1024,), (3072,), 1),
-    ],
-)
-def test_dequantized_prefill_passes_nax_split_hint(
-    recorded_ops, qlens, context_lens, hint
-):
-    case = build_case(qlens=qlens, context_lens=context_lens)
+def test_nax_hint_describes_only_the_dequantized_prefill(recorded_ops):
+    """The compressed short request must not suppress the full prefill blocks."""
+    case = build_case(qlens=(256, 63), context_lens=(257, 2111))
     assert_parity(case)
     prefill = [kw for _, kw in recorded_ops if not kw.get("use_turboquant", False)]
     assert len(prefill) == 1
-    assert prefill[0]["nax_split_hint"] == hint
+    assert prefill[0]["nax_split_hint"] == 1
 
 
 @pytest.mark.parametrize("qlen", [1, 2, 32, 127, 128])

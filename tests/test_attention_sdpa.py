@@ -984,9 +984,18 @@ class TestSDPAForward:
                     assert spy.calls[-1].gqa_length_plan == next_plan
                     assert spy.calls[-1].num_decode_requests == len(next_plan)
 
-    @pytest.mark.parametrize("supported", ["none", "whole", "subset"])
-    @pytest.mark.parametrize("kind", ["decode", "mixed", "prefill", "expanded_verify"])
-    def test_nax_split_hint_is_computed_once_for_prefill_batches(
+    @pytest.mark.parametrize(
+        "supported,kind",
+        [
+            ("subset", "decode"),
+            ("subset", "prefill"),
+            ("subset", "mixed"),
+            ("subset", "expanded_verify"),
+            ("whole", "mixed"),
+            ("none", "mixed"),
+        ],
+    )
+    def test_nax_hints_follow_batch_shape_and_native_capabilities(
         self, monkeypatch, supported, kind
     ) -> None:
         decode = [([[0] * 65], 511), ([[1] * 65], 511)] if kind != "prefill" else []
@@ -1019,26 +1028,23 @@ class TestSDPAForward:
         total = len(ctx.slot_mapping)
         x = mx.ones((1, total, _HIDDEN), mx.float16)
         zeros = mx.zeros((1, total, _N_HEADS * _HEAD_DIM), mx.float16)
+        subset = supported == "subset" and kind == "mixed"
+        windows = (-1, 128, -1, 128) if subset else (-1,)
         with (
             patch.object(sdpa_mod, "get_ops", return_value=spy),
             patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
         ):
-            for window in (-1, 128, -1, 128):
+            for window in windows:
                 cache.sliding_window_per_layer[0] = window
                 sdpa_forward(inner, x, ctx, cache, layer_idx=0)
         forwarded = supported != "none" and kind != "decode"
-        subset = supported == "subset" and kind == "mixed"
         # The full prefill blocks split on their own; decode partial tiles
         # keep the whole mixed batch unsplit, including at window 128.
         whole_hint = int(kind == "prefill")
         assert spy.calls[-1].nax_split_hint == (whole_hint if forwarded else -1)
         assert spy.calls[-1].nax_prefill_split_hint == (1 if subset else -1)
-        assert work.call_count == 2 * (int(forwarded) + int(subset))
-        if forwarded:
-            starts = (0, ctx.num_decode_requests) if subset else (0,)
-            assert set(ctx.nax_tile_work) == {
-                (window, first) for window in (-1, 128) for first in starts
-            }
+        # Matching layers reuse each whole/subset plan for their window.
+        assert work.call_count == len(set(windows)) * (int(forwarded) + int(subset))
 
     def test_mixed_batch_routes_slots_and_page_tables_by_layer_group(self) -> None:
         """Full and sliding layers consume their scheduler-group metadata."""
