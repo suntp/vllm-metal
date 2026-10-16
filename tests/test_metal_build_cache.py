@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -522,3 +523,43 @@ def test_runtime_staleness_does_not_query_toolchain(monkeypatch, tmp_path):
 
     monkeypatch.setattr(build, "_metal_toolchain_id", boom)
     assert build.is_stale(lib, "d") is False
+
+
+def _fake_xcrun(metal_out: str, sdk_out: str = "26.2\n"):
+    def run(cmd, **kwargs):
+        out = sdk_out if "--show-sdk-version" in cmd else metal_out
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+    return run
+
+
+def _toolchain_id_with(monkeypatch, metal_out: str) -> str:
+    monkeypatch.setattr(build.subprocess, "run", _fake_xcrun(metal_out))
+    build._metal_toolchain_id.cache_clear()
+    try:
+        return build._metal_toolchain_id()
+    finally:
+        build._metal_toolchain_id.cache_clear()
+
+
+_METAL_V1 = "Apple metal version 32023.620 (metalfe-32023.620)\nTarget: air64-apple-darwin25.0.0\n"
+
+
+def test_toolchain_id_ignores_installed_dir(monkeypatch):
+    a = _toolchain_id_with(
+        monkeypatch,
+        _METAL_V1
+        + "InstalledDir: /private/var/run/com.apple.security.cryptexd/mnt/AAA/bin\n",
+    )
+    b = _toolchain_id_with(
+        monkeypatch,
+        _METAL_V1
+        + "InstalledDir: /private/var/run/com.apple.security.cryptexd/mnt/BBB/bin\n",
+    )
+    assert a == b != "unavailable"
+
+
+def test_toolchain_id_changes_with_metal_version(monkeypatch):
+    a = _toolchain_id_with(monkeypatch, _METAL_V1)
+    b = _toolchain_id_with(monkeypatch, _METAL_V1.replace("32023.620", "32023.700"))
+    assert a != b
