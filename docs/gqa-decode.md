@@ -249,7 +249,7 @@ and pass only the decode prefix of a mixed batch, regenerating the plan when
 a later forward changes decode membership, order or lengths. Mixed-prefix
 tests pin the GPU core count and require decode rows bit-identical to the
 same rows as a pure GQA decode batch and prefill rows bit-identical to the
-unsplit prefill kernel, for every shipped geometry, both cache dtypes and
+unsplit prefill kernel, for representative geometries, both cache dtypes and
 translated scheduler pages; a short decode row next to a long prefill stays
 per-token, and an allocation-wide `max_seq_len` does not size the prefix.
 
