@@ -7,6 +7,7 @@ Metal shaders through MLX's own command encoder.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import logging
 import subprocess
@@ -194,6 +195,7 @@ def _compile_metallib(name: str, source: str) -> Path:
     finally:
         Path(tmp.name).unlink(missing_ok=True)
     _stamp_path(out).write_text(_metallib_digest(name, source))
+    _toolchain_path(out).write_text(_metal_toolchain_id())
     return out
 
 
@@ -217,15 +219,52 @@ def prepare_metallib(name: str, *, build_from_source: bool = False) -> Path:
     return path
 
 
+def _toolchain_path(artifact: Path) -> Path:
+    """Build-only sidecar recording the Metal compiler + SDK an artifact was
+    compiled with. Never read at runtime (loading must not invoke ``xcrun``)."""
+    return artifact.with_suffix(artifact.suffix + ".toolchain")
+
+
+@functools.lru_cache(maxsize=1)
+def _metal_toolchain_id() -> str:
+    """Digest of ``xcrun metal --version`` + the SDK version. Build-time only.
+    Any failure yields a sentinel that never matches a recorded id, forcing a
+    compile (which then surfaces the real toolchain error)."""
+    h = hashlib.sha256()
+    for cmd in (
+        ["xcrun", "-sdk", "macosx", "metal", "--version"],
+        ["xcrun", "-sdk", "macosx", "--show-sdk-version"],
+    ):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+        except (OSError, subprocess.CalledProcessError):
+            return "unavailable"
+        h.update(out.strip().encode())
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _read_strict(path: Path) -> str | None:
+    """Read a sidecar for a build decision; any error means "not current"."""
+    try:
+        return path.read_text().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
 def _metallib_is_current(name: str, source: str) -> bool:
-    """Whether the prebuilt library and its stamp already match ``source`` —
-    the same artifact+stamp+digest condition :func:`build` checks through
-    :func:`needs_rebuild` for the ``.so``."""
+    """Build-side skip gate: the library exists, its ``.sha256`` stamp matches
+    the assembled source + flags, and it was compiled by the current Metal
+    toolchain. Stricter than the runtime :func:`is_stale` on purpose: an
+    unreadable stamp or toolchain record means rebuild."""
     path = metallib_path(name)
+    if not path.is_file():
+        return False
+    if _read_strict(_stamp_path(path)) != _metallib_digest(name, source):
+        return False
+    toolchain = _metal_toolchain_id()
     return (
-        path.exists()
-        and _stamp_path(path).exists()
-        and not is_stale(path, _metallib_digest(name, source))
+        toolchain != "unavailable" and _read_strict(_toolchain_path(path)) == toolchain
     )
 
 

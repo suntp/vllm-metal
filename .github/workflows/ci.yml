@@ -79,6 +79,7 @@ jobs:
         path: |
           vllm_metal/metal/*.metallib
           vllm_metal/metal/*.metallib.sha256
+          vllm_metal/metal/*.metallib.toolchain
           vllm_metal/metal/_paged_ops*.so
           vllm_metal/metal/_paged_ops*.so.sha256
           vllm_metal/metal/_paged_ops.mlx-version
