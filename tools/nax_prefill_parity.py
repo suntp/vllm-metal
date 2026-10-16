@@ -30,6 +30,10 @@ Additional boundary cases poison unused cache slots with NaNs and independently
 exercise small sliding windows, softcap and sinks. Dispatch diagnostics verify
 that both kernels ran; zero- and one-token windows can legitimately produce
 identical outputs.
+
+Every case runs NAX twice, with ``nax_split_hint`` forced to 0 (original loop)
+and 1 (split full-tile pipeline), and checks the pipeline that actually ran.
+head_size 512 always uses the original loop.
 """
 
 from __future__ import annotations
@@ -208,7 +212,9 @@ def _build_case(case: Case):
     return key_cache, value_cache, query, block_tables, seq_lens, cu_seqlens, sinks
 
 
-def _run(ops, case: Case, built, *, enabled: bool) -> tuple[mx.array, str]:
+def _run(
+    ops, case: Case, built, *, enabled: bool, split_hint: int | None = None
+) -> tuple[mx.array, str, int]:
     key_cache, value_cache, query, block_tables, seq_lens, cu_seqlens, sinks = built
     ops.set_nax_enabled(enabled)
     out = mx.array(0)
@@ -227,19 +233,17 @@ def _run(ops, case: Case, built, *, enabled: bool) -> tuple[mx.array, str]:
         case.sliding_window,
         out,
         sinks=sinks,
+        **({} if split_hint is None else {"nax_split_hint": split_hint}),
     )
     mx.eval(out)
-    return out.astype(mx.float32), ops.last_paged_dispatch()
+    return (
+        out.astype(mx.float32),
+        ops.last_paged_dispatch(),
+        ops.last_nax_split_pipeline(),
+    )
 
 
-def _check(ops, case: Case) -> tuple[bool, str]:
-    built = _build_case(case)
-    nax, nax_dispatch = _run(ops, case, built, enabled=True)
-    tiled, tiled_dispatch = _run(ops, case, built, enabled=False)
-    if nax_dispatch != "nax_prefill" or tiled_dispatch != "tiled_prefill":
-        return False, f"unexpected dispatch: NAX={nax_dispatch}, tiled={tiled_dispatch}"
-    mx.eval(nax, tiled)
-
+def _compare(case: Case, nax: mx.array, tiled: mx.array) -> tuple[bool, str]:
     delta = mx.abs(nax - tiled)
     abs_err = delta.max().item()
     ulp = _DTYPE_EPS[case.dtype] * max(mx.abs(tiled).max().item(), 1.0)
@@ -252,6 +256,29 @@ def _check(ops, case: Case) -> tuple[bool, str]:
     if max_ulp > MAX_ULP or mean_ulp > MEAN_ULP:
         return False, f"{detail} exceeds bound"
     return True, detail
+
+
+def _check(ops, case: Case) -> tuple[bool, str]:
+    built = _build_case(case)
+    tiled, tiled_dispatch, _ = _run(ops, case, built, enabled=False)
+    if tiled_dispatch != "tiled_prefill":
+        return False, f"unexpected dispatch: tiled={tiled_dispatch}"
+    details = []
+    for hint in (0, 1):
+        nax, nax_dispatch, pipeline = _run(
+            ops, case, built, enabled=True, split_hint=hint
+        )
+        if nax_dispatch != "nax_prefill":
+            return False, f"hint={hint}: unexpected dispatch NAX={nax_dispatch}"
+        expected = hint if case.head_size < 512 else 0
+        if pipeline != expected:
+            return False, f"hint={hint}: ran pipeline {pipeline}, want {expected}"
+        mx.eval(nax, tiled)
+        ok, detail = _compare(case, nax, tiled)
+        details.append(f"{'split' if pipeline else 'loop'}: {detail}")
+        if not ok:
+            return False, "; ".join(details)
+    return True, "; ".join(details)
 
 
 def main() -> int:
@@ -285,7 +312,7 @@ def main() -> int:
         for failure in failures:
             print(f"  {failure}", file=sys.stderr)
         return 1
-    print(f"\nPARITY PASS ({len(cases)} cases)")
+    print(f"\nPARITY PASS ({len(cases)} cases x 2 NAX pipelines)")
     return 0
 
 

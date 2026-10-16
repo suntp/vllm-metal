@@ -79,7 +79,9 @@ def test_native_hint_does_not_change_outputs():
     )
     seq_lens = mx.array([q_ + c for q_, c in seqs], mx.int32)
     cu = mx.array([0, 300, 370], mx.int32)
-    outs = []
+    nax = ops.nax_supported() and ops.nax_ready()
+    previous = ops._set_paged_dispatch_diagnostics(True)
+    outs, pipelines = [], []
     for hint in (-1, 0, 1):
         out = mx.array(0)
         ops.paged_attention_primitive(
@@ -98,9 +100,13 @@ def test_native_hint_does_not_change_outputs():
             out,
             nax_split_hint=hint,
         )
+        mx.eval(out)
         outs.append(out)
-    mx.eval(outs)
+        pipelines.append(ops.last_nax_split_pipeline())
+    ops._set_paged_dispatch_diagnostics(previous)
     assert mx.array_equal(outs[0], outs[1]) and mx.array_equal(outs[0], outs[2])
+    # -1 falls back to the batch average (185 query tokens per sequence).
+    assert pipelines == ([1, 0, 1] if nax else [-1, -1, -1])
     with pytest.raises(ValueError):
         ops.paged_attention_primitive(
             q,

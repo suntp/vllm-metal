@@ -57,10 +57,16 @@ static std::atomic<PagedDispatch> g_last_dispatch{PagedDispatch::None};
 static std::atomic<int> g_last_gqa_partition{0};
 static std::atomic<int> g_last_gqa_requests{0};
 static std::atomic<bool> g_dispatch_diagnostics_enabled{false};
+// NAX prefill pipeline of the most recent recorded NAX launch: 1 split,
+// 0 original loop, -1 none (non-NAX dispatch or diagnostics off).
+static std::atomic<int> g_last_nax_split{-1};
 inline void record_paged_dispatch(PagedDispatch family, int gqa_partition = 0,
                                   int gqa_requests = 0) {
   if (!g_dispatch_diagnostics_enabled.load(std::memory_order_relaxed)) return;
   g_last_dispatch.store(family, std::memory_order_relaxed);
+  if (family != PagedDispatch::NaxPrefill &&
+      family != PagedDispatch::MixedNaxPrefillDecode)
+    g_last_nax_split.store(-1, std::memory_order_relaxed);
   g_last_gqa_partition.store(gqa_partition, std::memory_order_relaxed);
   g_last_gqa_requests.store(gqa_requests, std::memory_order_relaxed);
 }
@@ -73,6 +79,7 @@ static bool set_paged_dispatch_diagnostics(bool enabled) {
   g_last_dispatch.store(PagedDispatch::None, std::memory_order_relaxed);
   g_last_gqa_partition.store(0, std::memory_order_relaxed);
   g_last_gqa_requests.store(0, std::memory_order_relaxed);
+  g_last_nax_split.store(-1, std::memory_order_relaxed);
   return previous;
 }
 // Split only after eight KV partitions amortize the extra dispatch.
@@ -513,6 +520,8 @@ static void dispatch_paged_attention_nax(
               : total_q_tokens >= kNaxSplitMinAvgQ * num_seqs);
   std::string hash_name = base_kname + "_sk" + (use_sinks ? "1" : "0")
                           + "_sf" + (split_full ? "1" : "0");
+  if (g_dispatch_diagnostics_enabled.load(std::memory_order_relaxed))
+    g_last_nax_split.store(split_full ? 1 : 0, std::memory_order_relaxed);
 
   auto* lib = d.get_library("paged_attention_nax_kern");
   auto* kernel = d.get_kernel(
@@ -2643,6 +2652,13 @@ NB_MODULE(_paged_ops, m) {
         "nax_split_hint (M5 NAX prefill only) selects the split full-tile "
         "pipeline (1) or the original loop (0); -1 uses the batch-average "
         "rule. Outputs are identical either way; head_size 512 ignores it.");
+
+  m.def(
+      "last_nax_split_pipeline",
+      []() { return g_last_nax_split.load(std::memory_order_relaxed); },
+      "NAX prefill pipeline used by the most recent recorded NAX launch: 1 for "
+      "the split full-tile pipeline, 0 for the original loop, -1 when the last "
+      "recorded dispatch was not NAX or diagnostics are disabled.");
 
   m.def(
       "last_paged_dispatch",
