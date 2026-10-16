@@ -598,7 +598,7 @@ static void dispatch_paged_attention_nax(
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
     int block_size, int sliding_window,
-    Stream s, const array* sinks) {
+    Stream s, const array* sinks, int nax_split_hint) {
   auto& d = metal::device(s.device);
 
   constexpr int kNaxBQ = 64;
@@ -621,15 +621,19 @@ static void dispatch_paged_attention_nax(
   //  - unsplit: the original single guarded loop, compiled exactly as before.
   // Containing both tile bodies changes codegen enough to slow the guarded
   // path, so launches dominated by partial Q blocks (short prefill, cached
-  // prefix + few new tokens, small chunks) take the unsplit pipeline. The
-  // host only knows totals here, so the cut is an average of at least 128
-  // query tokens (two Q blocks) per sequence.
-  // head_size 512 stays unsplit: conservative enablement scope for this
-  // change to avoid regressing measured shapes (the split was slower on long
-  // D512 prefill; register pressure is suspected but unverified). D512 can
-  // be optimized separately later.
+  // prefix + few new tokens, small chunks) take the unsplit pipeline.
+  // nax_split_hint (0/1) is the caller's per-sequence choice, computed on the
+  // CPU from the lengths it already holds (vllm_metal.attention.nax_split).
+  // Without it (-1) the host only knows totals here, so it falls back to an
+  // average of at least 128 query tokens (two Q blocks) per sequence.
+  // head_size 512 stays unsplit either way: conservative enablement scope for
+  // this change to avoid regressing measured shapes (the split was slower on
+  // long D512 prefill; register pressure is suspected but unverified). D512
+  // can be optimized separately later.
   bool split_full = head_size < 512
-      && total_q_tokens >= kNaxSplitMinAvgQ * num_seqs;
+      && (nax_split_hint >= 0
+              ? nax_split_hint == 1
+              : total_q_tokens >= kNaxSplitMinAvgQ * num_seqs);
   std::string hash_name = base_kname + "_sk" + (use_sinks ? "1" : "0")
                           + "_sf" + (split_full ? "1" : "0");
 
@@ -830,7 +834,8 @@ static void dispatch_paged_attention_v2_online(
     int max_decode_context_len = 0,
     int decode_only_rows = 0, bool gqa_disabled = false,
     int gqa_test_partition = 0,
-    const GqaDecodeLengthPlan& gqa_length_plan = {}) {
+    const GqaDecodeLengthPlan& gqa_length_plan = {},
+    int nax_split_hint = -1) {
   int head_size = static_cast<int>(query.shape(2));
 
   // Tiled kernel for prefill batches, matching vLLM Triton's 2D/3D dispatch
@@ -898,7 +903,7 @@ static void dispatch_paged_attention_v2_online(
         out, query, key_cache, value_cache,
         num_kv_heads, scale, softcap,
         block_tables, seq_lens, cu_seqlens_q,
-        block_size, sliding_window, s, sinks);
+        block_size, sliding_window, s, sinks, nax_split_hint);
     return;
   }
   if (tile_config) {
@@ -1223,7 +1228,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
       bool use_mm_prefix = false, int num_decode_requests = -1,
       int num_decode_tokens = 0, int max_decode_context_len = 0,
       bool gqa_disabled = false, int gqa_test_partition = 0,
-      const GqaDecodeLengthPlan& gqa_length_plan = {})
+      const GqaDecodeLengthPlan& gqa_length_plan = {},
+      int nax_split_hint = -1)
       : UnaryPrimitive(stream),
         num_kv_heads_(num_kv_heads), scale_(scale), softcap_(softcap),
         block_size_(block_size), max_seq_len_(max_seq_len),
@@ -1235,7 +1241,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         num_decode_tokens_(num_decode_tokens),
         max_decode_context_len_(max_decode_context_len),
         gqa_disabled_(gqa_disabled), gqa_test_partition_(gqa_test_partition),
-        gqa_length_plan_(gqa_length_plan) {}
+        gqa_length_plan_(gqa_length_plan), nax_split_hint_(nax_split_hint) {}
 
   void eval_cpu(const std::vector<array>&, array&) override {
     throw std::runtime_error(
@@ -1268,7 +1274,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         stream(),
         ks, vs, kz, vc, use_turboquant_, k_bits_, v_bits_, sk, mp,
         num_decode_requests_, num_decode_tokens_, max_decode_context_len_,
-        0, gqa_disabled_, gqa_test_partition_, gqa_length_plan_);
+        0, gqa_disabled_, gqa_test_partition_, gqa_length_plan_,
+        nax_split_hint_);
   }
 
   const char* name() const override { return "PagedAttention"; }
@@ -1291,7 +1298,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         && rhs->max_decode_context_len_ == max_decode_context_len_
         && rhs->gqa_disabled_ == gqa_disabled_
         && rhs->gqa_test_partition_ == gqa_test_partition_
-        && rhs->gqa_length_plan_ == gqa_length_plan_;
+        && rhs->gqa_length_plan_ == gqa_length_plan_
+        && rhs->nax_split_hint_ == nax_split_hint_;
   }
 
  private:
@@ -1313,6 +1321,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
   bool gqa_disabled_;
   int gqa_test_partition_;
   GqaDecodeLengthPlan gqa_length_plan_;
+  int nax_split_hint_;
 };
 
 static array paged_attention_primitive_fn(
@@ -1335,7 +1344,10 @@ static array paged_attention_primitive_fn(
     int max_decode_context_len = 0, bool gqa_disabled = false,
     int gqa_test_partition = 0,
     const std::vector<int>& gqa_context_lens = {},
-    const std::optional<GqaDecodeLengthPlan>& gqa_length_plan = std::nullopt) {
+    const std::optional<GqaDecodeLengthPlan>& gqa_length_plan = std::nullopt,
+    int nax_split_hint = -1) {
+  if (nax_split_hint < -1 || nax_split_hint > 1)
+    throw std::invalid_argument("nax_split_hint must be -1, 0 or 1");
   if (gqa_length_plan && !gqa_context_lens.empty())
     throw std::invalid_argument("pass only one of gqa_length_plan and gqa_context_lens");
   const auto lengths = gqa_length_plan
@@ -1477,7 +1489,8 @@ static array paged_attention_primitive_fn(
       block_size, max_seq_len, sliding_window,
       use_turboquant, k_bits, v_bits, window_seqlen_q, sinks != nullptr,
       mm_prefix_ranges != nullptr, num_decode_requests, num_decode_tokens,
-      max_decode_context_len, gqa_disabled, gqa_test_partition, lengths);
+      max_decode_context_len, gqa_disabled, gqa_test_partition, lengths,
+      nax_split_hint);
   std::vector<array> inputs = {query, key_cache, value_cache,
                                block_tables, seq_lens, cu_seqlens_q};
   if (use_turboquant) {
@@ -2415,6 +2428,7 @@ NB_MODULE(_paged_ops, m) {
     caps["decode_routing_metadata"] = true;
     caps["gqa_batch_context_lens"] = true;
     caps["gqa_length_plan"] = true;
+    caps["nax_split_hint"] = true;
     return caps;
   }, "Capabilities of the public paged attention interface. Private test "
      "kernels do not imply an enabled production route.");
@@ -2680,7 +2694,8 @@ NB_MODULE(_paged_ops, m) {
            int num_decode_tokens,
            int max_decode_context_len, bool gqa_disabled,
            const std::vector<int>& gqa_context_lens,
-           const std::optional<GqaDecodeLengthPlan>& gqa_length_plan) {
+           const std::optional<GqaDecodeLengthPlan>& gqa_length_plan,
+           int nax_split_hint) {
           const array* sk = sinks_h.is_none()
               ? nullptr : nb::inst_ptr<array>(sinks_h);
           const array* mp = mm_prefix_ranges_h.is_none()
@@ -2705,7 +2720,7 @@ NB_MODULE(_paged_ops, m) {
               use_turboquant, quant_type, ks, vs, kz, vc, v_bits,
               window_seqlen_q, sk, mp, num_decode_requests,
               num_decode_tokens, max_decode_context_len, gqa_disabled,
-              0, gqa_context_lens, gqa_length_plan);
+              0, gqa_context_lens, gqa_length_plan, nax_split_hint);
           nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
         },
         nb::arg("query"),
@@ -2732,6 +2747,7 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("gqa_disabled") = false,
         nb::arg("gqa_context_lens") = std::vector<int>{},
         nb::arg("gqa_length_plan") = nb::none(),
+        nb::arg("nax_split_hint") = -1,
         "Paged attention primitive (read-only). Cache writes are handled "
         "by MLX-native scatter upstream.  window_seqlen_q must equal the "
         "longest cu_seqlens_q segment (validated when > 1); small "
@@ -2752,7 +2768,10 @@ NB_MODULE(_paged_ops, m) {
         "decode batch, used for planning without a GPU readback; the caller "
         "must keep both consistent. Alternatively pass a gqa_length_plan "
         "built once per forward; its compact statistics are captured by value. "
-        "Omit both to retain legacy batch routing.");
+        "Omit both to retain legacy batch routing. "
+        "nax_split_hint (M5 NAX prefill only) selects the split full-tile "
+        "pipeline (1) or the original loop (0); -1 uses the batch-average "
+        "rule. Outputs are identical either way; head_size 512 ignores it.");
 
   m.def(
       "last_paged_dispatch",

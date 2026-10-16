@@ -63,6 +63,7 @@ from vllm_metal.attention.impls.turboquant_prefill import (
 from vllm_metal.attention.impls.varlen_rope_compat import (
     apply_attention_rope,
 )
+from vllm_metal.attention.nax_split import nax_split_hint, nax_tile_work
 from vllm_metal.metal import get_ops, paged_attention_capabilities
 
 logger = init_logger(__name__)
@@ -989,6 +990,20 @@ def sdpa_forward(
             if ctx.gqa_length_plan is None:
                 ctx.gqa_length_plan = ops.gqa_decode_length_plan(ctx.context_lens)
             paged_kwargs["gqa_length_plan"] = ctx.gqa_length_plan
+        if (
+            capabilities["nax_split_hint"]
+            and ctx.cu_seqlens is not None
+            and len(ctx.cu_seqlens) == len(ctx.context_lens) + 1
+            and ctx.cu_seqlens[-1] == q_3d.shape[0]
+            and q_3d.shape[0] > len(ctx.context_lens)
+        ):
+            # Prefill batch: pick the NAX pipeline from per-sequence lengths
+            # the kernel dispatcher could only read back from the GPU.
+            if ctx.nax_tile_work is None:
+                ctx.nax_tile_work = nax_tile_work(ctx.cu_seqlens, ctx.context_lens)
+            paged_kwargs["nax_split_hint"] = nax_split_hint(
+                ctx.nax_tile_work, q_3d.shape[2]
+            )
         ops.paged_attention_primitive(
             q_3d,
             kernel_k_cache,

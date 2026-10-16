@@ -730,6 +730,7 @@ class _PagedRoutingOpsSpy:
         gqa_disabled: bool = False,
         gqa_context_lens: list[int] | None = None,
         gqa_length_plan: object = None,
+        nax_split_hint: int = -1,
     ) -> None:
         del window_seqlen_q, sinks
         self.calls[-1].block_tables = block_tables.tolist()
@@ -741,6 +742,7 @@ class _PagedRoutingOpsSpy:
         self.calls[-1].max_decode_context_len = max_decode_context_len
         self.calls[-1].gqa_context_lens = gqa_context_lens
         self.calls[-1].gqa_length_plan = gqa_length_plan
+        self.calls[-1].nax_split_hint = nax_split_hint
 
 
 class _PreMmPrefixOps(_PagedOpsCapsOff):
@@ -954,6 +956,44 @@ class TestSDPAForward:
                 sdpa_forward(inner, x, next_ctx, cache, layer_idx=0)
                 assert spy.length_plans == [(2, 4), (5, 3)]
                 assert spy.calls[-1].gqa_length_plan is not plan
+
+    @pytest.mark.parametrize("supported", [False, True])
+    @pytest.mark.parametrize("kind", ["decode", "mixed", "prefill"])
+    def test_nax_split_hint_is_computed_once_for_prefill_batches(
+        self, monkeypatch, supported, kind
+    ) -> None:
+        decode = [([[0]], 1), ([[1]], 3)] if kind != "prefill" else []
+        prefill = [([[2]], 5, 0)] if kind != "decode" else []
+        prepare_grouped(decode, prefill, (8,))
+        ctx = get_context()
+        spy = _PagedRoutingOpsSpy()
+        caps = {**spy.paged_attention_capabilities(), "nax_split_hint": supported}
+        monkeypatch.setattr(spy, "paged_attention_capabilities", lambda: caps)
+        work = MagicMock(wraps=sdpa_mod.nax_tile_work)
+        monkeypatch.setattr(sdpa_mod, "nax_tile_work", work)
+        inner = _make_inner()
+        inner.o_proj = lambda out: out
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            num_blocks=3,
+            block_size=8,
+            dtype=mx.float16,
+        )
+        total = len(ctx.slot_mapping)
+        x = mx.ones((1, total, _HIDDEN), mx.float16)
+        zeros = mx.zeros((1, total, _N_HEADS * _HEAD_DIM), mx.float16)
+        with (
+            patch.object(sdpa_mod, "get_ops", return_value=spy),
+            patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
+        ):
+            for _layer in range(3):
+                sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+        forwarded = supported and kind != "decode"
+        # Five-token prefills have no full 64-row Q block: original loop.
+        assert spy.calls[-1].nax_split_hint == (0 if forwarded else -1)
+        assert work.call_count == int(forwarded)
 
     def test_mixed_batch_routes_slots_and_page_tables_by_layer_group(self) -> None:
         """Full and sliding layers consume their scheduler-group metadata."""
