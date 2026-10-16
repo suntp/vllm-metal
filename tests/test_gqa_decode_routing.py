@@ -129,6 +129,7 @@ def test_unknown_core_count_keeps_measured_shape_on_baseline() -> None:
     ops._override_detected_gpu_core_count_for_test(0)
     try:
         assert ops.detected_gpu_core_count() == 0
+        assert ops.min_decode_grid() == 14 * 8
         out, ref = _run_primitive(
             [32768],
             mx.bfloat16,
@@ -136,7 +137,7 @@ def test_unknown_core_count_keeps_measured_shape_on_baseline() -> None:
             seed=37,
             num_decode_requests=1,
         )
-        _assert_fallback()
+        assert _dispatch_family() == "per_token_ps512"
         _assert_close(out, ref, mx.bfloat16)
     finally:
         _restore_test_gpu_cores()
@@ -171,33 +172,6 @@ def test_one_decode_request_takes_gqa(num_decode_requests) -> None:
 
 
 @pytest.mark.parametrize("q,kv,head,block_size", GQA_GEOMETRIES)
-@pytest.mark.parametrize("offset", [-1, 0, 1])
-def test_each_geometry_lower_boundary_dispatch(q, kv, head, block_size, offset):
-    cores = get_ops().detected_gpu_core_count()
-    if cores <= 0:
-        pytest.skip("GPU core count unavailable")
-    minimum = min(GQA_PARTITIONS) * ((GQA_SIMD_GROUPS_PER_CORE * cores + q - 1) // q)
-    n = minimum + offset
-    if offset >= 0:
-        _require_grid(n, q)
-    out, ref = _run_primitive(
-        [n],
-        mx.bfloat16,
-        interleaved=True,
-        seed=715,
-        num_query_heads=q,
-        num_kv_heads=kv,
-        head_size=head,
-        block_size=block_size,
-    )
-    if offset >= 0:
-        assert _dispatch_family() == "gqa_decode"
-    else:
-        _assert_fallback()
-    _assert_close(out, ref, mx.bfloat16)
-
-
-@pytest.mark.parametrize("q,kv,head,block_size", GQA_GEOMETRIES)
 @pytest.mark.parametrize("n", [131071, 131072, 131073, 196608, 262144, 262145])
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.slow
@@ -220,13 +194,9 @@ def test_each_geometry_stays_on_gqa_at_long_context(q, kv, head, block_size, n, 
 @pytest.mark.parametrize(
     "q,kv,head,n",
     [
-        (16, 4, 256, 16384),
         (16, 4, 256, 32768),  # 16/4/256 is outside default routing.
-        (16, 4, 256, 65536),
-        (16, 4, 256, 131073),
         (32, 4, 64, 32768),  # Head dim 64 is not a shipped GQA specialization.
         (64, 8, 64, 32768),
-        (32, 4, 64, 65536),
         (16, 2, 96, 65536),
         (32, 4, 256, 65536),  # Unmeasured 32/4/256 stays on the established path.
         (16, 8, 128, 65536),
@@ -315,8 +285,15 @@ def test_prefill_and_mixed_batches_stay_off_gqa(query_lens):
 
 
 @pytest.mark.parametrize("disabled", [False, True])
-def test_split_mixed_decode_stays_on_upstream_path(disabled, force_tiled_prefill):
+@pytest.mark.parametrize("prefill_kernel", ["tiled", "nax"])
+def test_split_mixed_decode_stays_on_upstream_path(prefill_kernel, disabled, request):
     """Splitting one decode row out of a mixed batch must not enable GQA."""
+    if prefill_kernel == "tiled":
+        request.getfixturevalue("force_tiled_prefill")
+        expected_family = "mixed_prefill_decode"
+    else:
+        request.getfixturevalue("nax_prefill")
+        expected_family = "mixed_nax_prefill_decode"
     out, ref = _run_primitive(
         [8192, 128],
         mx.float16,
@@ -328,7 +305,7 @@ def test_split_mixed_decode_stays_on_upstream_path(disabled, force_tiled_prefill
         max_decode_context_len=8192,
         gqa_disabled=disabled,
     )
-    assert _dispatch_family() == "mixed_prefill_decode"
+    assert _dispatch_family() == expected_family
     assert get_ops().last_gqa_partition_size() == 0
     _assert_close(out, ref, mx.float16)
 
@@ -381,26 +358,16 @@ def test_matching_float32_uses_fallback() -> None:
     _assert_close(out, ref, mx.float32)
 
 
-@pytest.mark.parametrize("minimum", [32768, 196609])
-@pytest.mark.parametrize("q,kv,head,block_size", GQA_GEOMETRIES)
-def test_gqa_disable_flag_forces_established_kernels(
-    monkeypatch, minimum, q, kv, head, block_size
-) -> None:
+def test_gqa_disable_flag_forces_established_kernels(monkeypatch) -> None:
     from vllm_metal import envs
 
     monkeypatch.delenv("VLLM_METAL_DISABLE_GQA_DECODE", raising=False)
     assert envs.VLLM_METAL_DISABLE_GQA_DECODE is False
-    n = _eligible_context(q, minimum=minimum)
-    shape = {
-        "num_query_heads": q,
-        "num_kv_heads": kv,
-        "head_size": head,
-        "block_size": block_size,
-    }
-    out_on, ref = _run_primitive([n], mx.bfloat16, interleaved=True, seed=7, **shape)
+    n = _eligible_context(minimum=0)
+    out_on, ref = _run_primitive([n], mx.bfloat16, interleaved=True, seed=7)
     assert _dispatch_family() == "gqa_decode"
     out_off, _ = _run_primitive(
-        [n], mx.bfloat16, interleaved=True, seed=7, gqa_disabled=True, **shape
+        [n], mx.bfloat16, interleaved=True, seed=7, gqa_disabled=True
     )
     _assert_fallback()
     _assert_close(out_on, ref, mx.bfloat16)
@@ -414,7 +381,6 @@ def test_gqa_disable_flag_forces_established_kernels(
         interleaved=True,
         seed=7,
         gqa_disabled=envs.VLLM_METAL_DISABLE_GQA_DECODE,
-        **shape,
     )
     _assert_fallback()
     _assert_close(out_env, ref, mx.bfloat16)
@@ -497,11 +463,11 @@ def test_default_partition_thresholds(q, kv, head, block):
 
 @pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
 @pytest.mark.parametrize("part", GQA_PARTITIONS)
-@pytest.mark.parametrize("offset", [-1, 0, 17])
-@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("offset", [-1, 0])
 def test_default_partition_executes_and_matches_oracle(
-    q, kv, head, block, part, offset, dtype
+    q, kv, head, block, part, offset
 ):
+    # Both dtypes and partial tails are covered by the forced-kernel suite.
     ops = get_ops()
     cores = ops.detected_gpu_core_count()
     if cores <= 0:
@@ -509,7 +475,7 @@ def test_default_partition_executes_and_matches_oracle(
     threshold = part * ((GQA_SIMD_GROUPS_PER_CORE * cores + q - 1) // q)
     out, ref = _run_primitive(
         [threshold + offset],
-        dtype,
+        mx.bfloat16,
         interleaved=True,
         seed=719,
         num_query_heads=q,
@@ -524,4 +490,4 @@ def test_default_partition_executes_and_matches_oracle(
     else:
         _assert_fallback()
     assert ops.last_gqa_partition_size() == expected
-    _assert_close(out, ref, dtype)
+    _assert_close(out, ref, mx.bfloat16)

@@ -6,6 +6,7 @@ import multiprocessing as mp
 import os
 import random
 import signal
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -87,6 +88,29 @@ def force_tiled_prefill():
         ops.set_nax_enabled(True)
 
 
+@pytest.fixture
+def nax_prefill():
+    """Route eligible prefill to NAX and record the dispatch family.
+
+    Skips off M5: the NAX kernel cannot run there, and the tiled twin of this
+    path is covered by test_mixed_batch_dispatches_decode_by_context.
+    """
+    import mlx.core as mx
+
+    from vllm_metal.metal import get_ops
+
+    ops = get_ops()
+    if not (ops.nax_supported() and ops.nax_ready()):
+        pytest.skip("NAX prefill needs an M5 GPU and the NAX metallib")
+    ops.set_nax_enabled(True)
+    previous = ops._set_paged_dispatch_diagnostics(True)
+    try:
+        yield ops
+    finally:
+        mx.synchronize()
+        ops._set_paged_dispatch_diagnostics(previous)
+
+
 @pytest.fixture(autouse=True)
 def _seed_random_generators() -> None:
     """Seed common RNGs to keep tests deterministic."""
@@ -124,17 +148,22 @@ def _no_kv_commit_probe(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture
 def spy_group(monkeypatch) -> SpyTransferGroup:
     """Install a spy as the KV transfer group the runner's connector uses."""
-    import vllm_metal.v1.kv_connector as metal_kv_connector
+    import vllm.v1.worker.gpu.kv_connector as upstream
+
     import vllm_metal.v1.model_runner as mr
     from tests.kv_connector_spy import SpyTransferGroup
 
     group = SpyTransferGroup()
     monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
-    monkeypatch.setattr(metal_kv_connector, "get_kv_transfer_group", lambda: group)
+    monkeypatch.setattr(upstream, "get_kv_transfer_group", lambda: group)
     # The driver opens a forward context for loads; a stub runner has no real
     # VllmConfig, and the spy ignores the context.
-    import vllm.v1.worker.gpu.kv_connector as upstream
-
     monkeypatch.setattr(upstream, "is_forward_context_available", lambda: True)
     monkeypatch.setattr(upstream, "get_forward_context", lambda: None)
+    # Stands in for register_kv_connector_caches, which stub runners skip.
+    monkeypatch.setattr(
+        mr.MetalModelRunner,
+        "_kv_connector_driver",
+        upstream.ActiveKVConnector(SimpleNamespace(), {}),
+    )
     return group

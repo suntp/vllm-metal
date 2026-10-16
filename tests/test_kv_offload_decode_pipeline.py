@@ -98,7 +98,7 @@ class _ConnectorEnv:
 def connector_env(spy_group: SpyTransferGroup) -> _ConnectorEnv:
     """Make the runner's connector step runnable off-device.
 
-    ``_kv_connector_start_step`` and ``MetalKVConnector`` run for real, since
+    ``_kv_connector_start_step`` and ``ActiveKVConnector`` run for real, since
     the step's lifetime is under test. Only the transfer group is a spy.
     """
     return _ConnectorEnv(spy_group)

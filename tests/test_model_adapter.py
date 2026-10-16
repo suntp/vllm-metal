@@ -766,6 +766,14 @@ class _PaddleOCRLanguageModelStub:
         return None
 
 
+# Every Qwen3-VL family hf_config carries the video frame token ids.
+_QWEN3_VL_FRAME_TOKEN_IDS = {
+    "video_token_id": 248057,
+    "vision_start_token_id": 248053,
+    "vision_end_token_id": 248054,
+}
+
+
 class TestBuildMultimodalAdapter:
     def test_builds_qwen35_adapter_from_loaded_vlm(self) -> None:
         vision_tower = object()
@@ -777,7 +785,7 @@ class TestBuildMultimodalAdapter:
             vision_tower=vision_tower,
             language_model=language_model,
         )
-        hf_config = SimpleNamespace(model_type="qwen3_5")
+        hf_config = SimpleNamespace(model_type="qwen3_5", **_QWEN3_VL_FRAME_TOKEN_IDS)
 
         adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
 
@@ -795,6 +803,7 @@ class TestBuildMultimodalAdapter:
         hf_config = SimpleNamespace(
             model_type="custom",
             architectures=["Qwen3VLForConditionalGeneration"],
+            **_QWEN3_VL_FRAME_TOKEN_IDS,
         )
 
         adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)

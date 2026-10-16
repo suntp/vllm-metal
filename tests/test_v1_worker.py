@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 import torch
 
@@ -37,6 +38,9 @@ from vllm_metal.v1.cache_policy import (  # noqa: E402
     WorkerCachePlanner,
     kv_pool_bytes_after_probe,
     kv_swap_tolerance_bytes,
+)
+from vllm_metal.v1.kv_offload.connector import (  # noqa: E402
+    MetalOffloadingConnector,
 )
 from vllm_metal.v1.worker import MetalWorker  # noqa: E402
 
@@ -130,6 +134,16 @@ def _make_worker(model_runner: object) -> MetalWorker:
 
 class TestWorkerRunnerBoundaryDelegation:
     """Worker should honor model runner memory-reporting modes."""
+
+    def test_model_inspection_renders_mlx_module_tree(self) -> None:
+        model = nn.Sequential(nn.Linear(4, 8), nn.RMSNorm(8))
+        worker = _make_worker(SimpleNamespace(model=model))
+
+        inspection = MetalWorker.get_model_inspection(worker)
+
+        assert inspection.splitlines()[0] == "Sequential("
+        assert "Linear(input_dims=4, output_dims=8, bias=True)" in inspection
+        assert "RMSNorm(8, eps=1e-05)" in inspection
 
     @pytest.mark.parametrize("revision", [None, "release-tag", "a" * 40])
     def test_init_device_preserves_stt_revision(self, monkeypatch, revision) -> None:
@@ -285,6 +299,103 @@ class TestWorkerRunnerBoundaryDelegation:
         worker.get_cache_block_size_bytes = MagicMock(return_value=1_000_000_000)
 
         assert MetalWorker.determine_available_memory(worker) == 2_900_000_000
+
+
+class TestSleepMode:
+    """Sleep frees the KV cache in place; weights stay in unified memory."""
+
+    def _worker(self) -> tuple[MetalWorker, list[str]]:
+        calls: list[str] = []
+        runner = SimpleNamespace(
+            release_kv_cache_memory=lambda: calls.append("release"),
+            restore_kv_cache_memory=lambda: calls.append("restore"),
+        )
+        return _make_worker(runner), calls
+
+    def test_level_one_releases_kv_and_wake_restores_it(self) -> None:
+        worker, calls = self._worker()
+
+        MetalWorker.sleep(worker, level=1)
+        MetalWorker.wake_up(worker, tags=None)
+
+        assert calls == ["release", "restore"]
+
+    def test_waking_only_weights_keeps_the_kv_cache_released(self) -> None:
+        worker, calls = self._worker()
+
+        MetalWorker.sleep(worker, level=1)
+        MetalWorker.wake_up(worker, tags=["weights"])
+
+        assert calls == ["release"]
+
+    def test_unsupported_level_is_rejected_before_releasing(self) -> None:
+        worker, calls = self._worker()
+
+        with pytest.raises(NotImplementedError, match="level 1 only"):
+            MetalWorker.sleep(worker, level=2)
+
+        assert calls == []
+
+    def test_discarding_weights_is_rejected(self) -> None:
+        worker, calls = self._worker()
+
+        with pytest.raises(NotImplementedError, match="only discard the KV cache"):
+            MetalWorker.discard(worker, ("weights",))
+
+        assert calls == []
+
+
+class TestSleepReleasesHostPool:
+    """Sleep frees the KV offloading host pool with the KV cache."""
+
+    def _runner(self, monkeypatch, group, runtime=None):
+        import vllm_metal.v1.model_runner as mr
+
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: group is not None)
+        monkeypatch.setattr(mr, "get_kv_transfer_group", lambda: group)
+        return make_stub_runner(_paged_attention_runtime=runtime)
+
+    def test_releases_and_restores_the_pool(self, monkeypatch) -> None:
+        connector = MagicMock(spec=MetalOffloadingConnector)
+        runner = self._runner(monkeypatch, connector)
+
+        runner.release_kv_cache_memory()
+        connector.release_host_pool.assert_called_once_with()
+        connector.restore_host_pool.assert_not_called()
+
+        runner.restore_kv_cache_memory()
+        connector.restore_host_pool.assert_called_once_with()
+
+    def test_keeps_the_pool_if_the_kv_cache_cannot_be_freed(self, monkeypatch) -> None:
+        connector = MagicMock(spec=MetalOffloadingConnector)
+        runtime = MagicMock()
+        runtime.release_kv_memory.side_effect = NotImplementedError
+        runner = self._runner(monkeypatch, connector, runtime)
+
+        with pytest.raises(NotImplementedError):
+            runner.release_kv_cache_memory()
+        connector.release_host_pool.assert_not_called()
+
+    def test_wake_reuses_the_pool_before_the_kv_cache(self, monkeypatch) -> None:
+        parent = MagicMock()
+        parent.connector = MagicMock(spec=MetalOffloadingConnector)
+        runner = self._runner(monkeypatch, parent.connector, parent.runtime)
+
+        runner.restore_kv_cache_memory()
+
+        assert [c[0] for c in parent.mock_calls] == [
+            "connector.restore_host_pool",
+            "runtime.restore_kv_memory",
+        ]
+
+    def test_skips_the_pool_without_metal_offloading(self, monkeypatch) -> None:
+        other = MagicMock(spec=["release_host_pool", "restore_host_pool"])
+        for group in (None, other):
+            runner = self._runner(monkeypatch, group)
+            runner.release_kv_cache_memory()
+            runner.restore_kv_cache_memory()
+        other.release_host_pool.assert_not_called()
+        other.restore_host_pool.assert_not_called()
 
 
 class TestPagedAttentionPlanDiagnostics:
@@ -788,6 +899,7 @@ class TestCommitProbeBudget:
 
         assert plan.kv_budget == _PLANNED_KV_BUDGET
         assert plan.num_blocks == 2_900
+        assert "increase --gpu-memory-utilization" in plan.format_mitigations()
 
     def test_busy_machine_keeps_the_capacity_it_was_given(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -848,6 +960,24 @@ class TestCommitProbeBudget:
 
         assert plan.kv_budget == (2 << 30) - _PROBE_RESERVE
         assert "sized down" in caplog.text
+
+    def test_paged_machine_does_not_advise_raising_the_fraction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Once the probe sizes the pool to free memory, the fraction no longer
+        bounds it, so the error must not tell the user to raise it."""
+        over_tolerance = kv_swap_tolerance_bytes(KV_COMMIT_SAMPLE_BYTES) + 1
+
+        plan = self._plan(
+            monkeypatch,
+            free_bytes=_PROBE_RESERVE // 2,
+            swap_out_bytes=over_tolerance,
+        )
+
+        assert plan.kv_budget <= 0
+        mitigations = plan.format_mitigations()
+        assert "close other applications" in mitigations
+        assert "increase --gpu-memory-utilization" not in mitigations
 
     def test_capacity_survives_a_fit_below_one_dense_block(
         self, monkeypatch: pytest.MonkeyPatch

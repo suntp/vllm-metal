@@ -341,6 +341,11 @@ class MetalWorker(WorkerBase):
         """
         return self.model_runner.model
 
+    def get_model_inspection(self) -> str:
+        # vLLM's default walks torch's named_children(); MLX modules have
+        # their own tree repr.
+        return repr(self.get_model())
+
     def update_max_model_len(self, max_model_len: int) -> None:
         """Update max_model_len after engine auto-fits context to GPU memory."""
         self.model_config.max_model_len = max_model_len
@@ -382,20 +387,37 @@ class MetalWorker(WorkerBase):
         return self.model_runner.get_draft_model_stats()
 
     def sleep(self, level: int = 1) -> None:
-        """Enter sleep mode (not supported on Metal).
-
-        Args:
-            level: Sleep level
+        """Free the KV cache. Weights already live in unified memory, so
+        level 1 keeps them in place instead of copying them to the CPU.
         """
-        logger.warning("Sleep mode is not supported on Metal, ignoring")
+        if level != 1:
+            raise NotImplementedError(
+                f"Metal supports sleep level 1 only, got {level}."
+            )
+        self.discard(("kv_cache",))
 
     def wake_up(self, tags: list[str] | None = None) -> None:
-        """Wake up from sleep mode (not supported on Metal).
+        if tags is None or "kv_cache" in tags:
+            self.model_runner.restore_kv_cache_memory()
 
-        Args:
-            tags: Wake up tags
-        """
-        logger.warning("Sleep mode is not supported on Metal, ignoring")
+    def discard(self, tags: tuple[str, ...]) -> None:
+        if set(tags) != {"kv_cache"}:
+            raise NotImplementedError(
+                f"Metal can only discard the KV cache, got tags {tags}."
+            )
+        if not hasattr(self.model_runner, "release_kv_cache_memory"):
+            raise NotImplementedError(
+                f"Sleep mode is not supported with {type(self.model_runner).__name__}."
+            )
+        before = mx.get_active_memory()
+        self.model_runner.release_kv_cache_memory()
+        gc.collect()
+        mx.clear_cache()
+        logger.info(
+            "Sleep mode freed %.2f GiB; %.2f GiB of Metal memory is still in use.",
+            (before - mx.get_active_memory()) / (1 << 30),
+            mx.get_active_memory() / (1 << 30),
+        )
 
     def check_health(self) -> None:
         """Check worker health."""

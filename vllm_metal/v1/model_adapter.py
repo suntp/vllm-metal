@@ -935,7 +935,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
 
             return cast(
                 MultimodalRuntimeAdapter,
-                Qwen3VLMultimodalAdapter.from_loaded_model(model),
+                Qwen3VLMultimodalAdapter.from_loaded_model(model, hf_config),
             )
 
         if model_type in _PADDLEOCR_VL_MODEL_TYPES or any(

@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the Metal KV offloading worker."""
 
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -19,6 +22,7 @@ from tests.kv_offload_helpers import (
     snapshot_blocks,
     zero_blocks,
 )
+from vllm_metal.v1.kv_offload.connector import MetalOffloadingConnector
 from vllm_metal.v1.kv_offload.shared_region import MetalSharedOffloadRegion
 
 ALIGN = MetalSharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
@@ -290,3 +294,39 @@ def test_shut_down_worker_raises() -> None:
     worker.shutdown()
     with pytest.raises(RuntimeError, match="shut down"):
         worker.submit_load(1, CPULoadStoreSpec([0]), gpu_spec([1]))
+
+
+class TestConnectorHostPool:
+    """The connector passes sleep and wake to the offload worker's region."""
+
+    def _connector(self, worker) -> MetalOffloadingConnector:
+        connector = MetalOffloadingConnector.__new__(MetalOffloadingConnector)
+        connector.connector_worker = SimpleNamespace(worker=worker)
+        return connector
+
+    def test_reaches_the_worker_region(self) -> None:
+        storage = make_storage()
+        worker = make_worker(storage)
+        assert worker.region is not None
+        region = worker.region
+        calls: list[str] = []
+        region.release_pages = lambda: calls.append("release")
+        region.reuse_pages = lambda: calls.append("reuse")
+        try:
+            connector = self._connector(worker)
+            connector.release_host_pool()
+            connector.restore_host_pool()
+            assert calls == ["release", "reuse"]
+        finally:
+            worker.shutdown()
+
+    def test_ignores_a_worker_of_another_type(self) -> None:
+        connector = self._connector(MagicMock(spec=[]))
+        connector.release_host_pool()
+        connector.restore_host_pool()
+
+    def test_without_a_worker_is_a_no_op(self) -> None:
+        connector = MetalOffloadingConnector.__new__(MetalOffloadingConnector)
+        connector.connector_worker = None
+        connector.release_host_pool()
+        connector.restore_host_pool()

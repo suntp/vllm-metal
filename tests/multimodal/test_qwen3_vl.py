@@ -16,6 +16,7 @@ from vllm_metal.multimodal import (
     PlaceholderRange,
 )
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
+from vllm_metal.multimodal.qwen3_vl.adapter import _VisionTokenIds
 
 # Qwen3-VL's mm_features-driven helper reads image sequence length and media
 # offsets from mm_features; the concrete token ids are irrelevant in these
@@ -101,8 +102,8 @@ class TestQwen3VLMultimodalAdapterValidation:
                     modality="video",
                 ),
                 NotImplementedError,
-                "Video multimodal features",
-                id="video-out-of-scope",
+                "frame token ids",
+                id="video-without-frame-token-ids",
             ),
             pytest.param(
                 _feature(
@@ -204,6 +205,40 @@ class TestQwen3VLMultimodalAdapterPositions:
         assert positions.shape == (3, 1, len(tokens))
         assert positions.tolist() == [[row] for row in expected_rows]
         assert delta == expected_delta
+
+    def test_video_positions_place_each_frame_on_its_own_grid(self) -> None:
+        """Two 2x2 frames with timestamp text between them: each frame gets
+        grid positions, and the delimiters and timestamps between frames stay
+        sequential text, as upstream vLLM lays a Qwen3-VL video out."""
+        text, timestamp, video, start, end = 1, 6, 3, 4, 5
+        frame = [timestamp, start, video, video, video, video, end]
+        tokens = [text, text] + frame + frame + [text]
+        is_embed = torch.tensor([t == video for t in frame + frame])
+        feature = MultiModalFeatureSpec(
+            data=_grid_item(key="video_grid_thw", modality="video", grid_thw=(2, 4, 4)),
+            modality="video",
+            identifier="video-2",
+            mm_position=PlaceholderRange(
+                offset=2, length=len(frame) * 2, is_embed=is_embed
+            ),
+        )
+        adapter = Qwen3VLMultimodalAdapter(
+            spatial_merge_size=_SPATIAL_MERGE_SIZE,
+            vision_token_ids=_VisionTokenIds(
+                video_token_id=video,
+                vision_start_token_id=start,
+                vision_end_token_id=end,
+            ),
+        )
+
+        positions, delta = adapter.get_mrope_input_positions(tokens, [feature])
+
+        assert positions.tolist() == [
+            [[0, 1, 2, 3, 4, 4, 4, 4, 6, 7, 8, 9, 9, 9, 9, 11, 12]],
+            [[0, 1, 2, 3, 4, 4, 5, 5, 6, 7, 8, 9, 9, 10, 10, 11, 12]],
+            [[0, 1, 2, 3, 4, 5, 4, 5, 6, 7, 8, 9, 10, 9, 10, 11, 12]],
+        ]
+        assert delta == 13 - len(tokens)
 
     def test_multi_image_positions_preserve_feature_offsets(self) -> None:
         tokens = (
@@ -370,7 +405,40 @@ class TestQwen3VLMultimodalAdapterEncodeMultimodal:
         pixel_values, _ = tower.calls[0]
         assert pixel_values.dtype == weight_dtype
 
-    def test_raises_on_video_feature(self) -> None:
+    def test_encodes_video_feature_from_video_fields(self) -> None:
+        """Video frames go through the same tower, read from the video keys."""
+        tower = _RecordingVisionTower()
+        adapter = Qwen3VLMultimodalAdapter(
+            spatial_merge_size=_SPATIAL_MERGE_SIZE,
+            vision_tower=tower,
+        )
+        field_config = MultiModalFieldConfig.batched("video", keep_on_cpu=True)
+        data = MultiModalKwargsItem(
+            {
+                "video_grid_thw": field_config.build_elems(
+                    "video_grid_thw", torch.tensor([(2, 4, 4)])
+                )[0],
+                "pixel_values_videos": field_config.build_elems(
+                    "pixel_values_videos", torch.ones((1, 32, 8), dtype=torch.float32)
+                )[0],
+            }
+        )
+        feature = MultiModalFeatureSpec(
+            data=data,
+            modality="video",
+            identifier="video-0",
+            mm_position=PlaceholderRange(offset=0, length=8),
+        )
+
+        outputs = adapter.encode_multimodal([feature])
+
+        assert len(outputs) == 1
+        pixel_values, grid_thw = tower.calls[0]
+        assert pixel_values.shape == (32, 8)
+        assert mx.all(pixel_values == 1).item()
+        assert grid_thw.tolist() == [[2, 4, 4]]
+
+    def test_raises_on_unsupported_modality(self) -> None:
         tower = _RecordingVisionTower()
         adapter = Qwen3VLMultimodalAdapter(
             spatial_merge_size=_SPATIAL_MERGE_SIZE,
@@ -379,12 +447,12 @@ class TestQwen3VLMultimodalAdapterEncodeMultimodal:
         feature = _vision_feature()
         feature = MultiModalFeatureSpec(
             data=feature.data,
-            modality="video",
+            modality="audio",
             identifier=feature.identifier,
             mm_position=feature.mm_position,
         )
 
-        with pytest.raises(ValueError, match="image features") as exc_info:
+        with pytest.raises(ValueError, match="image and video features") as exc_info:
             adapter.encode_multimodal([feature])
         assert feature.identifier in str(exc_info.value)
 
@@ -979,7 +1047,34 @@ class TestQwen3VLMultimodalAdapterCallLmHiddenStates:
             not_callable.call_lm_hidden_states(*args)
 
 
+# vLLM's hf_config carries the checkpoint's frame token ids.
+_HF_CONFIG = SimpleNamespace(
+    video_token_id=248057, vision_start_token_id=248053, vision_end_token_id=248054
+)
+
+
 class TestQwen3VLMultimodalAdapterFromLoadedModel:
+    def test_reads_frame_token_ids_from_hf_config(self) -> None:
+        """mlx-vlm's config defaults differ from the checkpoint's ids, so the
+        adapter must take them from vLLM's hf_config."""
+
+        class _LoadedModel:
+            class _Config:
+                class _VisionConfig:
+                    spatial_merge_size = 2
+
+                vision_config = _VisionConfig()
+                vision_start_token_id = 248045
+                vision_end_token_id = 248046
+
+            config = _Config()
+            vision_tower = _RecordingVisionTower()
+            language_model = _RecordingLanguageModel()
+
+        adapter = Qwen3VLMultimodalAdapter.from_loaded_model(_LoadedModel(), _HF_CONFIG)
+
+        assert adapter._vision_token_ids == (248057, 248053, 248054)
+
     def test_sniffs_embeds_kwarg_from_language_model(self) -> None:
         class _LoadedModel:
             class _Config:
@@ -992,7 +1087,7 @@ class TestQwen3VLMultimodalAdapterFromLoadedModel:
             vision_tower = _RecordingVisionTower()
             language_model = _RecordingLanguageModel()
 
-        adapter = Qwen3VLMultimodalAdapter.from_loaded_model(_LoadedModel())
+        adapter = Qwen3VLMultimodalAdapter.from_loaded_model(_LoadedModel(), _HF_CONFIG)
 
         assert adapter._embeds_kwarg == "inputs_embeds"
         assert adapter._spatial_merge_size == 2
@@ -1013,7 +1108,7 @@ class TestQwen3VLMultimodalAdapterFromLoadedModel:
         loaded = _LoadedModel()
         loaded.language_model = language_model
 
-        adapter = Qwen3VLMultimodalAdapter.from_loaded_model(loaded)
+        adapter = Qwen3VLMultimodalAdapter.from_loaded_model(loaded, _HF_CONFIG)
 
         assert adapter._embed_tokens_fn is language_model.model.embed_tokens
 
@@ -1029,7 +1124,7 @@ class TestQwen3VLMultimodalAdapterFromLoadedModel:
             vision_tower = _RecordingVisionTower()
             language_model = _RecordingLanguageModel()
 
-        adapter = Qwen3VLMultimodalAdapter.from_loaded_model(_LoadedModel())
+        adapter = Qwen3VLMultimodalAdapter.from_loaded_model(_LoadedModel(), _HF_CONFIG)
 
         assert adapter._supports_deepstack is False
 
@@ -1045,7 +1140,7 @@ class TestQwen3VLMultimodalAdapterFromLoadedModel:
             vision_tower = _RecordingVisionTower()
             language_model = _DeepstackLanguageModel()
 
-        adapter = Qwen3VLMultimodalAdapter.from_loaded_model(_LoadedModel())
+        adapter = Qwen3VLMultimodalAdapter.from_loaded_model(_LoadedModel(), _HF_CONFIG)
 
         assert adapter._supports_deepstack is True
 
@@ -1065,7 +1160,7 @@ class TestQwen3VLMultimodalAdapterFromLoadedModel:
             language_model = _LegacyLanguageModel()
 
         with pytest.raises(RuntimeError, match="not callable"):
-            Qwen3VLMultimodalAdapter.from_loaded_model(_LoadedModel())
+            Qwen3VLMultimodalAdapter.from_loaded_model(_LoadedModel(), _HF_CONFIG)
 
 
 class TestQwen3VLMultimodalAdapterResolveEmbedTokens:
