@@ -1828,6 +1828,53 @@ class TestGDNPrecision:
             np.array(cache.recurrent_states[0][2].astype(mx.float32)), 0.5
         )
 
+    @pytest.mark.parametrize("prefill", [False, True])
+    def test_conv_fp16_boundary_values_follow_native_reference(
+        self, prefill: bool
+    ) -> None:
+        # Weight 2.0 on the last tap and a zero state give exact FP32
+        # accumulators -70016, +70016 and -20 (the probe values in the PR).
+        # MLX nn.silu(nn.Conv1d(...)) rounds the accumulator to FP16 first:
+        # -70016 -> -inf, so -inf * sigmoid(-inf) is NaN; +70016 -> +inf;
+        # -20 -> -0, because the FP16 sigmoid of -20 underflows to zero.
+        dtype, ksize = mx.float16, 4
+        values = [-35008.0, 35008.0, -10.0]
+        channels = len(values)
+        weight = mx.zeros((channels, ksize, 1), dtype=dtype)
+        weight[:, ksize - 1, 0] = 2.0
+        conv = nn.Conv1d(channels, channels, ksize, groups=channels, bias=False)
+        conv.weight = weight
+        inner = SimpleNamespace(conv_kernel_size=ksize, conv1d=conv)
+        cache = _make_state_cache(
+            max_seqs=2, conv_kernel_dim=ksize, conv_dim=channels, dtype=dtype
+        )
+        cache.conv_states[0] = mx.zeros_like(cache.conv_states[0])
+        x = mx.array(values, dtype=dtype).reshape(1, 1, channels)
+        kernels = GDNLazyKernels(enabled=True)
+        if prefill:
+            actual = kernels.try_conv_prefill(
+                mx.concatenate([mx.zeros_like(x), x], axis=1),
+                inner,
+                cache,
+                0,
+                [1],
+                [0, 2],
+            )
+            assert actual is not None
+            actual = actual[:, 1:]
+        else:
+            actual = kernels.try_conv_decode(x, inner, cache, 0, [1])
+            assert actual is not None
+        zeros = mx.zeros((1, ksize - 1, channels), dtype=dtype)
+        native = nn.silu(conv(mx.concatenate([zeros, x], axis=1)))
+        got = np.array(actual.astype(mx.float32)).reshape(-1)
+        ref = np.array(native.astype(mx.float32)).reshape(-1)
+        np.testing.assert_array_equal(got, ref)  # NaN positions must match too.
+        assert np.isnan(got[0])
+        assert got[1] == np.inf
+        # array_equal does not distinguish -0 from +0.
+        assert got[2] == 0 and np.signbit(got[2]) and np.signbit(ref[2])
+
 
 class TestLazyDecodeFallbacks:
     def test_falls_back_for_multi_token_requests(self) -> None:
