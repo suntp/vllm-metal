@@ -115,11 +115,12 @@ jobs:
       run: |
         scripts/test.sh
 
-    # Each artifact's stamp is written only after it compiles, so saving after
-    # a test failure (anything but cancel) still stores only current artifacts.
+    # Save only after a fully successful Test step: a build that failed midway
+    # would leave an artifact missing, and an exact-key hit never re-saves, so
+    # that incomplete entry would force the same rebuild on every later run.
     - name: Save native build artifacts
       if: >-
-        !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
         && steps.native-cache.outputs.cache-hit != 'true'
       uses: actions/cache/save@v4
       with:
