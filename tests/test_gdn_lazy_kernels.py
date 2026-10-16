@@ -1736,6 +1736,98 @@ class TestGDNPrecision:
         np.testing.assert_allclose(np.array(updated), expected, atol=1e-7, rtol=1e-6)
         assert float(mx.max(updated).item()) < 1.0
 
+    @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+    def test_decay_gate_stays_fp32_with_half_recurrent_cache(
+        self, dtype: mx.Dtype
+    ) -> None:
+        inner = _TinyGDNInner()
+        cache = _make_state_cache(
+            conv_dim=inner.conv_dim, dtype=dtype, recurrent_dtype=dtype
+        )
+        wrapper = GDNPagedAttentionWrapper(inner, 0, 0, cache)
+        state = _GDNForwardState(
+            mx.zeros((1, 1, inner.conv_dim), dtype=dtype), [0, 1], 1, 1, [0], 1
+        )
+        a = mx.full((1, 1, 1), -9.25, dtype=dtype)
+        g, beta = wrapper._compute_gates(a, mx.zeros_like(a), state)
+        assert g.dtype == mx.float32 and beta.dtype == dtype
+        assert g.item() < 1.0 and g.astype(dtype).item() == 1.0
+
+    @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+    @pytest.mark.parametrize("route", ["decode", "prefill"])
+    def test_fp32_decay_with_half_recurrent_cache(
+        self, dtype: mx.Dtype, route: str
+    ) -> None:
+        # Same-half cache: g stays FP32 into the lazy kernel. Prefill keeps the
+        # state in float registers across all tokens and rounds once on store.
+        tokens = 1 if route == "decode" else 256
+        cache = _make_state_cache(dtype=dtype, recurrent_dtype=dtype)
+        cache.recurrent_states[0] = mx.ones_like(cache.recurrent_states[0])
+        q = mx.zeros((1, tokens, 1, 32), dtype=dtype)
+        q[..., 0] = 1
+        decay = 0.9999 if route == "prefill" else 0.99
+        common = {
+            "q": q,
+            "k": mx.zeros_like(q),
+            "v": mx.zeros((1, tokens, 1, 4), dtype=dtype),
+            "g": mx.full((1, tokens, 1), decay, dtype=mx.float32),
+            "beta": mx.zeros((1, tokens, 1), dtype=dtype),
+            "state_cache": cache,
+            "cache_idx": 0,
+            "slot_ids": [2],
+            "output_dtype": dtype,
+        }
+        kernels = GDNLazyKernels(enabled=True)
+        if route == "decode":
+            output = kernels.try_recurrent_decode(GDNRecurrentDecodeRequest(**common))
+            updated = cache.pending_recurrent_state(0, [2])
+        else:
+            output = kernels.try_recurrent_prefill(
+                GDNRecurrentPrefillRequest(
+                    **common, cu_seqlens=[0, tokens], compute_dtype=None
+                )
+            )
+            updated = cache.recurrent_states[0][2:3]
+        assert output is not None and updated is not None
+        assert output.dtype == dtype and updated.dtype == dtype
+        reference = np.float32(1)
+        for _ in range(tokens):
+            reference *= np.float32(decay)
+        expected = mx.array(reference).astype(dtype).item()
+        np.testing.assert_array_equal(
+            np.array(updated.astype(mx.float32)), np.float32(expected)
+        )
+        assert expected < 1.0
+
+    @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+    def test_fallback_casts_fp32_gate_to_half_cache(self, dtype: mx.Dtype) -> None:
+        _get_native_ops_or_skip()
+        cache = _make_state_cache(dtype=dtype, recurrent_dtype=dtype)
+        cache.recurrent_states[0] = mx.ones_like(cache.recurrent_states[0])
+        wrapper = GDNPagedAttentionWrapper(_TinyGDNInner(), 0, 0, cache)
+        q = mx.zeros((1, 1, 1, 32), dtype=dtype)
+        state = _GDNForwardState(
+            x=mx.zeros((1, 1, 68), dtype=dtype),
+            cu_seqlens=[0, 1],
+            num_requests=1,
+            total_tokens=1,
+            slot_ids=[2],
+            num_decode_requests=1,
+        )
+        out = wrapper._run_recurrent_fallback(
+            q,
+            mx.zeros_like(q),
+            mx.zeros((1, 1, 1, 4), dtype=dtype),
+            mx.full((1, 1, 1), 0.5, dtype=mx.float32),
+            mx.zeros((1, 1, 1), dtype=dtype),
+            state,
+        )
+        assert out.dtype == dtype
+        assert cache.recurrent_states[0].dtype == dtype
+        np.testing.assert_array_equal(
+            np.array(cache.recurrent_states[0][2].astype(mx.float32)), 0.5
+        )
+
 
 class TestLazyDecodeFallbacks:
     def test_falls_back_for_multi_token_requests(self) -> None:
