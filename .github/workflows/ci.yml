@@ -54,7 +54,8 @@ jobs:
         ensure_uv
         py=$(uv python find 3.12)
         {
-          xcrun -sdk macosx metal --version
+          # InstalledDir is a per-boot cryptex mount path; drop it.
+          xcrun -sdk macosx metal --version | grep -v '^InstalledDir:'
           clang --version
           xcrun -sdk macosx --show-sdk-version
           "$py" -c 'import sys; print(sys.version)'
