@@ -90,15 +90,21 @@ def nax_split_hint(work: NaxTileWork, head_size: int) -> int:
 
 
 def nax_split_kwargs(
-    capabilities: Mapping[str, bool], work: NaxTileWork | None, head_size: int
+    capabilities: Mapping[str, bool],
+    work: NaxTileWork | None,
+    head_size: int,
+    *,
+    prefill_work: NaxTileWork | None = None,
 ) -> dict[str, int]:
     """``nax_split_hint`` keyword for one prefill ``paged_attention_primitive``.
 
     Empty when the native build predates the hint.  Without per-sequence
-    metadata (``work`` is None) the original loop is used.
+    metadata (``work`` is None) the original loop is used. A separate hint
+    for the prefill subset is consumed only when native splits the batch.
     """
     if not capabilities.get("nax_split_hint", False):
         return {}
-    if work is None:
-        return {"nax_split_hint": 0}
-    return {"nax_split_hint": nax_split_hint(work, head_size)}
+    kwargs = {"nax_split_hint": 0 if work is None else nax_split_hint(work, head_size)}
+    if capabilities.get("nax_prefill_split_hint", False) and prefill_work is not None:
+        kwargs["nax_prefill_split_hint"] = nax_split_hint(prefill_work, head_size)
+    return kwargs

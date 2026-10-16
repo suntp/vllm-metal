@@ -731,6 +731,7 @@ class _PagedRoutingOpsSpy:
         gqa_context_lens: list[int] | None = None,
         gqa_length_plan: object = None,
         nax_split_hint: int = -1,
+        nax_prefill_split_hint: int = -1,
     ) -> None:
         del window_seqlen_q, sinks
         self.calls[-1].block_tables = block_tables.tolist()
@@ -743,6 +744,7 @@ class _PagedRoutingOpsSpy:
         self.calls[-1].gqa_context_lens = gqa_context_lens
         self.calls[-1].gqa_length_plan = gqa_length_plan
         self.calls[-1].nax_split_hint = nax_split_hint
+        self.calls[-1].nax_prefill_split_hint = nax_prefill_split_hint
 
 
 class _PreMmPrefixOps(_PagedOpsCapsOff):
@@ -982,17 +984,25 @@ class TestSDPAForward:
                     assert spy.calls[-1].gqa_length_plan == next_plan
                     assert spy.calls[-1].num_decode_requests == len(next_plan)
 
-    @pytest.mark.parametrize("supported", [False, True])
-    @pytest.mark.parametrize("kind", ["decode", "mixed", "prefill"])
+    @pytest.mark.parametrize("supported", ["none", "whole", "subset"])
+    @pytest.mark.parametrize("kind", ["decode", "mixed", "prefill", "expanded_verify"])
     def test_nax_split_hint_is_computed_once_for_prefill_batches(
         self, monkeypatch, supported, kind
     ) -> None:
-        decode = [([[0]], 1), ([[1]], 3)] if kind != "prefill" else []
-        prefill = [([[2]], 5, 0)] if kind != "decode" else []
+        decode = [([[0] * 65], 511), ([[1] * 65], 511)] if kind != "prefill" else []
+        if kind == "expanded_verify":
+            decode = [([[0] * 65], 511, 2), ([[1] * 65], 511, 2)]
+        prefill = [([[2] * 32], 256, 0)] if kind != "decode" else []
         prepare_grouped(decode, prefill, (8,))
         ctx = get_context()
+        # Disabling GQA does not disable native mixed-batch separation.
+        ctx.gqa_disabled = True
         spy = _PagedRoutingOpsSpy()
-        caps = {**spy.paged_attention_capabilities(), "nax_split_hint": supported}
+        caps = {
+            **spy.paged_attention_capabilities(),
+            "nax_split_hint": supported != "none",
+            "nax_prefill_split_hint": supported == "subset",
+        }
         monkeypatch.setattr(spy, "paged_attention_capabilities", lambda: caps)
         work = MagicMock(wraps=sdpa_mod.nax_tile_work)
         monkeypatch.setattr(sdpa_mod, "nax_tile_work", work)
@@ -1013,12 +1023,22 @@ class TestSDPAForward:
             patch.object(sdpa_mod, "get_ops", return_value=spy),
             patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
         ):
-            for _layer in range(3):
+            for window in (-1, 128, -1, 128):
+                cache.sliding_window_per_layer[0] = window
                 sdpa_forward(inner, x, ctx, cache, layer_idx=0)
-        forwarded = supported and kind != "decode"
-        # Five-token prefills have no full 64-row Q block: original loop.
-        assert spy.calls[-1].nax_split_hint == (0 if forwarded else -1)
-        assert work.call_count == int(forwarded)
+        forwarded = supported != "none" and kind != "decode"
+        subset = supported == "subset" and kind == "mixed"
+        # The full prefill blocks split on their own; decode partial tiles
+        # keep the whole mixed batch unsplit, including at window 128.
+        whole_hint = int(kind == "prefill")
+        assert spy.calls[-1].nax_split_hint == (whole_hint if forwarded else -1)
+        assert spy.calls[-1].nax_prefill_split_hint == (1 if subset else -1)
+        assert work.call_count == 2 * (int(forwarded) + int(subset))
+        if forwarded:
+            starts = (0, ctx.num_decode_requests) if subset else (0,)
+            assert set(ctx.nax_tile_work) == {
+                (window, first) for window in (-1, 128) for first in starts
+            }
 
     def test_mixed_batch_routes_slots_and_page_tables_by_layer_group(self) -> None:
         """Full and sliding layers consume their scheduler-group metadata."""

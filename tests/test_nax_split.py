@@ -4,6 +4,8 @@
 import mlx.core as mx
 import pytest
 
+from tests.gqa_test_utils import _primitive
+from tests.test_gqa_decode_routing import _mixed_call, _mixed_inputs
 from vllm_metal.attention.nax_split import (
     nax_split_hint,
     nax_split_kwargs,
@@ -63,6 +65,44 @@ def test_split_kwargs_defaults_to_the_original_loop():
     assert nax_split_kwargs({"nax_split_hint": False}, work, 128) == {}
     assert nax_split_kwargs(caps, work, 128) == {"nax_split_hint": 1}
     assert nax_split_kwargs(caps, None, 128) == {"nax_split_hint": 0}
+
+
+def test_separated_decode_work_changes_the_prefill_hint():
+    cu, kv = [0, 1, 257], [131072, 8192]
+    whole = nax_tile_work(cu, kv)
+    prefill = nax_tile_work(cu[1:], kv[1:])
+    assert (whole.full_blocks, whole.full_tiles, whole.partial_tiles) == (4, 1012, 4096)
+    assert (prefill.full_blocks, prefill.full_tiles, prefill.partial_tiles) == (
+        4,
+        1012,
+        0,
+    )
+    assert nax_split_hint(whole, 256) == 0
+    assert nax_split_hint(prefill, 256) == 1
+
+
+@pytest.mark.parametrize(
+    "caps,expected",
+    [
+        ({}, {}),
+        ({"nax_prefill_split_hint": True}, {}),
+        ({"nax_split_hint": True}, {"nax_split_hint": 0}),
+        (
+            {"nax_split_hint": True, "nax_prefill_split_hint": False},
+            {"nax_split_hint": 0},
+        ),
+        (
+            {"nax_split_hint": True, "nax_prefill_split_hint": True},
+            {"nax_split_hint": 0, "nax_prefill_split_hint": 1},
+        ),
+    ],
+)
+def test_prefill_hint_keeps_whole_batch_and_old_build_compatibility(caps, expected):
+    whole = nax_tile_work([0, 1, 257], [131072, 8192])
+    prefill = nax_tile_work([1, 257], [8192])
+    assert nax_split_kwargs(caps, whole, 256, prefill_work=prefill) == expected
+    if caps.get("nax_split_hint"):
+        assert nax_split_kwargs(caps, whole, 256) == {"nax_split_hint": 0}
 
 
 def test_sliding_window_counts_only_tiles_inside_the_window():
@@ -156,3 +196,80 @@ def test_native_hint_does_not_change_outputs():
             mx.array(0),
             nax_split_hint=2,
         )
+
+
+@pytest.mark.parametrize(
+    "decode_kv,decode_rows,metadata,separated",
+    [
+        (131072, 1, True, True),
+        (128, 1, True, False),
+        (8192, 1, False, False),
+        (8192, 3, True, False),
+    ],
+    ids=["ordinary-split", "short-decode", "missing-metadata", "expanded-verify"],
+)
+def test_native_prefill_hint_only_applies_after_decode_separation(
+    nax_prefill, decode_kv, decode_rows, metadata, separated
+):
+    """Conflicting hints expose the native subset choice and preserve row ownership."""
+    ops = nax_prefill
+    inputs = _mixed_inputs(
+        [decode_kv], prefill_kv=8192, geometry=(8, 2, 256, 16), dtype=mx.float16
+    )
+    inputs.update(
+        query=mx.random.normal((decode_rows + 256, 8, 256)).astype(mx.float16),
+        cu_seqlens_q=mx.array([0, decode_rows, decode_rows + 256], mx.int32),
+        num_decode_tokens=decode_rows,
+        nax_split_hint=0,
+    )
+    if decode_rows > 1:
+        inputs.update(
+            cu_seqlens_q=mx.array([0, 1, 2, 3, 259], mx.int32),
+            block_tables=inputs["block_tables"][mx.array([0, 0, 0, 1])],
+            seq_lens=mx.array([8190, 8191, 8192, 8192], mx.int32),
+        )
+    if not metadata:
+        for name in (
+            "num_decode_requests",
+            "num_decode_tokens",
+            "max_decode_context_len",
+        ):
+            inputs.pop(name)
+    whole = _mixed_call(
+        inputs, num_decode_requests=0, num_decode_tokens=0, max_decode_context_len=0
+    )
+    assert ops.last_paged_dispatch() == "nax_prefill"
+    assert ops.last_nax_split_pipeline() == 0
+    decode = None
+    if separated:
+        decode = _primitive(
+            inputs["query"][:1],
+            inputs["key_cache"],
+            inputs["value_cache"],
+            inputs["block_tables"][:1],
+            inputs["seq_lens"][:1],
+            inputs["block_size"],
+            decode_kv,
+            [decode_kv],
+            preplanned=False,
+            gqa_disabled=True,
+        )
+        mx.eval(decode)
+    # Evaluate each node before observing diagnostics; hints must not share a
+    # lazy result. Missing/-1 subset hints retain the old whole-batch choice.
+    for subset in ({"nax_prefill_split_hint": 1}, {"nax_prefill_split_hint": -1}, {}):
+        actual = _mixed_call(inputs, **subset)
+        assert ops.last_paged_dispatch() == (
+            "mixed_nax_prefill_decode" if separated else "nax_prefill"
+        )
+        assert ops.last_nax_split_pipeline() == int(
+            separated and subset.get("nax_prefill_split_hint") == 1
+        )
+        if separated:
+            assert mx.array_equal(actual[:1], decode).item()
+            assert mx.array_equal(actual[1:], whole[1:]).item()
+        else:
+            assert mx.array_equal(actual, whole).item()
+    for invalid in (-2, 2):
+        with pytest.raises(ValueError, match="nax_prefill_split_hint"):
+            _mixed_call(inputs, nax_prefill_split_hint=invalid)

@@ -32,10 +32,11 @@ that both kernels ran; zero- and one-token windows can legitimately produce
 identical outputs.
 
 Without a hint these batches take the original loop. A subset -- every
-boundary case (NaN padding, windows, softcap, sinks) and block size 16 at head
-sizes 128/256/512 -- also runs with ``nax_split_hint`` forced to 0 and 1 and
-checks the pipeline that actually ran; head_size 512 always uses the original
-loop.
+boundary case (NaN padding, windows, softcap, sinks), including one each at
+head sizes 64/96, and block size 16 at head sizes 128/256/512 -- also runs
+with ``nax_split_hint`` forced to 0 and 1 and checks the pipeline that actually
+ran. Forced-hint cases exercise both pipelines except at head_size 512, where
+both hints use the original loop; the final counts distinguish these fallbacks.
 """
 
 from __future__ import annotations
@@ -159,6 +160,19 @@ def _boundary_cases() -> list[Case]:
                     poison_padding=True,
                 )
             )
+    # Cover the TD=4/6 specializations on both pipelines without expanding
+    # the dtype/block-size/masking matrix.
+    cases.extend(
+        Case(
+            dtype,
+            head_size,
+            16,
+            "boundary-fast",
+            seqs=BOUNDARY_SEQS,
+            poison_padding=True,
+        )
+        for dtype, head_size in ((mx.float16, 64), (mx.bfloat16, 96))
+    )
     return cases
 
 
@@ -260,7 +274,7 @@ def _compare(case: Case, nax: mx.array, tiled: mx.array) -> tuple[bool, str]:
     return True, detail
 
 
-def _both_pipelines(case: Case) -> bool:
+def _forced_hints(case: Case) -> bool:
     return case.regime.startswith("boundary") or (
         case.block_size == 16 and case.head_size >= 128
     )
@@ -272,7 +286,7 @@ def _check(ops, case: Case) -> tuple[bool, str]:
     if tiled_dispatch != "tiled_prefill":
         return False, f"unexpected dispatch: tiled={tiled_dispatch}"
     details = []
-    for hint in (0, 1) if _both_pipelines(case) else (None,):
+    for hint in (0, 1) if _forced_hints(case) else (None,):
         nax, nax_dispatch, pipeline = _run(
             ops, case, built, enabled=True, split_hint=hint
         )
@@ -321,8 +335,13 @@ def main() -> int:
         for failure in failures:
             print(f"  {failure}", file=sys.stderr)
         return 1
-    both = sum(_both_pipelines(case) for case in cases)
-    print(f"\nPARITY PASS ({len(cases)} cases, {both} on both NAX pipelines)")
+    forced = sum(_forced_hints(case) for case in cases)
+    fallback = sum(_forced_hints(case) and case.head_size == 512 for case in cases)
+    print(
+        f"\nPARITY PASS ({len(cases)} cases, {forced} forced-hint cases: "
+        f"{forced - fallback} on both NAX pipelines, "
+        f"{fallback} D512 unsplit fallback cases)"
+    )
     return 0
 
 
