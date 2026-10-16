@@ -239,6 +239,11 @@ def _metal_toolchain_id() -> str:
             out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
         except (OSError, subprocess.CalledProcessError):
             return "unavailable"
+        # InstalledDir names the Metal toolchain's cryptex mount, which gets a
+        # random suffix per boot, so it would change the id on every runner.
+        out = "\n".join(
+            line for line in out.splitlines() if not line.startswith("InstalledDir:")
+        )
         h.update(out.strip().encode())
         h.update(b"\0")
     return h.hexdigest()
