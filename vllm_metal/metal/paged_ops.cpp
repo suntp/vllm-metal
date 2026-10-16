@@ -502,7 +502,7 @@ static void dispatch_paged_attention_nax(
   // Two pipelines of the same kernel, chosen per launch by function
   // constant 41 (nax_split_full):
   //  - split:   complete KV tiles of full 64-row Q blocks skip bounds checks;
-  //  - unsplit: the original single guarded loop, compiled exactly as before.
+  //  - unsplit: keeps the original single guarded loop structure.
   // Containing both tile bodies changes codegen enough to slow the guarded
   // path, so launches dominated by partial Q blocks (short prefill, cached
   // prefix + few new tokens, small chunks) take the unsplit pipeline.

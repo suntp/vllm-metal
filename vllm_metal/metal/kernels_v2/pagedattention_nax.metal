@@ -457,10 +457,10 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
           softcapping, sliding_window, Otile, max_score, sum_score);
     }
   } else {
-    // Original loop, kept verbatim in its own pipeline so short/partial
-    // launches compile exactly as before the split; sharing a kernel body
-    // with the split loop regressed them through codegen alone.  Do not
-    // dedupe or merge this into nax_kv_tile<..., true>.
+    // Original loop structure, in its own pipeline: sharing a kernel body
+    // with the split loop regressed short/partial launches through codegen
+    // alone, and keeping this loop restored their measured performance.
+    // Do not dedupe or merge this into nax_kv_tile<..., true>.
     for (int kb = kb_start; kb < num_kv_tiles; kb++) {
       const int tile_start = kb * TILE_KV;
       if (tile_start > context_len + q_pos_start + valid_q - 1) break;
