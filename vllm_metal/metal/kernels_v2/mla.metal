@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// cache-demo: comment-only edit to exercise the native build cache.
 //
 // Paged Multi-head Latent Attention (MLA) kernel.
 //
