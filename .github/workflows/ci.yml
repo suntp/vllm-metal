@@ -66,7 +66,8 @@ jobs:
         echo "hash=$(cat "$RUNNER_TEMP/tc")" >> "$GITHUB_OUTPUT"
 
     - name: Restore cached native build artifacts
-      uses: actions/cache@v4
+      id: native-cache
+      uses: actions/cache/restore@v4
       with:
         # Artifacts travel with their .sha256 stamps (digests of build
         # inputs, not checksums of the artifacts); the build recompiles
@@ -79,6 +80,12 @@ jobs:
         # also hashes what the stamps digest (Metal/C++ sources, shader
         # assembly, build.py/constants.py, the MPS launcher) and the vLLM
         # release tag (which pins torch).
+        # Only pushes to main save (see the save step): a PR's cache is
+        # invisible to main and other PRs, so saving there only spends quota.
+        # On an exact-key miss, restore-keys falls back to the newest entry
+        # with the same toolchain fingerprint; the stamps (which digest the
+        # mlx/nanobind/torch versions too) then rebuild only the artifacts
+        # whose inputs changed and keep the rest.
         path: |
           vllm_metal/metal/*.metallib
           vllm_metal/metal/*.metallib.sha256
@@ -100,7 +107,29 @@ jobs:
           'vllm_metal/pytorch_backend/mps_ops.mm',
           '.github/vllm-release-tag.commit'
           ) }}
+        restore-keys: |
+          native-${{ matrix.os }}-${{ runner.arch }}-${{ steps.native-toolchain.outputs.hash }}-
 
     - name: Test
       run: |
         scripts/test.sh
+
+    # Each artifact's stamp is written only after it compiles, so saving after
+    # a test failure (anything but cancel) still stores only current artifacts.
+    - name: Save native build artifacts
+      if: >-
+        !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        && steps.native-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          vllm_metal/metal/*.metallib
+          vllm_metal/metal/*.metallib.sha256
+          vllm_metal/metal/*.metallib.toolchain
+          vllm_metal/metal/_paged_ops*.so
+          vllm_metal/metal/_paged_ops*.so.sha256
+          vllm_metal/metal/_paged_ops.mlx-version
+          vllm_metal/pytorch_backend/_mps_ops*.so
+          vllm_metal/pytorch_backend/_mps_ops*.so.sha256
+          vllm_metal/pytorch_backend/_mps_ops.torch-version
+        key: ${{ steps.native-cache.outputs.cache-primary-key }}
