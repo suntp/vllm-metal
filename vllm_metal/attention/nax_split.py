@@ -46,14 +46,25 @@ def _tiles(kv_end: int) -> int:
     return (kv_end + _TILE_KV - 1) // _TILE_KV
 
 
-def nax_tile_work(cu_seqlens: Sequence[int], kv_lens: Sequence[int]) -> NaxTileWork:
-    """Count causal KV tiles touched by full and partial Q blocks.
+def nax_tile_work(
+    cu_seqlens: Sequence[int], kv_lens: Sequence[int], sliding_window: int = -1
+) -> NaxTileWork:
+    """Count the KV tiles the NAX kernel visits for full and partial Q blocks.
 
     ``cu_seqlens`` are cumulative query rows and ``kv_lens`` each sequence's
     KV length including this step's tokens (``PagedAttentionContext``).
+    Causal tiles past a block's last row are skipped, and with
+    ``sliding_window >= 0`` so are the tiles before the block's first row's
+    window, mirroring ``kb_start`` / ``kb_end`` in ``pagedattention_nax.metal``.
     """
     if len(cu_seqlens) != len(kv_lens) + 1:
         raise ValueError("cu_seqlens must have one more entry than kv_lens")
+
+    def first_tile(q_abs: int) -> int:
+        if sliding_window < 0:
+            return 0
+        return max(0, (q_abs + 1 - sliding_window) // _TILE_KV)
+
     full_blocks = full_tiles = partial_tiles = 0
     for i, kv in enumerate(kv_lens):
         q = cu_seqlens[i + 1] - cu_seqlens[i]
@@ -63,9 +74,10 @@ def nax_tile_work(cu_seqlens: Sequence[int], kv_lens: Sequence[int]) -> NaxTileW
         n_full = q // _BQ
         full_blocks += n_full
         for j in range(n_full):
-            full_tiles += _tiles(context + (j + 1) * _BQ)
+            start = context + j * _BQ
+            full_tiles += _tiles(start + _BQ) - first_tile(start)
         if q % _BQ:
-            partial_tiles += _tiles(kv)
+            partial_tiles += _tiles(kv) - first_tile(context + n_full * _BQ)
     return NaxTileWork(full_blocks, full_tiles, partial_tiles)
 
 
@@ -78,20 +90,15 @@ def nax_split_hint(work: NaxTileWork, head_size: int) -> int:
 
 
 def nax_split_kwargs(
-    capabilities: Mapping[str, bool],
-    work: NaxTileWork | None,
-    head_size: int,
-    sliding_window: int,
+    capabilities: Mapping[str, bool], work: NaxTileWork | None, head_size: int
 ) -> dict[str, int]:
     """``nax_split_hint`` keyword for one prefill ``paged_attention_primitive``.
 
     Empty when the native build predates the hint.  Without per-sequence
-    metadata (``work`` is None) the original loop is used.  Sliding-window
-    layers also use it: ``work`` counts the whole causal prefix, which
-    overstates the tiles a windowed layer actually visits.
+    metadata (``work`` is None) the original loop is used.
     """
     if not capabilities.get("nax_split_hint", False):
         return {}
-    if work is None or sliding_window >= 0:
+    if work is None:
         return {"nax_split_hint": 0}
     return {"nax_split_hint": nax_split_hint(work, head_size)}

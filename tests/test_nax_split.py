@@ -59,21 +59,29 @@ def test_tile_counts_follow_the_causal_mask():
 def test_split_kwargs_defaults_to_the_original_loop():
     caps = {"nax_split_hint": True}
     work = _work([(2048, 6144)])
-    assert nax_split_kwargs({}, work, 128, -1) == {}
-    assert nax_split_kwargs({"nax_split_hint": False}, work, 128, -1) == {}
-    assert nax_split_kwargs(caps, work, 128, -1) == {"nax_split_hint": 1}
-    assert nax_split_kwargs(caps, None, 128, -1) == {"nax_split_hint": 0}
+    assert nax_split_kwargs({}, work, 128) == {}
+    assert nax_split_kwargs({"nax_split_hint": False}, work, 128) == {}
+    assert nax_split_kwargs(caps, work, 128) == {"nax_split_hint": 1}
+    assert nax_split_kwargs(caps, None, 128) == {"nax_split_hint": 0}
 
 
-def test_sliding_window_layers_use_the_original_loop():
-    # Causal-prefix work says split, but a 128-token window visits only a few
-    # KV tiles per Q block, so the windowed layer keeps the original loop.
-    caps = {"nax_split_hint": True}
-    work = _work([(256, 131072)] + [(63, 0)] * 9)
-    assert nax_split_hint(work, 128) == 1
-    assert nax_split_kwargs(caps, work, 128, -1) == {"nax_split_hint": 1}
-    assert nax_split_kwargs(caps, work, 128, 128) == {"nax_split_hint": 0}
-    assert nax_split_kwargs(caps, work, 128, 0) == {"nax_split_hint": 0}
+def test_sliding_window_counts_only_tiles_inside_the_window():
+    # The kernel skips KV tiles left of each block's window, so a 128-token
+    # window leaves the 256-row prefill only ~6 tiles per full block: the
+    # causal-prefix count would split, the windowed count must not.
+    seqs = [(256, 131072)] + [(63, 0)] * 9
+    cu, kv = [0], []
+    for q, context in seqs:
+        cu.append(cu[-1] + q)
+        kv.append(q + context)
+    causal = nax_tile_work(cu, kv)
+    windowed = nax_tile_work(cu, kv, sliding_window=128)
+    assert causal.full_blocks == windowed.full_blocks == 4
+    assert windowed.full_tiles == 4 * 6 and windowed.partial_tiles == 9 * 2
+    assert nax_split_hint(causal, 128) == 1
+    assert nax_split_hint(windowed, 128) == 0
+    # A window wider than the context changes nothing.
+    assert nax_tile_work(cu, kv, sliding_window=1 << 20) == causal
 
 
 def test_length_mismatch_is_rejected():

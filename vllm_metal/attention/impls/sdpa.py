@@ -940,11 +940,9 @@ def sdpa_forward(
                 layer_sliding_window,
                 out,
                 window_seqlen_q=ctx.verify_window_q,
+                # The dequantized lane only admits full-attention layers.
                 **nax_split_kwargs(
-                    ctx.paged_native_capabilities,
-                    batch.nax_work,
-                    q_3d.shape[2],
-                    layer_sliding_window,
+                    ctx.paged_native_capabilities, batch.nax_work, q_3d.shape[2]
                 ),
             )
             if plan.fallback is not None:
@@ -1001,21 +999,22 @@ def sdpa_forward(
         if capabilities["nax_split_hint"] and q_3d.shape[0] > len(ctx.context_lens):
             # Prefill batch: pick the NAX pipeline from per-sequence lengths
             # the kernel dispatcher could only read back from the GPU.
+            # Layers with different sliding windows visit different KV tiles.
+            work = None
             if (
-                ctx.nax_tile_work is None
-                and ctx.cu_seqlens is not None
+                ctx.cu_seqlens is not None
                 and len(ctx.cu_seqlens) == len(ctx.context_lens) + 1
                 and ctx.cu_seqlens[-1] == q_3d.shape[0]
             ):
-                ctx.nax_tile_work = nax_tile_work(ctx.cu_seqlens, ctx.context_lens)
-            paged_kwargs.update(
-                nax_split_kwargs(
-                    capabilities,
-                    ctx.nax_tile_work,
-                    q_3d.shape[2],
-                    layer_sliding_window,
-                )
-            )
+                if ctx.nax_tile_work is None:
+                    ctx.nax_tile_work = {}
+                work = ctx.nax_tile_work.get(layer_sliding_window)
+                if work is None:
+                    work = nax_tile_work(
+                        ctx.cu_seqlens, ctx.context_lens, layer_sliding_window
+                    )
+                    ctx.nax_tile_work[layer_sliding_window] = work
+            paged_kwargs.update(nax_split_kwargs(capabilities, work, q_3d.shape[2]))
         ops.paged_attention_primitive(
             q_3d,
             kernel_k_cache,

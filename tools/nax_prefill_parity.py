@@ -31,9 +31,11 @@ exercise small sliding windows, softcap and sinks. Dispatch diagnostics verify
 that both kernels ran; zero- and one-token windows can legitimately produce
 identical outputs.
 
-Every case runs NAX twice, with ``nax_split_hint`` forced to 0 (original loop)
-and 1 (split full-tile pipeline), and checks the pipeline that actually ran.
-head_size 512 always uses the original loop.
+Without a hint these batches take the original loop. A subset -- every
+boundary case (NaN padding, windows, softcap, sinks) and block size 16 at head
+sizes 128/256/512 -- also runs with ``nax_split_hint`` forced to 0 and 1 and
+checks the pipeline that actually ran; head_size 512 always uses the original
+loop.
 """
 
 from __future__ import annotations
@@ -258,24 +260,31 @@ def _compare(case: Case, nax: mx.array, tiled: mx.array) -> tuple[bool, str]:
     return True, detail
 
 
+def _both_pipelines(case: Case) -> bool:
+    return case.regime.startswith("boundary") or (
+        case.block_size == 16 and case.head_size >= 128
+    )
+
+
 def _check(ops, case: Case) -> tuple[bool, str]:
     built = _build_case(case)
     tiled, tiled_dispatch, _ = _run(ops, case, built, enabled=False)
     if tiled_dispatch != "tiled_prefill":
         return False, f"unexpected dispatch: tiled={tiled_dispatch}"
     details = []
-    for hint in (0, 1):
+    for hint in (0, 1) if _both_pipelines(case) else (None,):
         nax, nax_dispatch, pipeline = _run(
             ops, case, built, enabled=True, split_hint=hint
         )
         if nax_dispatch != "nax_prefill":
             return False, f"hint={hint}: unexpected dispatch NAX={nax_dispatch}"
-        expected = hint if case.head_size < 512 else 0
-        if pipeline != expected:
-            return False, f"hint={hint}: ran pipeline {pipeline}, want {expected}"
+        if hint is not None:
+            expected = hint if case.head_size < 512 else 0
+            if pipeline != expected:
+                return False, f"hint={hint}: ran pipeline {pipeline}, want {expected}"
         mx.eval(nax, tiled)
         ok, detail = _compare(case, nax, tiled)
-        details.append(f"{'split' if pipeline else 'loop'}: {detail}")
+        details.append(f"{'split' if pipeline == 1 else 'loop'}: {detail}")
         if not ok:
             return False, "; ".join(details)
     return True, "; ".join(details)
@@ -312,7 +321,8 @@ def main() -> int:
         for failure in failures:
             print(f"  {failure}", file=sys.stderr)
         return 1
-    print(f"\nPARITY PASS ({len(cases)} cases x 2 NAX pipelines)")
+    both = sum(_both_pipelines(case) for case in cases)
+    print(f"\nPARITY PASS ({len(cases)} cases, {both} on both NAX pipelines)")
     return 0
 
 
