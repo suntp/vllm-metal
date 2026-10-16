@@ -198,55 +198,35 @@ def test_each_geometry_stays_on_gqa_at_long_context(q, kv, head, block_size, n, 
     _assert_close(out, ref, dtype)
 
 
+# Every unselected geometry is pinned by test_policy_rejects_unmeasured_geometries;
+# these run a representative subset natively: one case per unshipped head dim
+# (64, 96, 256), plus MHA and an unmeasured page size on a shipped geometry.
+# MLX SDPA is the oracle because the fp32 CPU reference dominates at this length.
 @pytest.mark.parametrize(
-    "q,kv,head,n",
+    "q,kv,head,block_size",
     [
-        (16, 4, 256, 32768),  # 16/4/256 is outside default routing.
-        (32, 4, 64, 32768),  # Head dim 64 is not a shipped GQA specialization.
-        (64, 8, 64, 32768),
-        (16, 2, 96, 65536),
-        (32, 4, 256, 65536),  # Unmeasured 32/4/256 stays on the established path.
-        (16, 8, 128, 65536),
-        (16, 16, 128, 65536),  # MHA.
+        (32, 4, 64, 16),  # Head dim 64 is not a shipped GQA specialization.
+        (16, 2, 96, 16),  # Neither is head dim 96.
+        (16, 4, 256, 16),  # 16/4/256 is outside default routing.
+        (16, 16, 128, 16),  # MHA.
+        (32, 8, 128, 8),  # Unmeasured page size on a shipped geometry.
+        (16, 4, 256, 32),
     ],
 )
-def test_unselected_shapes_really_use_fallback(q, kv, head, n):
+def test_unselected_shapes_really_use_fallback(q, kv, head, block_size):
     out, ref = _run_primitive(
-        [n],
+        [32768],
         mx.bfloat16,
         interleaved=True,
         seed=717,
         num_query_heads=q,
         num_kv_heads=kv,
         head_size=head,
+        block_size=block_size,
+        native_reference=True,
     )
     _assert_fallback()
     _assert_close(out, ref, mx.bfloat16)
-
-
-@pytest.mark.parametrize(
-    "q,kv,head,block_size",
-    [
-        (32, 8, 128, 8),
-        (32, 8, 128, 32),
-        (16, 2, 256, 8),
-        (16, 4, 256, 32),
-        (24, 4, 256, 32),
-    ],
-)
-def test_unmeasured_kernel_page_sizes_use_fallback(q, kv, head, block_size):
-    out, ref = _run_primitive(
-        [32768],
-        mx.float16,
-        interleaved=True,
-        seed=718,
-        block_size=block_size,
-        num_query_heads=q,
-        num_kv_heads=kv,
-        head_size=head,
-    )
-    _assert_fallback()
-    _assert_close(out, ref, mx.float16)
 
 
 @pytest.mark.parametrize("num_decode_requests", [-1, 2])
@@ -618,7 +598,10 @@ def test_policy_has_no_fixed_long_context_ceiling(q, kv, head, block, n):
         (8, 1, 128, 16),
         (18, 4, 128, 16),
         (16, 0, 128, 16),
+        (32, 8, 128, 8),
         (32, 8, 128, 32),
+        (16, 2, 256, 8),
+        (16, 4, 256, 32),
         (24, 4, 256, 32),
     ],
 )

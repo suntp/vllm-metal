@@ -180,6 +180,12 @@ class MultimodalRuntimeAdapter(Protocol):
       encoder profiling): one feature of the largest encoder input, which
       ``MetalModelRunner.profile_run`` encodes so the measured allocator
       overhead covers the vision tower.
+    - ``lora_weights_mapper: WeightsMapper`` (default ``None``): rewrites PEFT
+      adapter module names from the HF checkpoint layout to the names of the
+      wrapped MLX modules.
+    - ``lora_encoder_target() -> EncoderLoRATarget`` (default absent): the
+      vision tower and connector that ``--enable-tower-connector-lora``
+      adapts.  Without it the flag is rejected.
     - ``bidirectional_layer_kinds: frozenset[str]`` (default empty): the layer
       kinds (``"sliding"``, ``"full"``) on which the rows of an image block
       attend to the whole block, not only causally.  Gemma 4 sets
@@ -399,6 +405,11 @@ _TEXT_BACKBONE_OVERRIDE_ARCHITECTURES: frozenset[str] = frozenset(
         "Qwen3_6MoeForConditionalGeneration",
     }
 )
+# Mistral 3 text models that mlx_lm's mistral3 wrapper loads. mistral4 text is
+# MLA, which that wrapper does not load, so it keeps the native path.
+_MISTRAL3_TEXT_BACKBONE_TEXT_TYPES: frozenset[str] = frozenset(
+    {"mistral", "ministral3"}
+)
 _QWEN3_VL_MODEL_TYPES: frozenset[str] = frozenset({"qwen3_5", "qwen3_vl"})
 _QWEN3_VL_ARCHITECTURES: frozenset[str] = frozenset(
     {
@@ -426,6 +437,10 @@ class DefaultModelAdapter(ModelAdapter):
         Gemma4: mlx_vlm forward currently produces garbled output; remove this
         override once mlx_vlm Gemma4 parity is fixed upstream.
 
+        Mistral 3: no multimodal adapter yet. The text backbone clears
+        ``multimodal_config``, so the frontend rejects image input instead of
+        the runner raising on it.
+
         Qwen3.5/Qwen3.6 conditional-generation wrappers: these configs are
         marked multimodal even when served text-only, and the FP8 family fails
         under mlx_vlm.load() on `*_weight_scale_inv` tensors, so it routes
@@ -440,6 +455,10 @@ class DefaultModelAdapter(ModelAdapter):
         model_type_from_hf = hf_config.model_type
         if model_type_from_hf in _GEMMA4_MODEL_TYPES:
             return True
+        if model_type_from_hf == "mistral3":
+            text_config = getattr(hf_config, "text_config", None)
+            text_type = getattr(text_config, "model_type", None)
+            return text_type in _MISTRAL3_TEXT_BACKBONE_TEXT_TYPES
 
         architectures_from_hf = tuple(hf_config.architectures or ())
         has_text_backbone_architecture = any(

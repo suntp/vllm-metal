@@ -356,8 +356,10 @@ def test_zero_budget_with_auto_fit_reports_the_breakdown(monkeypatch) -> None:
     monkeypatch.setattr(WorkerCachePlanner, "get_model_memory_usage", lambda _: 4 * _GB)
     planner = _planner(_auto_pool(4 * _GB))
     planner._worker.vllm_config.model_config.original_max_model_len = -1
-    with pytest.raises(ValueError, match="not enough Metal memory"):
+    with pytest.raises(ValueError, match="not enough Metal memory") as error:
         planner.determine_available_memory()
+    # The pool resolved to 0, so the advice does not mention offloading.
+    assert "offloading" not in str(error.value)
 
 
 # Re-capping inside the probe. Budget: 10GB * 0.5 - 1GB weights - 1GB
@@ -430,6 +432,27 @@ def test_no_room_error_names_paging(
     assert ("without KV offloading" in message) == without_offloading_helps
 
 
+def test_user_pool_with_no_kv_room_advises_its_size(monkeypatch) -> None:
+    kv_transfer_config = _offload("MetalOffloadingConnector", pool=_AUTO)
+    planner = _planner(kv_transfer_config, max_model_len=_MML)
+    _paging_probe(monkeypatch, free=_RESERVE)
+    with pytest.raises(ValueError) as error:
+        planner.determine_available_memory()
+    assert "Mitigations: lower --kv-offloading-size; close other applications" in (
+        str(error.value)
+    )
+
+
+def test_auto_pool_mitigations_leave_out_the_pool_size() -> None:
+    """Without the probe too, for example when too few KV blocks are left."""
+    plan = _planner(_auto_pool(_POOL))._paged_attention_plan(overhead=_GB)
+    assert plan.kv_offload_pool_auto
+    assert plan.format_mitigations() == (
+        "Mitigations: increase --gpu-memory-utilization (currently 0.5); "
+        "use a smaller or more quantized model."
+    )
+
+
 @pytest.mark.parametrize("past_reserve", [_AUTO, 300_000_000, _AUTO + 500_000_000])
 def test_user_pool_is_never_recapped(monkeypatch, past_reserve) -> None:
     """--kv-offloading-size is the user's choice: the probe shrinks KV only."""
@@ -461,16 +484,29 @@ def test_no_paging_keeps_the_pool(monkeypatch, swap) -> None:
     assert kv_transfer_config.kv_connector_extra_config["cpu_bytes_to_use"] == _AUTO
 
 
-def test_auto_fit_with_only_one_chunk_reports_memory_pressure(monkeypatch) -> None:
-    """A re-cap with no KV room keeps the probe's advice to free memory."""
+@pytest.mark.parametrize("room", [0, _chunk_bytes() // 2, _chunk_bytes()])
+def test_auto_pool_with_no_kv_room_reports_memory_pressure(monkeypatch, room) -> None:
+    """Room for at most one host chunk leaves no KV cache. The error keeps the
+    probe's advice to free memory. The user never set --kv-offloading-size,
+    so it is not advised."""
+    kv_transfer_config = _auto_pool(4 * _GB)
+    planner = _planner(kv_transfer_config, max_model_len=_MML)
+    planner._worker.vllm_config.model_config.original_max_model_len = -1
+    _paging_probe(monkeypatch, free=_RESERVE + room)
+
+    with pytest.raises(ValueError, match="close other applications") as error:
+        planner.determine_available_memory()
+    assert str(error.value).endswith("use a smaller or more quantized model.")
+    assert "offloading" not in str(error.value)
+
+
+def test_auto_pool_recapped_to_one_chunk_is_written_back(monkeypatch) -> None:
     kv_transfer_config = _auto_pool(4 * _GB)
     planner = _planner(kv_transfer_config, max_model_len=_MML)
     planner._worker.vllm_config.model_config.original_max_model_len = -1
     _paging_probe(monkeypatch, free=_RESERVE + _chunk_bytes())
-
-    with pytest.raises(ValueError, match="close other applications"):
+    with pytest.raises(ValueError):
         planner.determine_available_memory()
-
     assert (
         kv_transfer_config.kv_connector_extra_config["cpu_bytes_to_use"]
         == _chunk_bytes()

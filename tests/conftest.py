@@ -19,6 +19,77 @@ if TYPE_CHECKING:
 os.environ["MLX_ENABLE_TF32"] = "0"  # Keep FP32 parity checks strict on M5.
 
 
+@pytest.fixture(scope="module")
+def inspect_vllm_models_in_process():
+    """Opt-in, per module: skip vLLM's per-architecture registry subprocess.
+
+    ``ModelRegistry`` inspects each architecture in a fresh interpreter (to
+    keep CUDA out of the parent) and caches the result under
+    ``VLLM_CACHE_ROOT``. CI starts cold, so every config-building test that
+    names a new architecture pays a full vLLM import. There is no CUDA here,
+    and the test process has vLLM imported already.
+
+    This bypasses the real subprocess path, so it is not autouse and is
+    module-scoped: the original ``_run_in_subprocess`` is restored when the
+    requesting module finishes (``test_registry_subprocess_restored.py``
+    checks this). ``test_entry_point_mounts_without_manual_register`` keeps
+    the real path covered with an empty cache root.
+    """
+
+    from vllm.model_executor.models import registry
+
+    with pytest.MonkeyPatch.context() as mp_patch:
+        mp_patch.setattr(registry, "_run_in_subprocess", lambda fn: fn())
+        yield
+
+
+@pytest.fixture(scope="session")
+def _whisper_hub_tokenizers() -> dict:
+    """Session-lifetime cache behind ``whisper_hub_tokenizer_cache``."""
+    return {}
+
+
+@pytest.fixture
+def whisper_hub_tokenizer_cache(
+    _whisper_hub_tokenizers: dict, monkeypatch: pytest.MonkeyPatch
+):
+    """Serve hub Whisper tokenizers from a session cache of deep copies.
+
+    ``WhisperTranscriber.load_tokenizer`` resolves a tokenizer-free snapshot
+    by loading one of three ``openai/whisper-*`` checkpoints from the hub —
+    a ~1.5s metadata round-trip per call even with a warm local cache. Every
+    fallback test constructs its own transcriber, so a plain run pays that
+    per parameter. Copies (not a shared instance) are handed out even
+    though nothing mutates a tokenizer today: ``len`` is read-only, and a
+    future mutation would otherwise leak across tests. Only the exact
+    no-argument form hits the cache; load-shaping arguments such as
+    ``revision=`` must reach the real loader.
+
+    Non-hub paths (the local-snapshot attempt) still hit the real loader.
+    """
+    import copy
+
+    from transformers import WhisperTokenizer
+
+    real = WhisperTokenizer.from_pretrained
+
+    def cached_from_pretrained(name_or_path, *args, **kwargs):
+        if (
+            isinstance(name_or_path, str)
+            and name_or_path.startswith("openai/whisper-")
+            and not args
+            and not kwargs
+        ):
+            if name_or_path not in _whisper_hub_tokenizers:
+                _whisper_hub_tokenizers[name_or_path] = real(name_or_path)
+            return copy.deepcopy(_whisper_hub_tokenizers[name_or_path])
+        return real(name_or_path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        WhisperTokenizer, "from_pretrained", staticmethod(cached_from_pretrained)
+    )
+
+
 @pytest.fixture
 def run_in_spawn_process(request):
     """Isolate a real engine: MLX is not fork-safe, and engines retain state.

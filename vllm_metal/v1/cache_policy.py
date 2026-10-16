@@ -267,6 +267,7 @@ class _PagedAttentionPlan:
     # KV offload host pool. Pageable, but the same physical RAM as the wired
     # cache on unified memory, so it comes out of the same budget.
     kv_offload_pool: int = 0
+    kv_offload_pool_auto: bool = False
     sized_down_by_probe: bool = False
 
     def format_breakdown(self) -> str:
@@ -295,7 +296,8 @@ class _PagedAttentionPlan:
                 f"increase --gpu-memory-utilization (currently {self.fraction})",
                 "use a smaller or more quantized model",
             ]
-        if self.kv_offload_pool:
+        # An automatic pool was sized for the user, who never set the flag.
+        if self.kv_offload_pool and not self.kv_offload_pool_auto:
             mitigations.insert(0, "lower --kv-offloading-size")
         return "Mitigations: " + "; ".join(mitigations) + "."
 
@@ -1219,6 +1221,7 @@ class WorkerCachePlanner:
                 kv_budget=kv_budget,
                 num_blocks=max(0, kv_budget // per_block_bytes),
                 kv_offload_pool=kv_offload_pool,
+                kv_offload_pool_auto=self._auto_pool_extra() is not None,
             ),
             future_reserved_bytes=future_reserved_bytes,
         )
@@ -1237,6 +1240,15 @@ class WorkerCachePlanner:
                 )
         return plan
 
+    def _auto_pool_extra(self) -> dict | None:
+        """Connector config of an automatic Metal host pool, else None."""
+        vllm_config = self._worker.vllm_config
+        if not uses_metal_offloading(vllm_config):
+            return None
+        assert vllm_config.kv_transfer_config is not None
+        extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+        return extra if extra.get(AUTO_POOL_KEY) is True else None
+
     def _auto_pool_limits(
         self, kv_budget: int, per_block_bytes: int
     ) -> tuple[int, int, int, dict] | None:
@@ -1244,13 +1256,10 @@ class WorkerCachePlanner:
 
         None for a user-set size, which is never capped.
         """
+        extra = self._auto_pool_extra()
+        if extra is None:
+            return None
         vllm_config = self._worker.vllm_config
-        if not uses_metal_offloading(vllm_config):
-            return None
-        assert vllm_config.kv_transfer_config is not None
-        extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
-        if extra.get(AUTO_POOL_KEY) is not True:
-            return None
         cache_config = vllm_config.cache_config
         block_size = cache_config.block_size
         cap = int(kv_budget * _AUTO_POOL_MAX_SHARE)
