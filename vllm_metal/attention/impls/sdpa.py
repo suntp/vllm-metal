@@ -63,7 +63,7 @@ from vllm_metal.attention.impls.turboquant_prefill import (
 from vllm_metal.attention.impls.varlen_rope_compat import (
     apply_attention_rope,
 )
-from vllm_metal.attention.nax_split import nax_split_hint, nax_tile_work
+from vllm_metal.attention.nax_split import nax_split_kwargs, nax_tile_work
 from vllm_metal.metal import get_ops, paged_attention_capabilities
 
 logger = init_logger(__name__)
@@ -923,6 +923,8 @@ def sdpa_forward(
             )
             batch = plan.prefill
             query = q_3d if batch.query_indices is None else q_3d[batch.query_indices]
+            if ctx.paged_native_capabilities is None:
+                ctx.paged_native_capabilities = paged_attention_capabilities(ops)
             ops.paged_attention_primitive(
                 query,
                 k16.reshape(-1, kernel_block_size, cache_kv_heads, q_3d.shape[2]),
@@ -938,6 +940,12 @@ def sdpa_forward(
                 layer_sliding_window,
                 out,
                 window_seqlen_q=ctx.verify_window_q,
+                **nax_split_kwargs(
+                    ctx.paged_native_capabilities,
+                    batch.nax_work,
+                    q_3d.shape[2],
+                    layer_sliding_window,
+                ),
             )
             if plan.fallback is not None:
                 fallback = plan.fallback
@@ -990,19 +998,23 @@ def sdpa_forward(
             if ctx.gqa_length_plan is None:
                 ctx.gqa_length_plan = ops.gqa_decode_length_plan(ctx.context_lens)
             paged_kwargs["gqa_length_plan"] = ctx.gqa_length_plan
-        if (
-            capabilities["nax_split_hint"]
-            and ctx.cu_seqlens is not None
-            and len(ctx.cu_seqlens) == len(ctx.context_lens) + 1
-            and ctx.cu_seqlens[-1] == q_3d.shape[0]
-            and q_3d.shape[0] > len(ctx.context_lens)
-        ):
+        if capabilities["nax_split_hint"] and q_3d.shape[0] > len(ctx.context_lens):
             # Prefill batch: pick the NAX pipeline from per-sequence lengths
             # the kernel dispatcher could only read back from the GPU.
-            if ctx.nax_tile_work is None:
+            if (
+                ctx.nax_tile_work is None
+                and ctx.cu_seqlens is not None
+                and len(ctx.cu_seqlens) == len(ctx.context_lens) + 1
+                and ctx.cu_seqlens[-1] == q_3d.shape[0]
+            ):
                 ctx.nax_tile_work = nax_tile_work(ctx.cu_seqlens, ctx.context_lens)
-            paged_kwargs["nax_split_hint"] = nax_split_hint(
-                ctx.nax_tile_work, q_3d.shape[2]
+            paged_kwargs.update(
+                nax_split_kwargs(
+                    capabilities,
+                    ctx.nax_tile_work,
+                    q_3d.shape[2],
+                    layer_sliding_window,
+                )
             )
         ops.paged_attention_primitive(
             q_3d,

@@ -198,6 +198,26 @@ def test_mixed_batch_routes_and_restores_rows(recorded_ops, prefill_backend):
     assert prefill[0][6][0, 0].item() == prefill[0][6][1, 0].item()
 
 
+@pytest.mark.parametrize(
+    ("qlens", "context_lens", "hint"),
+    [
+        # 63 stays compressed, so the dequantized lane sees one 193-row
+        # sequence: three full Q blocks keep the original loop, although its
+        # batch average (193) would pass the native >= 128 fallback.
+        ((193, 63), (2241, 2111), 0),
+        ((1024,), (3072,), 1),
+    ],
+)
+def test_dequantized_prefill_passes_nax_split_hint(
+    recorded_ops, qlens, context_lens, hint
+):
+    case = build_case(qlens=qlens, context_lens=context_lens)
+    assert_parity(case)
+    prefill = [kw for _, kw in recorded_ops if not kw.get("use_turboquant", False)]
+    assert len(prefill) == 1
+    assert prefill[0]["nax_split_hint"] == hint
+
+
 @pytest.mark.parametrize("qlen", [1, 2, 32, 127, 128])
 def test_short_suffix_crossover(recorded_ops, qlen):
     case = build_case(qlens=(qlen,), context_lens=(2049,))

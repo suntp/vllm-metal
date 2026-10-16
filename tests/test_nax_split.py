@@ -4,7 +4,11 @@
 import mlx.core as mx
 import pytest
 
-from vllm_metal.attention.nax_split import nax_split_hint, nax_tile_work
+from vllm_metal.attention.nax_split import (
+    nax_split_hint,
+    nax_split_kwargs,
+    nax_tile_work,
+)
 
 
 def _work(seqs):
@@ -50,6 +54,26 @@ def test_tile_counts_follow_the_causal_mask():
     # Two full blocks end at KV 128 and 192 (4 and 6 tiles); the residual
     # row sees all 193 tokens (7 tiles).
     assert (work.full_blocks, work.full_tiles, work.partial_tiles) == (2, 10, 7)
+
+
+def test_split_kwargs_defaults_to_the_original_loop():
+    caps = {"nax_split_hint": True}
+    work = _work([(2048, 6144)])
+    assert nax_split_kwargs({}, work, 128, -1) == {}
+    assert nax_split_kwargs({"nax_split_hint": False}, work, 128, -1) == {}
+    assert nax_split_kwargs(caps, work, 128, -1) == {"nax_split_hint": 1}
+    assert nax_split_kwargs(caps, None, 128, -1) == {"nax_split_hint": 0}
+
+
+def test_sliding_window_layers_use_the_original_loop():
+    # Causal-prefix work says split, but a 128-token window visits only a few
+    # KV tiles per Q block, so the windowed layer keeps the original loop.
+    caps = {"nax_split_hint": True}
+    work = _work([(256, 131072)] + [(63, 0)] * 9)
+    assert nax_split_hint(work, 128) == 1
+    assert nax_split_kwargs(caps, work, 128, -1) == {"nax_split_hint": 1}
+    assert nax_split_kwargs(caps, work, 128, 128) == {"nax_split_hint": 0}
+    assert nax_split_kwargs(caps, work, 128, 0) == {"nax_split_hint": 0}
 
 
 def test_length_mismatch_is_rejected():

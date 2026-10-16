@@ -18,7 +18,7 @@ size 16); head_size 512 is never split (see ``dispatch_paged_attention_nax``).
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 _BQ = 64  # Q rows per NAX threadgroup
@@ -75,3 +75,23 @@ def nax_split_hint(work: NaxTileWork, head_size: int) -> int:
         return 0
     factor = _MIN_FULL_TO_PARTIAL.get(head_size, _MIN_FULL_TO_PARTIAL_DEFAULT)
     return int(work.full_tiles >= factor * work.partial_tiles)
+
+
+def nax_split_kwargs(
+    capabilities: Mapping[str, bool],
+    work: NaxTileWork | None,
+    head_size: int,
+    sliding_window: int,
+) -> dict[str, int]:
+    """``nax_split_hint`` keyword for one prefill ``paged_attention_primitive``.
+
+    Empty when the native build predates the hint.  Without per-sequence
+    metadata (``work`` is None) the original loop is used.  Sliding-window
+    layers also use it: ``work`` counts the whole causal prefix, which
+    overstates the tiles a windowed layer actually visits.
+    """
+    if not capabilities.get("nax_split_hint", False):
+        return {}
+    if work is None or sliding_window >= 0:
+        return {"nax_split_hint": 0}
+    return {"nax_split_hint": nax_split_hint(work, head_size)}
