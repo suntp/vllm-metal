@@ -6,6 +6,7 @@ import multiprocessing as mp
 import os
 import random
 import signal
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -216,17 +217,22 @@ def _no_kv_commit_probe(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture
 def spy_group(monkeypatch) -> SpyTransferGroup:
     """Install a spy as the KV transfer group the runner's connector uses."""
-    import vllm_metal.v1.kv_connector as metal_kv_connector
+    import vllm.v1.worker.gpu.kv_connector as upstream
+
     import vllm_metal.v1.model_runner as mr
     from tests.kv_connector_spy import SpyTransferGroup
 
     group = SpyTransferGroup()
     monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
-    monkeypatch.setattr(metal_kv_connector, "get_kv_transfer_group", lambda: group)
+    monkeypatch.setattr(upstream, "get_kv_transfer_group", lambda: group)
     # The driver opens a forward context for loads; a stub runner has no real
     # VllmConfig, and the spy ignores the context.
-    import vllm.v1.worker.gpu.kv_connector as upstream
-
     monkeypatch.setattr(upstream, "is_forward_context_available", lambda: True)
     monkeypatch.setattr(upstream, "get_forward_context", lambda: None)
+    # Stands in for register_kv_connector_caches, which stub runners skip.
+    monkeypatch.setattr(
+        mr.MetalModelRunner,
+        "_kv_connector_driver",
+        upstream.ActiveKVConnector(SimpleNamespace(), {}),
+    )
     return group

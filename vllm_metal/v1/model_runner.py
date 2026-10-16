@@ -47,7 +47,11 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.sample.logits_processor import LOGITSPROCS_GROUP
 from vllm.v1.sample.sampler import Sampler
-from vllm.v1.worker.gpu.kv_connector import NO_OP_KV_CONNECTOR, KVConnector
+from vllm.v1.worker.gpu.kv_connector import (
+    NO_OP_KV_CONNECTOR,
+    ActiveKVConnector,
+    KVConnector,
+)
 
 from vllm_metal import envs
 from vllm_metal.attention.context import (
@@ -445,9 +449,10 @@ class MetalModelRunner:
         self._sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
 
         self._draft_token_ids: DraftTokenIds | None = None
+        # KV connector driver, built by register_kv_connector_caches.
+        self._kv_connector_driver: KVConnector | None = None
         # KV connector step, open across the execute_model / sample_tokens
         # split (see _kv_connector_start_step). Not None while a step is open.
-        self._kv_connector_driver: KVConnector | None = None
         self._kv_step_finished_req_ids: set[str] | None = None
 
         # Paged attention state (set by worker during cache initialization)
@@ -960,7 +965,7 @@ class MetalModelRunner:
         self._cache_policy.initialize_kv_cache(kv_cache_config)
 
     def register_kv_connector_caches(self) -> None:
-        """Hand the runtime's KV storage to the KV connector.
+        """Hand the runtime's KV storage to the KV connector, and build its driver.
 
         Called by the worker after ``initialize_kv_cache`` when a KV connector
         is configured. Only the SDPA runtime binds vLLM's allocation as
@@ -982,19 +987,23 @@ class MetalModelRunner:
                 "runtime with storage bound from the KV cache config; "
                 f"{type(runtime).__name__} provides none."
             )
-        get_kv_transfer_group().register_kv_caches(storage)
+        # MRv2's driver registers the caches it is given. The Metal connector
+        # takes KVCacheStorage where upstream annotates a torch tensor dict.
+        self._kv_connector_driver = ActiveKVConnector(
+            self.vllm_config,
+            storage,  # type: ignore[arg-type]
+        )
 
     def _kv_connector(self) -> KVConnector:
-        """The connector driver, in MRv2's shape; a no-op without a connector."""
-        if self._kv_connector_driver is None:
-            from vllm_metal.v1.kv_connector import MetalKVConnector
+        """The connector driver, in MRv2's shape; a no-op without a connector.
 
-            self._kv_connector_driver = (
-                MetalKVConnector(self.vllm_config)
-                if has_kv_transfer_group()
-                else NO_OP_KV_CONNECTOR
-            )
-        return self._kv_connector_driver
+        Raises if a connector is configured but its caches are not registered.
+        """
+        if self._kv_connector_driver is not None:
+            return self._kv_connector_driver
+        if has_kv_transfer_group():
+            raise RuntimeError("KV connector step before register_kv_connector_caches")
+        return NO_OP_KV_CONNECTOR
 
     def _kv_connector_start_step(self, scheduler_output: SchedulerOutput) -> None:
         """Open this step's connector step: preemptions, metadata, sync loads.
