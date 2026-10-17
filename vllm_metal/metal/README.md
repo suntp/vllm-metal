@@ -11,6 +11,8 @@ the [vLLM project](https://github.com/vllm-project/vllm) (Apache-2.0).
 `turboquant.metal`, `pagedattention_tiled.metal`, and `mla.metal` are
 vLLM-project Apache-2.0 sources. `pagedattention_nax.metal` adapts MLX's
 `steel_attention_nax` (MIT, © 2025 Apple Inc.).
+`gdn_recurrent_prefill_packed.metal` adapts mlx-lm's packed recurrence layout
+(MIT, © 2025 Apple Inc.).
 
 ## How the shaders are compiled
 
@@ -34,7 +36,7 @@ builders to precompile the `.metallib` files via `python -m vllm_metal.metal.bui
 
 ### 2. `mx.fast.metal_kernel` snippets: `attention/impls/gdn_lazy.py`
 
-The lazy GDN decode and prefill paths compile four shaders directly through
+The lazy GDN decode and prefill paths compile the following shaders directly through
 MLX, via `_read_v2_metal_source`:
 
 | Shader | Compiled kernel name |
@@ -43,6 +45,7 @@ MLX, via `_read_v2_metal_source`:
 | `gdn_conv1d_silu_prefill.metal` | `gdn_conv1d_silu_prefill_v2` |
 | `gdn_recurrent_decode.metal` | `gdn_recurrent_decode_v2` |
 | `gdn_recurrent_prefill.metal` | `gdn_recurrent_prefill_v2` |
+| `gdn_recurrent_prefill_packed.metal` | `gdn_recurrent_prefill_packed_v2` |
 
 ## File reference
 
@@ -62,3 +65,4 @@ MLX, via `_read_v2_metal_source`:
 | `gdn_conv1d_silu_prefill.metal` | Lazy GDN prefill: causal conv1d + SiLU. |
 | `gdn_recurrent_decode.metal` | Lazy GDN decode: recurrent state update. |
 | `gdn_recurrent_prefill.metal` | Lazy GDN prefill: recurrent state updates over packed sequences. |
+| `gdn_recurrent_prefill_packed.metal` | Lazy GDN prefill: eight value rows per SIMD-group for Dk=128 and Dv divisible by eight. |
