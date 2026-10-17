@@ -50,6 +50,22 @@ class _FakeVllmSuffix:
         return drafts
 
 
+class _FakeSuffixCache:
+    """Records the archive-time history feed a real cache would receive."""
+
+    def __init__(self) -> None:
+        self.added: list[tuple[str, list[int]]] = []
+        self.stopped: list[str] = []
+        self.active_requests: set[str] = set()
+
+    def add_active_response(self, req_id: str, sampled_ids: list[int]) -> None:
+        self.added.append((req_id, list(sampled_ids)))
+
+    def stop_request(self, req_id: str) -> None:
+        self.active_requests.discard(req_id)
+        self.stopped.append(req_id)
+
+
 def _request_state(
     token_ids: list[int],
     *,
@@ -228,6 +244,73 @@ class TestSuffixMarshalling:
 
         assert proposer.propose(_context(decode_reqs=[("r0", state)])) is None
 
+    def test_output_capped_row_still_feeds_its_delta(self) -> None:
+        fake = _FakeVllmSuffix()
+        proposer = _proposer(fake)
+        capped = _request_state([1, 2, 3, 4], prompt_len=2)
+        other = _request_state([9, 9, 9], prompt_len=1)
+        proposer.propose(_context(decode_reqs=[("c", capped), ("o", other)]))
+        assert proposer._last_len == {"c": 4, "o": 3}
+
+        # The capped request reaches its output budget: it is no longer
+        # draft-eligible, but its row is still in the batch and its live
+        # tree must still learn the tokens committed since the last feed.
+        capped.token_ids += [5, 6]
+        capped.sampling_params = SamplingParams(temperature=0.0, max_tokens=2)
+        capped.generated_tokens = 2
+        other.token_ids += [7]
+
+        drafts = proposer.propose(_context(decode_reqs=[("c", capped), ("o", other)]))
+        _, stub, sampled = fake.calls[-1]
+        assert stub.req_ids == ["c", "o"]
+        assert sampled == [[5, 6], [7]]
+        assert drafts is not None
+        assert drafts.req_ids == ["o"]  # the capped row drafts nothing
+        assert drafts.draft_token_ids == [[7]]
+        assert proposer._last_len == {"c": 6, "o": 4}
+
+    def test_finish_feeds_final_segment_before_archiving(self) -> None:
+        fake = _FakeVllmSuffix()
+        cache = _FakeSuffixCache()
+        fake.suffix_cache = cache
+        cache.active_requests.add("r0")
+        proposer = _proposer(fake)
+        state = _request_state([1, 2, 3, 4], prompt_len=2)
+        proposer.propose(_context(decode_reqs=[("r0", state)]))
+
+        # The final verify commits two more tokens, then the request
+        # finishes without ever drafting again.
+        state.token_ids += [5, 6]
+        proposer.release_requests({"r0"})
+
+        assert cache.added == [("r0", [5, 6])]
+        assert cache.stopped == ["r0"]
+        assert proposer._last_len == {}
+        assert proposer._states == {}
+
+    def test_reused_request_id_feeds_from_its_own_state(self) -> None:
+        fake = _FakeVllmSuffix()
+        cache = _FakeSuffixCache()
+        fake.suffix_cache = cache
+        cache.active_requests.add("r0")
+        proposer = _proposer(fake)
+        state = _request_state([1, 2, 3, 4], prompt_len=2)
+        proposer.propose(_context(decode_reqs=[("r0", state)]))
+
+        # The engine hands the finished id straight to a new request whose
+        # history is one token longer: the tail feed must use the held
+        # (finished) state, not request_states' replacement under the id.
+        state.token_ids += [5, 6]
+        reused = _request_state([1, 2, 3], prompt_len=2)
+        proposer.propose(
+            _context(
+                decode_reqs=[("r0", reused)],
+                request_states={"r0": reused},
+                finished_req_ids={"r0"},
+            )
+        )
+        assert cache.added == [("r0", [5, 6])]
+
 
 class TestSuffixRealTree:
     def test_repetitive_history_drafts_continuation(self) -> None:
@@ -382,6 +465,59 @@ class TestSuffixRealLifecycle:
         assert "c" not in cache.active_requests
         assert "c" in cache.cached_requests
         assert "c" not in proposer._last_len
+
+    def test_final_committed_token_reaches_archived_response(self) -> None:
+        proposer = _real_proposer()
+        state = _request_state(self._PROMPT + [20, 21], prompt_len=8)
+        state.sampling_params = SamplingParams(temperature=0.0, max_tokens=3)
+        state.generated_tokens = 2
+        proposer.propose(_context(decode_reqs=[("r0", state)]))
+
+        # The final verify commits 22, the budget is exhausted, and the
+        # request finishes -- it never drafts again. Regression: the last
+        # committed token used to miss the tree, so a later request
+        # re-emitting [20, 21] could not speculate 22.
+        state.token_ids.append(22)
+        state.generated_tokens = 3
+        proposer.propose(_context(decode_reqs=[], finished_req_ids={"r0"}))
+
+        nxt = _request_state(self._PROMPT + [20, 21], prompt_len=8)
+        drafts = proposer.propose(_context(decode_reqs=[("r1", nxt)]))
+        assert drafts is not None
+        assert drafts.draft_token_ids == [[22]]
+
+    def test_final_multi_token_commit_reaches_archived_response(self) -> None:
+        proposer = _real_proposer()
+        state = _request_state(self._PROMPT + [20, 21], prompt_len=8)
+        proposer.propose(_context(decode_reqs=[("m", state)]))
+
+        # The last verify round accepts a deep draft plus the bonus token
+        # before the request finishes.
+        state.token_ids += [22, 23, 24]
+        proposer.release_requests({"m"})
+
+        nxt = _request_state(self._PROMPT + [20, 21, 22], prompt_len=8)
+        drafts = proposer.propose(_context(decode_reqs=[("n", nxt)]))
+        assert drafts is not None
+        assert drafts.draft_token_ids == [[23, 24]]
+
+    def test_reused_request_id_does_not_inherit_the_old_tree(self) -> None:
+        proposer = _real_proposer()
+        cache = proposer._vllm.suffix_cache
+        state = _request_state(self._PROMPT + [20, 21], prompt_len=8)
+        proposer.propose(_context(decode_reqs=[("same", state)]))
+        state.token_ids += [22, 23]
+        proposer.release_requests({"same"})
+        assert "same" in cache.cached_requests
+
+        # The engine hands the finished id to a brand-new request: the old
+        # archived tree is evicted (upstream keys archives by id) and the
+        # drafts must come from the new request's own content alone.
+        fresh = _request_state([30, 31, 32, 33, 30, 31], prompt_len=2)
+        drafts = proposer.propose(_context(decode_reqs=[("same", fresh)]))
+        assert drafts is not None
+        assert drafts.draft_token_ids == [[32, 33]]
+        assert proposer._last_len == {"same": 6}
 
     def test_final_prefill_chunk_drafts(self) -> None:
         proposer = _real_proposer()
