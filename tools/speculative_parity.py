@@ -255,11 +255,12 @@ def run(args) -> bool:
 
     # Resolve once so every worker loads the same checkpoint revision.
     for name in ("target", "draft"):
-        path = getattr(args, name)
-        if path is None:
+        checkpoint = getattr(args, name)
+        if checkpoint is None:
             continue
+        path = Path(checkpoint)
         if not path.is_dir():
-            path = Path(snapshot_download(path))
+            path = Path(snapshot_download(checkpoint))
         setattr(args, name, str(path.resolve()))
     root = Path(__file__).resolve().parents[1]
     sources = sorted(
@@ -309,13 +310,10 @@ def run(args) -> bool:
                 *sys.argv[1:],
                 "--model",
                 args.target,
-                "--output-dir",
-                str(args.output_dir),
-                "--worker",
-                worker,
             ]
             if args.draft is not None:
                 command += ["--draft", args.draft]
+            command += ["--output-dir", str(args.output_dir), "--worker", worker]
             subprocess.run(
                 command,
                 stdout=log,
