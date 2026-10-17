@@ -37,7 +37,10 @@ Metal-specific decisions on top of upstream's loop:
   feeds the slice in between. When upstream holds no active tree for the
   id (first sighting, or archived while preempted) the slice starts at
   ``prompt_len``, so a restarted tree relearns the whole response.
-- **Finished requests are archived immediately** (``release_requests`` /
+  Ingestion is decoupled from drafting eligibility: a row that cannot
+  draft but holds a live tree still feeds its delta, and the state
+  reference is held so the final committed segment reaches the tree when
+  the request is archived (``release_requests`` /
   ``finished_req_ids``) instead of on upstream's next propose call.
 
 Draft lengths are dynamic per request (the tree speculates as deep as the
@@ -89,6 +92,11 @@ class SuffixProposer(NoOwnKVProposer):
         # req_id -> committed-history length at this request's last feeding.
         # The delta since then is what the suffix tree should learn from.
         self._last_len: dict[str, int] = {}
+        # req_id -> the RequestState whose token_ids that length anchors.
+        # Held so the final committed segment can still be fed when the
+        # request is archived: by then the engine may have dropped it from
+        # request_states, or even reused the id for a new request.
+        self._states: dict[str, object] = {}
         self._vllm = _build_vllm_suffix(vllm_config)
         spec = vllm_config.speculative_config
         assert spec is not None
@@ -143,9 +151,22 @@ class SuffixProposer(NoOwnKVProposer):
             self._stop(req_id)
 
     def _stop(self, req_id: str) -> None:
-        self._last_len.pop(req_id, None)
+        anchor = self._last_len.pop(req_id, None)
+        state = self._states.pop(req_id, None)
         cache = getattr(self._vllm, "suffix_cache", None)
         if cache is not None and req_id in cache.active_requests:
+            # Feed the final committed segment before archiving. The request
+            # leaves after its last drafting step (finished, preempted or
+            # evicted), so the tokens committed since then -- the verify
+            # round that finished it, or the output-budget-capped tail --
+            # would otherwise never reach the tree, and that tail is exactly
+            # what later requests want to reuse. The held state is the
+            # finished request's own; request_states cannot be used here
+            # because a finished id may already be reused by a new request.
+            if anchor is not None and state is not None:
+                delta = [int(t) for t in state.token_ids[anchor:]]
+                if delta:
+                    cache.add_active_response(req_id, delta)
             cache.stop_request(req_id)
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
@@ -195,29 +216,42 @@ class SuffixProposer(NoOwnKVProposer):
                 num_prompt_tokens[i] = state.prompt_len
             draft_state = drafting.get(req_id)
             if draft_state is None:
-                # Upstream skips rows without a delta and never reads their
-                # token_ids_cpu, so nothing is copied for them.
-                sampled_token_ids.append([])
-                continue
-            history = draft_state.token_ids
+                # Not drafting and no live tree to feed: upstream skips the
+                # row and never reads its token_ids_cpu, so nothing is
+                # copied for it.
+                if state is None or req_id not in self._last_len:
+                    sampled_token_ids.append([])
+                    continue
+                # A row that is not drafting but holds a live tree (it
+                # reached its output budget; this is its last batch
+                # appearance) still feeds its committed delta -- without
+                # this, its final tokens would only reach the tree through
+                # _stop's tail feed, and never at all if the batch row were
+                # dropped. Upstream drafts for the row anyway; the draft is
+                # discarded below.
+                source = state
+            else:
+                source = draft_state
+            history = source.token_ids
             cur = len(history)
             # Not in _last_len means upstream holds no active tree for this
             # id (first sighting, or archived while preempted/absent): it
             # will (re)start the tree from the prompt, so feed the whole
             # response so far, not just the latest delta.
             starting = req_id not in self._last_len
-            prev = self._last_len.get(req_id, draft_state.prompt_len)
+            prev = self._last_len.get(req_id, source.prompt_len)
             if prev > cur:
                 # Rollback: the recomputed history is shorter than what was
                 # fed; re-anchor and skip the delta this step.
                 prev = cur
             self._last_len[req_id] = cur
+            self._states[req_id] = source
             sampled_token_ids.append(history[prev:cur])
             # Upstream reads only the prompt (when it starts a tree) and the
             # last max_tree_depth tokens (the match pattern); copy just those
             # instead of the whole history every step.
             if starting:
-                prompt_len = draft_state.prompt_len
+                prompt_len = source.prompt_len
                 token_ids_cpu[i, :prompt_len] = history[:prompt_len]
             tail = max(0, cur - self._max_tree_depth)
             token_ids_cpu[i, tail:cur] = history[tail:cur]
@@ -238,6 +272,7 @@ class SuffixProposer(NoOwnKVProposer):
         for req_id in list(self._last_len):
             if req_id not in req_id_to_index:
                 del self._last_len[req_id]
+                self._states.pop(req_id, None)
 
         req_ids: list[str] = []
         draft_token_ids: list[list[int]] = []
