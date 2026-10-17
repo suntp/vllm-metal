@@ -1162,6 +1162,7 @@ class TestLazyRecurrentPrefill:
         [
             (mx.float32, None, mx.float32, 8, 2),
             (mx.float16, None, mx.float32, 24, 4),
+            pytest.param(mx.float16, None, mx.float16, 24, 4, id="fp16-state"),
             (mx.bfloat16, None, mx.bfloat16, 128, 8),
             (mx.bfloat16, mx.float32, mx.float32, 24, 4),
             pytest.param(
