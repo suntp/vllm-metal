@@ -242,11 +242,10 @@ settings via `tools/check_parity.py --method suffix --top-k 5`, and accept
 `EXACT`, or a first divergence with mutual `TOP_K_MATCH` membership, with
 zero `FAIL`.
 
-Sleep mode (`--enable-sleep-mode`) is supported with suffix: the trees are
-host memory independent of the KV cache and persist across a
-`sleep(level=1)` → `wake_up()` cycle, with post-wake cross-request drafting
-and acceptance matching the no-sleep control and identical greedy outputs
-(level 2 sleep is not available on Metal).
+With `--enable-sleep-mode`, suffix decoding supports the worker's
+`sleep(level=1)` → `wake_up()` cycle. Suffix trees remain in host memory
+while the KV cache is released, so cached responses can be reused after
+wake-up. Level 2 sleep is not supported on Metal.
 
 ### Example
 
