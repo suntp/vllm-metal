@@ -96,7 +96,7 @@ class SuffixProposer(NoOwnKVProposer):
         # Held so the final committed segment can still be fed when the
         # request is archived: by then the engine may have dropped it from
         # request_states, or even reused the id for a new request.
-        self._states: dict[str, object] = {}
+        self._states: dict[str, RequestState] = {}
         self._vllm = _build_vllm_suffix(vllm_config)
         spec = vllm_config.speculative_config
         assert spec is not None
@@ -109,6 +109,7 @@ class SuffixProposer(NoOwnKVProposer):
         # upstream reads rows [:num_prompt_tokens] and [start:num_tokens].
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         max_model_len = vllm_config.model_config.max_model_len
+        self._max_model_len = max_model_len
         self._token_ids_cpu = np.zeros((max_num_seqs, max_model_len), dtype=np.int32)
         logger.info(
             "Suffix speculative decoding enabled "
@@ -193,9 +194,8 @@ class SuffixProposer(NoOwnKVProposer):
         # whole InputBatch over. Upstream stops (archives) any active tree
         # whose id is missing from the batch, so a drafting request that sits
         # in an intermediate prefill chunk (recompute after preemption) or
-        # cannot draft this step must still be present. Only drafting rows
-        # carry a delta and receive drafts; that includes the last prefill
-        # chunk, whose first sampled token is already committed.
+        # cannot draft this step must still be present. Active trees ingest
+        # their deltas even when the row cannot receive drafts.
         rows: list[tuple[str, RequestState | None]] = list(ctx.decode_reqs)
         seen = {req_id for req_id, _ in rows}
         for prefill in ctx.prefill_reqs:
@@ -234,6 +234,13 @@ class SuffixProposer(NoOwnKVProposer):
                 source = draft_state
             history = source.token_ids
             cur = len(history)
+            if cur >= self._max_model_len:
+                # Upstream skips ingestion at the context limit. Preserve
+                # the last ingested position so _stop can flush the tail.
+                if req_id in self._last_len:
+                    self._states[req_id] = source
+                sampled_token_ids.append([])
+                continue
             # Not in _last_len means upstream holds no active tree for this
             # id (first sighting, or archived while preempted/absent): it
             # will (re)start the tree from the prompt, so feed the whole
@@ -263,16 +270,13 @@ class SuffixProposer(NoOwnKVProposer):
             num_prompt_tokens=num_prompt_tokens,
             token_ids_cpu=token_ids_cpu,
         )
+        # Flush missing requests before upstream archives them. Their last
+        # step may have committed tokens while drafting was disabled.
+        for req_id in self._last_len.keys() - req_id_to_index.keys():
+            self._stop(req_id)
         drafts = self._vllm.propose(
             self._num_speculative_tokens, stub, sampled_token_ids
         )
-        # Upstream archives every active tree missing from this batch; keep
-        # the length anchors in sync so a returning id is re-fed from its
-        # prompt boundary when its tree restarts.
-        for req_id in list(self._last_len):
-            if req_id not in req_id_to_index:
-                del self._last_len[req_id]
-                self._states.pop(req_id, None)
 
         req_ids: list[str] = []
         draft_token_ids: list[list[int]] = []
