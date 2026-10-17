@@ -252,8 +252,9 @@ def test_replay_rejects_broken_generation_and_closes_stream(monkeypatch, problem
     "audit_passed,legacy_passed", [(False, True), (True, False), (True, True)]
 )
 @pytest.mark.parametrize("hub_models", [False, True])
+@pytest.mark.parametrize("method", ["dspark", "suffix"])
 def test_cli_requires_both_audits_and_preserves_the_report(
-    monkeypatch, tmp_path, audit_passed, legacy_passed, hub_models
+    monkeypatch, tmp_path, audit_passed, legacy_passed, hub_models, method
 ):
     import tools.speculative_parity as tool
     from tools import check_parity as cli
@@ -274,11 +275,14 @@ def test_cli_requires_both_audits_and_preserves_the_report(
         [
             "parity",
             "--method",
-            "dspark",
+            method,
             "--model",
             "test/target" if hub_models else str(target),
-            "--draft",
-            "test/draft" if hub_models else str(draft),
+            *(
+                ["--draft", "test/draft" if hub_models else str(draft)]
+                if method != "suffix"
+                else []
+            ),
             "--audit-continuations",
             "--output-dir",
             str(output),
@@ -288,7 +292,7 @@ def test_cli_requires_both_audits_and_preserves_the_report(
     report = {
         "passed": audit_passed,
         "reports": {
-            "dspark-b1": {
+            f"{method}-b1": {
                 "tokens": 32,
                 "native_argmax_mismatches": int(not audit_passed),
                 "serving_argmax_mismatches": 0,
@@ -378,17 +382,24 @@ def test_cli_requires_both_audits_and_preserves_the_report(
     assert [command[-1] for command in commands] == [
         "native",
         "target",
-        "dspark",
+        method,
         "replay",
     ]
-    assert all(
-        command[-8:-4] == ["--model", str(target), "--draft", str(draft)]
-        for command in commands
-    )
-    assert resolved == (["test/target", "test/draft"] if hub_models else [])
+    if method == "suffix":
+        assert all("--draft" not in command for command in commands)
+        assert all(command[-6:-4] == ["--model", str(target)] for command in commands)
+    else:
+        assert all(
+            command[-8:-4] == ["--model", str(target), "--draft", str(draft)]
+            for command in commands
+        )
+    expected_models = ["test/target"]
+    if method != "suffix":
+        expected_models.append("test/draft")
+    assert resolved == (expected_models if hub_models else [])
     metadata = json.loads((output / "metadata.json").read_text())
     assert metadata["target"] == str(target)
-    assert metadata["draft"] == str(draft)
+    assert metadata["draft"] == (None if method == "suffix" else str(draft))
 
 
 def test_cli_rejects_duplicate_batch_sizes_before_starting_workers(
