@@ -207,28 +207,27 @@ for the tuning knobs (`suffix_decoding_max_tree_depth`,
 ### Installing arctic_inference on macOS
 
 The suffix tree lives in the [`arctic_inference`](https://pypi.org/project/arctic-inference/)
-package. PyPI ships an sdist only — no macOS wheels — but the suffix-tree
-core is pure C++/nanobind with no CUDA in it, so it builds from source:
+package. The tested version is **0.3.0**. Its suffix-tree core uses
+C++/nanobind and builds from source on macOS without CUDA.
+
+Activate the same native arm64 environment used to run vLLM Metal, then
+install the build tools and the pinned backend. Build without isolation
+to use the environment's existing PyTorch and nanobind versions, and pin
+the interpreter so CMake does not select a different Homebrew Python:
 
 ```bash
-  pip install nanobind grpcio-tools   # build-time dependencies
-  pip install --no-build-isolation arctic_inference
-```
-
-If the build binds the wrong interpreter (a Homebrew Python instead of the
-venv's), pin it:
-
-```bash
-  PATH="$VIRTUAL_ENV/bin:$PATH" \
+  python -m pip install cmake ninja grpcio-tools wheel
   Python_ROOT_DIR="$VIRTUAL_ENV" Python_FIND_STRATEGY=LOCATION \
-  pip install --no-build-isolation --no-deps arctic_inference
+    python -m pip install --no-build-isolation --no-deps \
+    --no-binary arctic-inference arctic-inference==0.3.0
+  python -c 'from arctic_inference.suffix_decoding import SuffixDecodingCache; SuffixDecodingCache(max_tree_depth=24)'
 ```
 
 Serving without the package installed fails at config time with vLLM's own
-error, which suggests `pip install arctic-inference==0.1.1` (vLLM's pin). That
-pin is not what this backend was tested with: the Metal path was validated
-against `arctic_inference` 0.3.0 built with the recipe above. The package is
-Apache-2.0 licensed (its `LICENSE` file, shipped in the sdist).
+error, which may suggest `arctic-inference==0.1.1`. Use the tested 0.3.0
+version above for this backend. CI installs this optional dependency and
+runs the suffix tests with the real native cache; it is not required for
+other speculative methods. The package is Apache-2.0 licensed.
 
 Greedy outputs with suffix (as with n-gram) are not guaranteed to match a
 run without speculation token for token: the verify forward has a different
