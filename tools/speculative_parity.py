@@ -187,6 +187,8 @@ def run_engine(args):
 
 
 def validate_args(args, parser):
+    if args.method == "suffix" and args.draft is not None:
+        parser.error("--draft cannot be used with --method suffix")
     if args.dspark_draft_quantization is not None and args.method != "dspark":
         parser.error("--dspark-draft-quantization requires --method dspark")
     if args.dspark_draft_topk is not None and (
