@@ -40,13 +40,17 @@ def run_engine(args):
         if args.worker == "target"
         else {
             "method": args.method,
-            "model": args.draft,
             "num_speculative_tokens": args.num_draft_tokens,
             "num_speculative_tokens_per_batch_size": args.draft_schedule,
         }
     )
-    if spec is not None and args.dspark_draft_topk is not None:
-        spec["dspark_draft_topk"] = args.dspark_draft_topk
+    if spec is not None:
+        # Model-free methods (suffix) draft from token history alone and
+        # take no draft checkpoint.
+        if args.draft is not None:
+            spec["model"] = args.draft
+        if args.dspark_draft_topk is not None:
+            spec["dspark_draft_topk"] = args.dspark_draft_topk
     llm = LLM(
         model=args.target,
         max_model_len=1024,
@@ -196,6 +200,8 @@ def validate_args(args, parser):
             "dflash": "z-lab/Qwen3-4B-DFlash-b16",
             "dspark": "deepseek-ai/dspark_qwen3_4b_block7",
             "draft_model": "Qwen/Qwen3-0.6B",
+            # Suffix drafts from token history; there is no draft checkpoint.
+            "suffix": None,
         }[args.method]
     if args.worker not in (None, "native", "target", args.method, "replay"):
         parser.error("Draft worker must match --method")
@@ -249,9 +255,11 @@ def run(args) -> bool:
 
     # Resolve once so every worker loads the same checkpoint revision.
     for name in ("target", "draft"):
-        path = Path(getattr(args, name))
+        path = getattr(args, name)
+        if path is None:
+            continue
         if not path.is_dir():
-            path = Path(snapshot_download(getattr(args, name)))
+            path = Path(snapshot_download(path))
         setattr(args, name, str(path.resolve()))
     root = Path(__file__).resolve().parents[1]
     sources = sorted(
@@ -294,21 +302,22 @@ def run(args) -> bool:
         workers.append("replay")
     for worker in workers:
         with (args.output_dir / f"{worker}.log").open("w") as log:
+            command = [
+                sys.executable,
+                "-m",
+                "tools.check_parity",
+                *sys.argv[1:],
+                "--model",
+                args.target,
+                "--output-dir",
+                str(args.output_dir),
+                "--worker",
+                worker,
+            ]
+            if args.draft is not None:
+                command += ["--draft", args.draft]
             subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "tools.check_parity",
-                    *sys.argv[1:],
-                    "--model",
-                    args.target,
-                    "--draft",
-                    args.draft,
-                    "--output-dir",
-                    str(args.output_dir),
-                    "--worker",
-                    worker,
-                ],
+                command,
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 check=True,
