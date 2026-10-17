@@ -1073,52 +1073,34 @@ static void dispatch_paged_attention_gqa_decode(
     const PagedAttentionArrays& arrays, const PagedAttentionMetadata& metadata,
     const PagedAttentionPlan& plan, const PagedAttentionEncoding& encoding,
     MTL::ComputePipelineState* gqa_rkernel) {
-  auto& out = arrays.out;
-  const auto& query = arrays.query;
-  const auto& key_cache = arrays.key_cache;
-  const auto& value_cache = arrays.value_cache;
-  const auto& block_tables = arrays.block_tables;
-  const auto& seq_lens = arrays.seq_lens;
-  const auto& cu_seqlens_q = arrays.cu_seqlens_q;
-  auto& d = *encoding.device;
-  auto* lib = encoding.library;
   auto& enc = *encoding.encoder;
-  const auto& dt = encoding.dt;
-  const auto& head_size = metadata.head_size;
-  const auto& num_heads = metadata.num_heads;
-  const auto& num_kv_heads = metadata.num_kv_heads;
-  const auto& block_size = metadata.block_size;
-  const auto& scale = metadata.scale;
-  const auto& total_q_tokens = plan.total_q_tokens;
-  const auto& num_seqs = plan.num_seqs;
-  const auto& gqa_partition_size = plan.gqa_partition_size;
-  const auto& offsets = plan.offsets;
-  const auto& compact = plan.compact;
   const int gqa_num_partitions = static_cast<int>(plan.gqa_partitions);
-  record_paged_dispatch(PagedDispatch::GqaDecode, gqa_partition_size, num_seqs);
+  record_paged_dispatch(
+      PagedDispatch::GqaDecode, plan.gqa_partition_size, plan.num_seqs);
   std::string name = gqa_decode_kernel_name(
-      dt, head_size, block_size, gqa_partition_size);
-  std::string hash = name + (compact ? "_compact1" : "_compact0");
-  const int num_threads = 32 * (num_heads / num_kv_heads);
+      encoding.dt, metadata.head_size, metadata.block_size, plan.gqa_partition_size);
+  std::string hash = name + (plan.compact ? "_compact1" : "_compact0");
+  const int num_threads = 32 * (metadata.num_heads / metadata.num_kv_heads);
   // Instantiated in pagedattention.metal and shipped in the v2 metallib.
   // A missing specialization is a build/packaging bug: fail loudly
   // rather than silently drop eligible long decode back to the slower
   // per-token kernel.
-  auto* gkernel = d.get_kernel(
-      name, lib, hash,
-      {{&compact, MTL::DataType::DataTypeBool, NS::UInteger(130)}});
+  auto* gkernel = encoding.device->get_kernel(
+      name, encoding.library, hash,
+      {{&plan.compact, MTL::DataType::DataTypeBool, NS::UInteger(130)}});
 
-  Shape stats_shape = offsets
-      ? Shape{static_cast<int>(offsets->back()), num_heads}
-      : Shape{total_q_tokens, num_heads, gqa_num_partitions};
+  Shape stats_shape = plan.offsets
+      ? Shape{static_cast<int>(plan.offsets->back()), metadata.num_heads}
+      : Shape{plan.total_q_tokens, metadata.num_heads, gqa_num_partitions};
   Shape output_shape = stats_shape;
-  output_shape.push_back(head_size);
-  array g_tmp_out = make_paged_attention_temp(enc, output_shape, query.dtype());
+  output_shape.push_back(metadata.head_size);
+  array g_tmp_out = make_paged_attention_temp(enc, output_shape, arrays.query.dtype());
   array g_exp_sums = make_paged_attention_temp(enc, stats_shape, float32);
   array g_max_logits = make_paged_attention_temp(enc, stats_shape, float32);
   std::optional<array> g_offsets;
-  if (compact) {
-    g_offsets.emplace(offsets->data(), Shape{static_cast<int>(offsets->size())}, int64);
+  if (plan.compact) {
+    g_offsets.emplace(
+        plan.offsets->data(), Shape{static_cast<int>(plan.offsets->size())}, int64);
     enc.add_temporary(*g_offsets);
   }
 
@@ -1126,74 +1108,45 @@ static void dispatch_paged_attention_gqa_decode(
   enc.set_output_array(g_exp_sums, 0);
   enc.set_output_array(g_max_logits, 1);
   enc.set_output_array(g_tmp_out, 2);
-  enc.set_input_array(query, 3);
-  enc.set_input_array(key_cache, 4);
-  enc.set_input_array(value_cache, 5);
-  int32_t g_nkv = static_cast<int32_t>(num_kv_heads);
+  enc.set_input_array(arrays.query, 3);
+  enc.set_input_array(arrays.key_cache, 4);
+  enc.set_input_array(arrays.value_cache, 5);
+  int32_t g_nkv = static_cast<int32_t>(metadata.num_kv_heads);
   enc.set_bytes(g_nkv, 8);
-  enc.set_bytes(scale, 9);
-  enc.set_input_array(block_tables, 11);
-  enc.set_input_array(seq_lens, 12);
-  int32_t g_max_blocks = static_cast<int32_t>(block_tables.shape(1));
+  enc.set_bytes(metadata.scale, 9);
+  enc.set_input_array(arrays.block_tables, 11);
+  enc.set_input_array(arrays.seq_lens, 12);
+  int32_t g_max_blocks = static_cast<int32_t>(arrays.block_tables.shape(1));
   enc.set_bytes(g_max_blocks, 13);
-  bind_paged_attn_strides(enc, query, key_cache, block_size);
-  if (compact) enc.set_input_array(*g_offsets, 18);
+  bind_paged_attn_strides(enc, arrays.query, arrays.key_cache, metadata.block_size);
+  if (plan.compact) enc.set_input_array(*g_offsets, 18);
   // One threadgroup per (partition, kv head, sequence); each simdgroup
   // owns one query head of the GQA group.
   enc.dispatch_threadgroups(
-      MTL::Size::Make(gqa_num_partitions, num_kv_heads, num_seqs),
+      MTL::Size::Make(gqa_num_partitions, metadata.num_kv_heads, plan.num_seqs),
       MTL::Size::Make(num_threads, 1, 1));
 
   dispatch_paged_attention_v2_reduce(
-      d, enc, out, g_exp_sums, g_max_logits, g_tmp_out, seq_lens,
-      cu_seqlens_q, num_seqs, total_q_tokens, num_heads, head_size,
-      gqa_num_partitions, dt, /*use_sinks=*/false, nullptr,
-      /*use_tq_fc=*/false, gqa_partition_size, gqa_rkernel,
-      compact ? &*g_offsets : nullptr);
+      *encoding.device, enc, arrays.out, g_exp_sums, g_max_logits, g_tmp_out,
+      arrays.seq_lens, arrays.cu_seqlens_q, plan.num_seqs, plan.total_q_tokens,
+      metadata.num_heads, metadata.head_size,
+      gqa_num_partitions, encoding.dt, /*use_sinks=*/false, nullptr,
+      /*use_tq_fc=*/false, plan.gqa_partition_size, gqa_rkernel,
+      plan.compact ? &*g_offsets : nullptr);
   return;
 }
 
 static void dispatch_paged_attention_per_token(
     const PagedAttentionArrays& arrays, const PagedAttentionMetadata& metadata,
     const PagedAttentionPlan& plan, const PagedAttentionEncoding& encoding) {
-  auto& out = arrays.out;
-  const auto& query = arrays.query;
-  const auto& key_cache = arrays.key_cache;
-  const auto& value_cache = arrays.value_cache;
-  const auto& block_tables = arrays.block_tables;
-  const auto& seq_lens = arrays.seq_lens;
-  const auto& cu_seqlens_q = arrays.cu_seqlens_q;
-  const auto* key_scale_cache = arrays.key_scale_cache;
-  const auto* value_scale_cache = arrays.value_scale_cache;
-  const auto* key_zero_cache = arrays.key_zero_cache;
-  const auto* v_centroids = arrays.v_centroids;
-  const auto* sinks = arrays.sinks;
-  auto& d = *encoding.device;
-  auto* lib = encoding.library;
   auto& enc = *encoding.encoder;
-  const auto& dt = encoding.dt;
-  const auto& k_cache_dt = encoding.k_cache_dt;
-  const auto& v_cache_dt = encoding.v_cache_dt;
-  const auto& head_size = metadata.head_size;
-  const auto& num_heads = metadata.num_heads;
-  const auto& num_kv_heads = metadata.num_kv_heads;
-  const auto& block_size = metadata.block_size;
-  const auto& sliding_window = metadata.sliding_window;
-  const auto& scale = metadata.scale;
-  const auto& softcap = metadata.softcap;
-  const auto& use_turboquant = metadata.use_turboquant;
-  const auto& k_bits = metadata.k_bits;
-  const auto& v_bits = metadata.v_bits;
-  const auto& total_q_tokens = plan.total_q_tokens;
-  const auto& num_seqs = plan.num_seqs;
-  const auto& window_batch = plan.window_batch;
-  const auto& max_num_partitions = plan.max_num_partitions;
-  const auto& partition = plan.partition;
   const auto kernel_plan = make_paged_attention_kernel_plan(
-      dt, k_cache_dt, v_cache_dt, head_size, block_size, partition,
-      sinks != nullptr, use_turboquant, k_bits, v_bits, plan.window_q);
-  auto* kernel = d.get_kernel(
-      kernel_plan.kernel_name, lib, kernel_plan.hash_name,
+      encoding.dt, encoding.k_cache_dt, encoding.v_cache_dt,
+      metadata.head_size, metadata.block_size, plan.partition,
+      arrays.sinks != nullptr, metadata.use_turboquant,
+      metadata.k_bits, metadata.v_bits, plan.window_q);
+  auto* kernel = encoding.device->get_kernel(
+      kernel_plan.kernel_name, encoding.library, kernel_plan.hash_name,
       {{&kernel_plan.use_partitioning, MTL::DataType::DataTypeBool, NS::UInteger(10)},
        {&kernel_plan.use_alibi,        MTL::DataType::DataTypeBool, NS::UInteger(20)},
        {&kernel_plan.use_fp8,          MTL::DataType::DataTypeBool, NS::UInteger(30)},
@@ -1204,25 +1157,25 @@ static void dispatch_paged_attention_per_token(
        {&kernel_plan.window_q,         MTL::DataType::DataTypeInt,  NS::UInteger(110)}});
 
   const size_t shmem = kernels::paged_threadgroup_bytes(
-      head_size, block_size, static_cast<int>(query.itemsize()),
-      window_batch, kWindowRows);
-  const int grid_z = partition ? max_num_partitions : 1;
+      metadata.head_size, metadata.block_size, static_cast<int>(arrays.query.itemsize()),
+      plan.window_batch, kWindowRows);
+  const int grid_z = plan.partition ? plan.max_num_partitions : 1;
   constexpr int num_threads = 256;
 
   // TurboQuant scale/zero/centroid buffers (slots 22-27); shared by both paths.
   auto bind_turboquant = [&]() {
-    if (!use_turboquant) return;
-    enc.set_input_array(*key_scale_cache,   22);
-    enc.set_input_array(*value_scale_cache, 23);
-    int32_t v_block_stride_i = static_cast<int32_t>(value_cache.strides()[0]);
-    int32_t v_head_stride_i  = static_cast<int32_t>(value_cache.strides()[2]);
+    if (!metadata.use_turboquant) return;
+    enc.set_input_array(*arrays.key_scale_cache,   22);
+    enc.set_input_array(*arrays.value_scale_cache, 23);
+    int32_t v_block_stride_i = static_cast<int32_t>(arrays.value_cache.strides()[0]);
+    int32_t v_head_stride_i  = static_cast<int32_t>(arrays.value_cache.strides()[2]);
     enc.set_bytes(v_block_stride_i, 24);
     enc.set_bytes(v_head_stride_i,  25);
-    enc.set_input_array(*key_zero_cache, 26);
-    enc.set_input_array(*v_centroids, 27);
-    int64_t scale_block_stride = key_scale_cache->strides()[0];
+    enc.set_input_array(*arrays.key_zero_cache, 26);
+    enc.set_input_array(*arrays.v_centroids, 27);
+    int64_t scale_block_stride = arrays.key_scale_cache->strides()[0];
     enc.set_bytes(scale_block_stride, 28);
-    int64_t scale_head_stride = key_scale_cache->strides()[2];
+    int64_t scale_head_stride = arrays.key_scale_cache->strides()[2];
     enc.set_bytes(scale_head_stride, 29);
   };
 
@@ -1230,44 +1183,48 @@ static void dispatch_paged_attention_per_token(
   // use_sinks, since the argument is declared under that function constant.
   auto bind_sinks = [&]() {
     if (!kernel_plan.use_sinks) return;
-    enc.set_input_array(*sinks, 18);
+    enc.set_input_array(*arrays.sinks, 18);
   };
 
-  if (!partition) {
+  if (!plan.partition) {
     // Single-pass path (grid.z = 1): the original decode/per-token kernel.
     record_paged_dispatch(
-        window_batch ? PagedDispatch::Window : PagedDispatch::PerToken);
+        plan.window_batch ? PagedDispatch::Window : PagedDispatch::PerToken);
     enc.set_compute_pipeline_state(kernel);
     enc.set_threadgroup_memory_length(shmem, 0);
-    bind_paged_attn_buffers(enc, out, query, key_cache, value_cache,
-                            num_kv_heads, softcap, block_tables, seq_lens,
-                            cu_seqlens_q, block_size, sliding_window);
-    enc.set_bytes(scale, 9);
+    bind_paged_attn_buffers(
+        enc, arrays.out, arrays.query, arrays.key_cache, arrays.value_cache,
+        metadata.num_kv_heads, metadata.softcap, arrays.block_tables,
+        arrays.seq_lens, arrays.cu_seqlens_q,
+        metadata.block_size, metadata.sliding_window);
+    enc.set_bytes(metadata.scale, 9);
     bind_turboquant();
     bind_sinks();
     enc.dispatch_threadgroups(
-        MTL::Size::Make(num_heads, plan.grid_y, grid_z),
+        MTL::Size::Make(metadata.num_heads, plan.grid_y, grid_z),
         MTL::Size::Make(num_threads, 1, 1));
     return;
   }
 
   // ----- Split-KV path: paged_attention(_ps512) -> paged_attention_v2_reduce.
   record_paged_dispatch(
-      window_batch ? PagedDispatch::WindowSplitKv : PagedDispatch::SplitKv);
-  Shape stats_shape{total_q_tokens, num_heads, max_num_partitions};
+      plan.window_batch ? PagedDispatch::WindowSplitKv : PagedDispatch::SplitKv);
+  Shape stats_shape{plan.total_q_tokens, metadata.num_heads, plan.max_num_partitions};
   Shape output_shape = stats_shape;
-  output_shape.push_back(head_size);
-  array tmp_out = make_paged_attention_temp(enc, output_shape, query.dtype());
+  output_shape.push_back(metadata.head_size);
+  array tmp_out = make_paged_attention_temp(enc, output_shape, arrays.query.dtype());
   array exp_sums = make_paged_attention_temp(enc, stats_shape, float32);
   array max_logits = make_paged_attention_temp(enc, stats_shape, float32);
 
   // Pass 1: partitioned kernel writes partials.  Out slot (2) = tmp_out scratch.
   enc.set_compute_pipeline_state(kernel);
   enc.set_threadgroup_memory_length(shmem, 0);
-  bind_paged_attn_buffers(enc, tmp_out, query, key_cache, value_cache,
-                          num_kv_heads, softcap, block_tables, seq_lens,
-                          cu_seqlens_q, block_size, sliding_window);
-  enc.set_bytes(scale, 9);
+  bind_paged_attn_buffers(
+      enc, tmp_out, arrays.query, arrays.key_cache, arrays.value_cache,
+      metadata.num_kv_heads, metadata.softcap, arrays.block_tables,
+      arrays.seq_lens, arrays.cu_seqlens_q,
+      metadata.block_size, metadata.sliding_window);
+  enc.set_bytes(metadata.scale, 9);
   enc.set_output_array(exp_sums, 0);
   enc.set_output_array(max_logits, 1);
   bind_turboquant();
@@ -1276,14 +1233,15 @@ static void dispatch_paged_attention_per_token(
   // declared argument under function constant 40, so it must be bound here.
   bind_sinks();
   enc.dispatch_threadgroups(
-      MTL::Size::Make(num_heads, plan.grid_y, grid_z),
+      MTL::Size::Make(metadata.num_heads, plan.grid_y, grid_z),
       MTL::Size::Make(num_threads, 1, 1));
 
   // Pass 2: reduce per-partition partials -> out (log-sum-exp combine).
   dispatch_paged_attention_v2_reduce(
-      d, enc, out, exp_sums, max_logits, tmp_out, seq_lens, cu_seqlens_q,
-      num_seqs, total_q_tokens, num_heads, head_size, max_num_partitions, dt,
-      kernel_plan.use_sinks, sinks, kernel_plan.use_tq);
+      *encoding.device, enc, arrays.out, exp_sums, max_logits, tmp_out,
+      arrays.seq_lens, arrays.cu_seqlens_q, plan.num_seqs, plan.total_q_tokens,
+      metadata.num_heads, metadata.head_size, plan.max_num_partitions, encoding.dt,
+      kernel_plan.use_sinks, arrays.sinks, kernel_plan.use_tq);
 }
 
 static void dispatch_paged_attention_mixed(
@@ -1427,82 +1385,58 @@ static void dispatch_paged_attention_v2_online(
 static void dispatch_paged_attention_mixed(
     const PagedAttentionArrays& arrays, const PagedAttentionMetadata& metadata,
     const PagedAttentionPlan& plan) {
-  auto& out = arrays.out;
-  const auto& query = arrays.query;
-  const auto& key_cache = arrays.key_cache;
-  const auto& value_cache = arrays.value_cache;
-  const auto& block_tables = arrays.block_tables;
-  const auto& seq_lens = arrays.seq_lens;
-  const auto& cu_seqlens_q = arrays.cu_seqlens_q;
-  const auto* key_scale_cache = arrays.key_scale_cache;
-  const auto* value_scale_cache = arrays.value_scale_cache;
-  const auto* key_zero_cache = arrays.key_zero_cache;
-  const auto* v_centroids = arrays.v_centroids;
-  const auto* sinks = arrays.sinks;
-  const auto* mm_prefix_ranges = arrays.mm_prefix_ranges;
-  auto s = arrays.s;
-  const auto& num_kv_heads = metadata.num_kv_heads;
-  const auto& block_size = metadata.block_size;
-  const auto& max_seq_len = metadata.max_seq_len;
-  const auto& sliding_window = metadata.sliding_window;
-  const auto& window_seqlen_q = metadata.window_seqlen_q;
-  const auto& scale = metadata.scale;
-  const auto& softcap = metadata.softcap;
-  const auto& use_turboquant = metadata.use_turboquant;
-  const auto& k_bits = metadata.k_bits;
-  const auto& v_bits = metadata.v_bits;
-  const auto& num_decode_requests = metadata.num_decode_requests;
-  const auto& num_decode_tokens = metadata.num_decode_tokens;
-  const auto& max_decode_context_len = metadata.max_decode_context_len;
-  const auto& gqa_disabled = metadata.gqa_disabled;
-  const auto& gqa_length_plan = metadata.gqa_length_plan;
-  const auto& tile_config = plan.tile_config;
   // The decode prefix reads only the decode rows. Size its split-KV
   // partitions and scratch by their context bound, never by max_seq_len:
   // that bound also covers the prefill rows and may be a whole allocation
   // bound, which the prefill kernels ignore but split-KV would plan for.
-  const int decode_max_seq_len = std::min(max_seq_len, max_decode_context_len);
+  const int decode_max_seq_len =
+      std::min(metadata.max_seq_len, metadata.max_decode_context_len);
   // A caller-supplied plan for exactly the decode prefix (validated at the
   // binding against max_seq_len and max_decode_context_len) opts the prefix
   // into GQA and tightens the bound to the plan's longest decode row.
-  const bool prefix_plan = gqa_length_plan.num_requests == num_decode_requests;
+  const bool prefix_plan =
+      metadata.gqa_length_plan.num_requests == metadata.num_decode_requests;
   dispatch_paged_attention_v2_online(
-      out, query, key_cache, value_cache,
-      num_kv_heads, scale, softcap,
-      block_tables, seq_lens, cu_seqlens_q,
-      block_size,
-      prefix_plan ? gqa_length_plan.max_length : decode_max_seq_len,
-      sliding_window, window_seqlen_q, s,
-      key_scale_cache, value_scale_cache, key_zero_cache, v_centroids,
-      use_turboquant, k_bits, v_bits, sinks, nullptr,
-      num_decode_requests, num_decode_tokens, max_decode_context_len,
-      num_decode_tokens, gqa_disabled, 0,
-      prefix_plan ? gqa_length_plan : GqaDecodeLengthPlan{});
+      arrays.out, arrays.query, arrays.key_cache, arrays.value_cache,
+      metadata.num_kv_heads, metadata.scale, metadata.softcap,
+      arrays.block_tables, arrays.seq_lens, arrays.cu_seqlens_q,
+      metadata.block_size,
+      prefix_plan ? metadata.gqa_length_plan.max_length : decode_max_seq_len,
+      metadata.sliding_window, metadata.window_seqlen_q, arrays.s,
+      arrays.key_scale_cache, arrays.value_scale_cache,
+      arrays.key_zero_cache, arrays.v_centroids,
+      metadata.use_turboquant, metadata.k_bits, metadata.v_bits, arrays.sinks, nullptr,
+      metadata.num_decode_requests, metadata.num_decode_tokens,
+      metadata.max_decode_context_len,
+      metadata.num_decode_tokens, metadata.gqa_disabled, 0,
+      prefix_plan ? metadata.gqa_length_plan : GqaDecodeLengthPlan{});
   // Keep the decode prefix's GQA selection visible in the diagnostics.
   const int decode_partition = g_last_gqa_partition.load(std::memory_order_relaxed);
   const int decode_requests = g_last_gqa_requests.load(std::memory_order_relaxed);
   // Decode rows lead the batch, so the first prefill sequence starts at
   // q-block cu_seqlens_q[D] / BQ + D with D = num_decode_requests.
-  if (plan.route != PagedAttentionRoute::MixedTiled) {
+  if (plan.route == PagedAttentionRoute::MixedNaxSplit ||
+      plan.route == PagedAttentionRoute::MixedNaxUnsplit) {
     dispatch_paged_attention_nax(
-        out, query, key_cache, value_cache,
-        num_kv_heads, scale, softcap,
-        block_tables, seq_lens, cu_seqlens_q,
-        block_size, sliding_window,
-        num_decode_tokens / kernels::kNaxBQ + num_decode_requests, s, sinks,
+        arrays.out, arrays.query, arrays.key_cache, arrays.value_cache,
+        metadata.num_kv_heads, metadata.scale, metadata.softcap,
+        arrays.block_tables, arrays.seq_lens, arrays.cu_seqlens_q,
+        metadata.block_size, metadata.sliding_window,
+        metadata.num_decode_tokens / kernels::kNaxBQ + metadata.num_decode_requests,
+        arrays.s, arrays.sinks,
         plan.route == PagedAttentionRoute::MixedNaxSplit);
     record_paged_dispatch(PagedDispatch::MixedNaxPrefillDecode,
                           decode_partition, decode_requests);
     return;
   }
   const int q_block_offset =
-      num_decode_tokens / tile_config->BQ + num_decode_requests;
+      metadata.num_decode_tokens / plan.tile_config->BQ + metadata.num_decode_requests;
   dispatch_paged_attention_tiled(
-      out, query, key_cache, value_cache,
-      num_kv_heads, scale, softcap,
-      block_tables, seq_lens, cu_seqlens_q,
-      block_size, max_seq_len, sliding_window, q_block_offset,
-      *tile_config, s, sinks, mm_prefix_ranges);
+      arrays.out, arrays.query, arrays.key_cache, arrays.value_cache,
+      metadata.num_kv_heads, metadata.scale, metadata.softcap,
+      arrays.block_tables, arrays.seq_lens, arrays.cu_seqlens_q,
+      metadata.block_size, metadata.max_seq_len, metadata.sliding_window, q_block_offset,
+      *plan.tile_config, arrays.s, arrays.sinks, arrays.mm_prefix_ranges);
   record_paged_dispatch(PagedDispatch::MixedPrefillDecode,
                         decode_partition, decode_requests);
   return;
