@@ -449,6 +449,38 @@ def test_cli_rejects_q4_for_other_drafting_methods(monkeypatch, tmp_path):
     assert not (tmp_path / "results").exists()
 
 
+@pytest.mark.parametrize("worker", [None, "suffix"])
+def test_cli_rejects_draft_checkpoint_for_suffix(monkeypatch, tmp_path, capsys, worker):
+    from tools import check_parity as cli
+    from tools import speculative_parity as tool
+
+    monkeypatch.setattr(
+        tool,
+        "run",
+        lambda *_: pytest.fail("Invalid arguments reached model resolution"),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "parity",
+            "--model",
+            "test/target",
+            "--method",
+            "suffix",
+            "--draft",
+            "test/unused-draft",
+            "--output-dir",
+            str(tmp_path / "results"),
+            *(["--worker", worker] if worker is not None else []),
+        ],
+    )
+    with pytest.raises(SystemExit) as caught:
+        cli.main()
+    assert caught.value.code == 2
+    assert "--draft cannot be used with --method suffix" in capsys.readouterr().err
+    assert not (tmp_path / "results").exists()
+
+
 @pytest.mark.parametrize("worker", ["target", "dspark"])
 def test_q4_parity_option_only_applies_to_draft_worker(monkeypatch, tmp_path, worker):
     import vllm
