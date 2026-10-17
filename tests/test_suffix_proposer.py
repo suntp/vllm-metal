@@ -501,6 +501,54 @@ class TestSuffixRealLifecycle:
         assert drafts is not None
         assert drafts.draft_token_ids == [[23, 24]]
 
+    @pytest.mark.parametrize("finish_path", ["release", "finished"])
+    def test_context_limit_preserves_the_final_committed_token(
+        self, finish_path: str
+    ) -> None:
+        proposer = _real_proposer()
+        prompt = list(range(1000, 1509))
+        state = _request_state(prompt + [20, 21], prompt_len=len(prompt))
+        state.sampling_params = SamplingParams(temperature=0.0, max_tokens=3)
+        state.generated_tokens = 2
+        other = _request_state([90, 91], prompt_len=1)
+        batch = [("producer", state), ("other", other)]
+        proposer.propose(_context(decode_reqs=batch))
+
+        # Another drafting row keeps the upstream loop running, but upstream
+        # skips this row before ingestion once its history reaches 512.
+        state.token_ids.append(22)
+        state.generated_tokens = 3
+        proposer.propose(_context(decode_reqs=batch))
+        if finish_path == "release":
+            proposer.release_requests({"producer", "other"})
+        else:
+            proposer.propose(_context(finished_req_ids={"producer", "other"}))
+
+        consumer = _request_state([90, 20, 21], prompt_len=1)
+        drafts = proposer.propose(_context(decode_reqs=[("consumer", consumer)]))
+        assert drafts is not None
+        assert drafts.draft_token_ids == [[22]]
+
+    def test_absent_request_archives_tokens_committed_while_drafting_disabled(
+        self,
+    ) -> None:
+        proposer = _real_proposer()
+        state = _request_state(self._PROMPT + [20, 21], prompt_len=8)
+        proposer.propose(_context(decode_reqs=[("producer", state)]))
+        state.token_ids.append(22)
+        proposer.propose(
+            _context(decode_reqs=[("producer", state)], num_speculative_tokens=0)
+        )
+
+        # Requests can be absent without finishing or being preempted. Flush
+        # pending history before upstream archives the missing active tree.
+        other = _request_state([90, 91], prompt_len=1)
+        proposer.propose(_context(decode_reqs=[("other", other)]))
+        consumer = _request_state([90, 20, 21], prompt_len=1)
+        drafts = proposer.propose(_context(decode_reqs=[("consumer", consumer)]))
+        assert drafts is not None
+        assert drafts.draft_token_ids == [[22]]
+
     def test_reused_request_id_does_not_inherit_the_old_tree(self) -> None:
         proposer = _real_proposer()
         cache = proposer._vllm.suffix_cache
