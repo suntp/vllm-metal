@@ -168,9 +168,14 @@ class TestParityTool:
         with pytest.raises(ValueError, match="input token IDs"):
             http_generate("http://localhost/v1", "model", [{"input_ids": [1]}], 1)
 
-    def test_canonical_flow_reuses_reference_and_server(self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize("backend", ["mlx", "mps"])
+    def test_canonical_flow_reuses_reference_and_server(
+        self, monkeypatch, tmp_path, backend
+    ):
+        monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
+        monkeypatch.setenv("PYTORCH_ENABLE_MPS_FALLBACK", "1")
         events = []
-        row = {**self._result([2], []), "input_ids": [1]}
+        row = {**self._result([2], [[2, 3]]), "input_ids": [1]}
 
         def generate_reference(command, **kwargs):
             path = Path(command[command.index("--generate-reference") + 1])
@@ -184,18 +189,27 @@ class TestParityTool:
         ):
             assert max_num_seqs == 2
             assert gpu_memory_utilization == 0.65
+            assert env["VLLM_METAL_BACKEND"] == backend
+            if backend == "mps":
+                assert env["PYTORCH_ENABLE_MPS_FALLBACK"] == "0"
             events.append("server started")
             yield "http://localhost/v1"
             events.append("server stopped")
 
         def generate(base_url, model, reference, max_tokens, top_k, batch_size):
             events.append(f"batch size {batch_size}")
-            return reference
+            return [self._result([3], [[3, 2]])]
 
         monkeypatch.setattr("subprocess.run", generate_reference)
         monkeypatch.setattr("tools.check_parity.serving", server)
         monkeypatch.setattr("tools.check_parity.http_generate", generate)
-        assert check_parity(str(tmp_path), ["test prompt"], 1, output_dir=tmp_path)
+        assert check_parity(
+            str(tmp_path),
+            ["test prompt"],
+            1,
+            top_k=2,
+            output_dir=tmp_path,
+        )
         assert events == [
             "reference exited",
             "server started",
@@ -203,3 +217,9 @@ class TestParityTool:
             "batch size 2",
             "server stopped",
         ]
+        report = json.loads((tmp_path / "batch-2.json").read_text())
+        assert report["comparison"]["counts"] == {
+            "EXACT": 0,
+            "TOP_K_MATCH": 1,
+            "FAIL": 0,
+        }

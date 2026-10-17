@@ -34,19 +34,30 @@ Run checks relevant to the change. Report the commands, results, and any checks 
 
 Extend related test suites. Test observable behavior rather than locking in implementation details.
 
+### Test design
+
+When adding tests:
+
+- **Design before you write.** Answer four questions first: what is the module for, what is its I/O contract, what failure am I guarding against, and what is the cheapest level that catches it (unit over integration over e2e)?
+- **Reuse before create.** Extend existing test files, `conftest.py` fixtures, and helpers; add a new file only when no nearby suite fits.
+- **Test behavior with intent.** Assert observable outcomes through public APIs; state why in the name or docstring. Skip trivial wiring; flaky tests are worse than no tests.
+- **Keep it minimal.** One behavior per test and the smallest setup that triggers it; if the test diff dwarfs the code change, cut scope.
+- **No one-off kernel benchmarks in `tests/`.** Put kernel perf work in `tools/benchmark/`; prove correctness in existing pytest suites.
+
 ### Model parity and benchmarks
 
 For model changes, use parity tools with matching checkpoints and input token IDs.
 
-- **MLX:** compare top-K parity against `mlx_lm` using [the parity tool](tools/check_parity.py) with `--top-k 5`. Report `EXACT` and `TOP_K_MATCH` counts separately and investigate failures.
-- **PyTorch MPS:** use a parity tool to compare against `transformers` running on MPS.
+Always set `PYTORCH_ENABLE_MPS_FALLBACK=0` for MPS runs to disable PyTorch's optional CPU fallback.
+
+- **MLX and PyTorch MPS:** compare top-K parity against `mlx_lm` using [the parity tool](tools/check_parity.py) with `--top-k 5`. Set `VLLM_METAL_BACKEND=mps` to check PyTorch MPS serving. Report `EXACT` and `TOP_K_MATCH` counts separately and investigate failures.
 
 For performance improvements, report before/after end-to-end serving speedup on meaningful workloads using `vllm bench serve`. Follow [the macOS benchmarking guide](docs/benchmarking-macos.md) and keep the model, workload, and serving configuration consistent between runs.
 
 ### Speculative decoding
 
-- Compare fresh greedy runs with speculative decoding enabled and disabled, using the same inputs and settings. The output token IDs must be identical.
-- Test the algorithm's correctness properties. For example, for draft-model speculation, use the same checkpoint for draft and target under greedy decoding; acceptance should be near 100%. Report the measured rate and investigate substantial rejections.
+- Compare fresh greedy runs with speculative decoding enabled and disabled, using the same inputs and settings. Accept `EXACT` or mutual `TOP_K_MATCH` at the first divergence (`--top-k 5`); require zero `FAIL`.
+- Test the algorithm's correctness properties, including exact verifier results for fixed target logits. For draft-model speculation, use the same checkpoint for draft and target under greedy decoding; acceptance should be near 100%. Report the measured rate and investigate substantial rejections.
 - Evaluate acceptance rate and speedup on natural datasets such as [RedHatAI/speculator_benchmarks](https://huggingface.co/datasets/RedHatAI/speculator_benchmarks), prepared with [the dataset builder](tools/build_spec_bench_dataset.py). Artificial workloads such as `sonnet` can produce unrealistically low acceptance rates.
 - Demonstrate end-to-end speedup at batch size `B=1`. Speedup at `B>1` is harder but still expected; benchmark both with [the benchmark tools](tools/README.md). Report the tested batch sizes, representative workloads, and any regressions.
 

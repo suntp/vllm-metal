@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""JIT build script for the native paged-attention Metal extension.
+"""Build shared Metal shader artifacts and both native launchers.
 
 Compiles ``paged_ops.cpp``, ``mlx_patch.cpp``, and nanobind into a shared library that dispatches
 Metal shaders through MLX's own command encoder.
@@ -7,6 +7,7 @@ Metal shaders through MLX's own command encoder.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import logging
 import subprocess
@@ -26,12 +27,17 @@ logger = logging.getLogger(__name__)
 _THIS_DIR = Path(__file__).resolve().parent
 _SRC = _THIS_DIR / "paged_ops.cpp"
 _MLX_PATCH = _THIS_DIR / "mlx_patch.cpp"
+_KERNELS = _THIS_DIR / "paged_attention_kernels.h"
+_DEVICE = _THIS_DIR / "metal_device.h"
 _BUILD = _THIS_DIR / "build.py"
 _CONSTANTS = _THIS_DIR / "constants.py"
 _EXT_SUFFIX = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
 # The built extension lives inside the package so the wheel can include it.
 # Runtime loads the prebuilt artifact without invoking clang++ on the user's Mac.
 _OUT = _THIS_DIR / f"_paged_ops{_EXT_SUFFIX}"
+_MPS_DIR = _THIS_DIR.parent / "pytorch_backend"
+_MPS_OUT = _MPS_DIR / f"_mps_ops{_EXT_SUFFIX}"
+_MPS_VERSION = _MPS_DIR / "_mps_ops.torch-version"
 
 
 def _stamp_path(artifact: Path) -> Path:
@@ -45,11 +51,8 @@ _HASH = _stamp_path(_OUT)
 # The MLX version build() compiled the .so against; shipped in the wheel.
 _MLX_VERSION = _THIS_DIR / "_paged_ops.mlx-version"
 
-# Names of the three precompiled Metal shader libraries.  Each is the cache-key
-# name the C++ extension registers the library under (passed to
-# ``init_library_path(name, path)`` in paged_ops.cpp), so a later dispatch's
-# ``get_library(name)`` returns the .metallib loaded at startup.
-METALLIB_NAMES = ("paged_attention_v2_kern", "gdn_kern", "paged_mla_kern")
+# Required precompiled shader libraries bundled in every wheel.
+METALLIB_NAMES = ("paged_attention_v2_kern", "gdn_kern", "paged_mla_kern", "rope_kern")
 
 # Kept outside METALLIB_NAMES because wheels built with older SDKs omit it.
 NAX_METALLIB_NAME = "paged_attention_nax_kern"
@@ -62,6 +65,14 @@ def output_path() -> Path:
 
 def mlx_version_path() -> Path:
     return _MLX_VERSION
+
+
+def mps_output_path() -> Path:
+    return _MPS_OUT
+
+
+def mps_version_path() -> Path:
+    return _MPS_VERSION
 
 
 def metallib_path(name: str) -> Path:
@@ -133,6 +144,7 @@ def _metallib_source(name: str) -> str:
         _build_gdn_source,
         _build_mla_paged_attention_source,
         _build_nax_source,
+        _build_rope_source,
         _build_v2_paged_attention_source,
     )
 
@@ -141,6 +153,7 @@ def _metallib_source(name: str) -> str:
         "gdn_kern": _build_gdn_source,
         "paged_mla_kern": _build_mla_paged_attention_source,
         NAX_METALLIB_NAME: _build_nax_source,
+        "rope_kern": _build_rope_source,
     }
     return builders[name]()
 
@@ -182,7 +195,82 @@ def _compile_metallib(name: str, source: str) -> Path:
     finally:
         Path(tmp.name).unlink(missing_ok=True)
     _stamp_path(out).write_text(_metallib_digest(name, source))
+    _toolchain_path(out).write_text(_metal_toolchain_id())
     return out
+
+
+def prepare_metallib(name: str, *, build_from_source: bool = False) -> Path:
+    """Resolve one shader artifact without loading either framework's extension."""
+    if build_from_source:
+        return _compile_metallib(name, _metallib_source(name))
+    path = metallib_path(name)
+    if not path.exists():
+        raise RuntimeError(
+            f"Prebuilt Metal library missing: {path}. Install a vllm-metal release "
+            "wheel, or set VLLM_METAL_BUILD_FROM_SOURCE=1 to compile shaders."
+        )
+    if _stamp_path(path).exists() and is_stale(
+        path, _metallib_digest(name, _metallib_source(name))
+    ):
+        raise RuntimeError(
+            f"Prebuilt Metal library is stale: {path}. Set "
+            "VLLM_METAL_BUILD_FROM_SOURCE=1 to rebuild it."
+        )
+    return path
+
+
+def _toolchain_path(artifact: Path) -> Path:
+    """Build-only sidecar recording the Metal compiler + SDK an artifact was
+    compiled with. Never read at runtime (loading must not invoke ``xcrun``)."""
+    return artifact.with_suffix(artifact.suffix + ".toolchain")
+
+
+@functools.lru_cache(maxsize=1)
+def _metal_toolchain_id() -> str:
+    """Digest of ``xcrun metal --version`` + the SDK version. Build-time only.
+    Any failure yields a sentinel that never matches a recorded id, forcing a
+    compile (which then surfaces the real toolchain error)."""
+    h = hashlib.sha256()
+    for cmd in (
+        ["xcrun", "-sdk", "macosx", "metal", "--version"],
+        ["xcrun", "-sdk", "macosx", "--show-sdk-version"],
+    ):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+        except (OSError, subprocess.CalledProcessError):
+            return "unavailable"
+        # InstalledDir names the Metal toolchain's cryptex mount, which gets a
+        # random suffix per boot, so it would change the id on every runner.
+        out = "\n".join(
+            line for line in out.splitlines() if not line.startswith("InstalledDir:")
+        )
+        h.update(out.strip().encode())
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _read_strict(path: Path) -> str | None:
+    """Read a sidecar for a build decision; any error means "not current"."""
+    try:
+        return path.read_text().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _metallib_is_current(name: str, source: str) -> bool:
+    """Build-side skip gate: the library exists, its ``.sha256`` stamp matches
+    the assembled source + flags, and it was compiled by the current Metal
+    toolchain. Stricter than the runtime :func:`is_stale` on purpose: an
+    unreadable stamp or toolchain record means rebuild."""
+    path = metallib_path(name)
+    if not path.is_file():
+        return False
+    if _read_strict(_stamp_path(path)) != _metallib_digest(name, source):
+        return False
+    toolchain = _metal_toolchain_id()
+    return (
+        toolchain != "unavailable" and _read_strict(_toolchain_path(path)) == toolchain
+    )
 
 
 def build_metallibs() -> list[Path]:
@@ -192,19 +280,30 @@ def build_metallibs() -> list[Path]:
     prebuilt libraries, but source mode (``VLLM_METAL_BUILD_FROM_SOURCE=1``)
     compiles the shaders in-process via MLX, so a source-install dev without
     the Metal toolchain never reaches this code.
+
+    A library whose prebuilt artifact and ``.sha256`` stamp still match its
+    assembled source is kept as-is, mirroring the incremental gates on the
+    native extensions — so restoring previously built artifacts (CI caches
+    them between runs) skips the ``xcrun metal`` compile entirely.
     """
     logger.info("Building Metal shader libraries ...")
-    built = [_compile_metallib(name, _metallib_source(name)) for name in METALLIB_NAMES]
+    names = [*METALLIB_NAMES]
     if _sdk_supports_nax():
-        built.append(
-            _compile_metallib(NAX_METALLIB_NAME, _metallib_source(NAX_METALLIB_NAME))
-        )
+        names.append(NAX_METALLIB_NAME)
     else:
         logger.warning(
             "macOS SDK < %s: skipping %s",
             ".".join(map(str, _NAX_MIN_SDK)),
             NAX_METALLIB_NAME,
         )
+    built = []
+    for name in names:
+        source = _metallib_source(name)
+        if _metallib_is_current(name, source):
+            logger.info("Metal library '%s' is up to date; skipping compile", name)
+            built.append(metallib_path(name))
+        else:
+            built.append(_compile_metallib(name, source))
     return built
 
 
@@ -270,7 +369,7 @@ def _build_spec() -> _BuildSpec:
         "Metal",
         "-framework",
         "Foundation",
-        # IOKit + CoreFoundation: gpu_core_count() in paged_ops.cpp queries the
+        # IOKit + CoreFoundation: shared GPU detection in metal_device.h queries the
         # IORegistry. Explicit -framework is load-bearing — "-undefined
         # dynamic_lookup" below resolves only against already-loaded images,
         # and nothing else loads IOKit.
@@ -323,7 +422,7 @@ def _input_hash(spec: _BuildSpec) -> str:
     # so editing a flag still busts the hash.
     # Versions catch in-place upgrades where the install path is reused.
     h.update(f"mlx={spec.mlx_version}\0nb={spec.nb_version}\0".encode())
-    for p in (_SRC, _MLX_PATCH, _BUILD, _CONSTANTS, spec.nb_src):
+    for p in (_SRC, _MLX_PATCH, _KERNELS, _DEVICE, _BUILD, _CONSTANTS, spec.nb_src):
         h.update(p.name.encode())
         h.update(b"\0")
         h.update(p.read_bytes())
@@ -447,9 +546,71 @@ def build() -> Path:
     return _OUT
 
 
+def _mps_input_hash() -> str:
+    import torch
+
+    h = hashlib.sha256(str(torch.__version__).encode())
+    for path in (_MPS_DIR / "mps_ops.mm", _KERNELS, _DEVICE, _BUILD, _CONSTANTS):
+        h.update(path.name.encode() + b"\0" + path.read_bytes() + b"\0")
+    return h.hexdigest()
+
+
+def mps_artifact_is_stale() -> bool:
+    # Wheels have no stamps; source checkouts verify the shared headers too.
+    return _stamp_path(_MPS_OUT).exists() and is_stale(_MPS_OUT, _mps_input_hash())
+
+
+def build_mps() -> Path:
+    """Build the MPS launcher into the package using PyTorch's extension builder."""
+    import torch
+    from setuptools import Distribution
+    from torch.utils.cpp_extension import BuildExtension, CppExtension
+
+    digest = _mps_input_hash()
+    if all(
+        p.exists() for p in (_MPS_OUT, _MPS_VERSION, _stamp_path(_MPS_OUT))
+    ) and not is_stale(_MPS_OUT, digest):
+        return _MPS_OUT
+    extension = CppExtension(
+        "_mps_ops",
+        sources=[str(_MPS_DIR / "mps_ops.mm")],
+        extra_compile_args=[
+            "-O3",
+            f"-mmacosx-version-min={MIN_MACOS_VERSION}",
+            f"-DVLLM_METAL_PARTITION_SIZE={PARTITION_SIZE}",
+            f"-DVLLM_METAL_PA_WINDOW_ROWS={PA_WINDOW_ROWS}",
+            f"-DVLLM_METAL_PA_WINDOW_MAX_HEAD={PA_WINDOW_MAX_HEAD_SIZE}",
+        ],
+        extra_link_args=[
+            f"-mmacosx-version-min={MIN_MACOS_VERSION}",
+            "-framework",
+            "Metal",
+            "-framework",
+            "Foundation",
+            "-framework",
+            "IOKit",
+            "-framework",
+            "CoreFoundation",
+        ],
+    )
+    command = BuildExtension(Distribution({"ext_modules": [extension]}))
+    # A single host source needs no Ninja dependency.
+    command.use_ninja = False
+    command.ensure_finalized()
+    command.build_lib = str(_MPS_DIR)
+    command.force = True
+    with tempfile.TemporaryDirectory(prefix="vllm-metal-mps-build-") as tmp:
+        command.build_temp = tmp
+        command.run()
+    _MPS_VERSION.write_text(str(torch.__version__) + "\n")
+    _stamp_path(_MPS_OUT).write_text(digest)
+    return _MPS_OUT
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     so = build()
     print(so)
     for lib in build_metallibs():
         print(lib)
+    print(build_mps())

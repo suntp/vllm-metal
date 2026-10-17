@@ -2,15 +2,15 @@
 
 import io
 import json
-import subprocess
 import sys
 import threading
 import urllib.error
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from types import SimpleNamespace
 
 import pytest
 
+from tests.http_test_utils import LoopbackHTTPServer
 from tools import gguf_serve_smoke as smoke
 
 
@@ -39,9 +39,11 @@ def old_server():
         def log_message(self, *args):
             pass
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = LoopbackHTTPServer(("127.0.0.1", 0), Handler)
     server.completion_requests = 0
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+    )
     thread.start()
     try:
         yield server
@@ -124,12 +126,11 @@ def test_model_check_closes_health_and_handles_malformed_data(monkeypatch, model
 
 
 def test_child_startup_failure_returns_nonzero(monkeypatch, capsys):
-    original_popen = subprocess.Popen
     starts = []
 
     def failed_vllm(command):
         starts.append(command)
-        return original_popen([sys.executable, "-c", "raise SystemExit(7)"])
+        return SimpleNamespace(poll=lambda: 7, wait=lambda timeout: 7)
 
     monkeypatch.setattr(smoke.subprocess, "Popen", failed_vllm)
     monkeypatch.setattr(

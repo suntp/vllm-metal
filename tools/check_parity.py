@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Compare greedy paged serving with the environment's native mlx-lm.
+"""Compare greedy serving with mlx-lm.
 
 Generate one native reference, then compare individual and batched requests.
 Speculative modes observe target verification in isolated engine workers;
@@ -179,6 +179,8 @@ def check_parity(
         model = snapshot_download(model)
     model = str(Path(model).resolve())
     env = os.environ.copy()
+    if env.get("VLLM_METAL_BACKEND", "mlx") == "mps":
+        env["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
     env["PYTHONPATH"] = os.pathsep.join(
         filter(None, [str(Path(__file__).resolve().parents[1]), env.get("PYTHONPATH")])
     )
@@ -186,7 +188,7 @@ def check_parity(
     env.setdefault("GLOO_SOCKET_IFNAME", "lo0")
     reference_path = output_dir / "reference.json"
     reference_path.write_text(json.dumps(prompts))
-    print("Generating native MLX reference...", flush=True)
+    print("Generating native mlx-lm reference...", flush=True)
     with (output_dir / "reference.log").open("w") as log:
         subprocess.run(
             [
@@ -383,6 +385,8 @@ def main() -> None:
     if min(args.batch_size) < 1 or len(set(args.batch_size)) != len(args.batch_size):
         parser.error("--batch-size values must be positive and unique")
     if args.method is not None:
+        if os.environ.get("VLLM_METAL_BACKEND", "mlx") != "mlx":
+            parser.error("--method requires the MLX backend")
         if args.generate_reference:
             parser.error("--generate-reference cannot be combined with --method")
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))

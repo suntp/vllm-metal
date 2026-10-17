@@ -730,6 +730,8 @@ class _PagedRoutingOpsSpy:
         gqa_disabled: bool = False,
         gqa_context_lens: list[int] | None = None,
         gqa_length_plan: object = None,
+        nax_split_hint: int = -1,
+        nax_prefill_split_hint: int = -1,
     ) -> None:
         del window_seqlen_q, sinks
         self.calls[-1].block_tables = block_tables.tolist()
@@ -741,6 +743,8 @@ class _PagedRoutingOpsSpy:
         self.calls[-1].max_decode_context_len = max_decode_context_len
         self.calls[-1].gqa_context_lens = gqa_context_lens
         self.calls[-1].gqa_length_plan = gqa_length_plan
+        self.calls[-1].nax_split_hint = nax_split_hint
+        self.calls[-1].nax_prefill_split_hint = nax_prefill_split_hint
 
 
 class _PreMmPrefixOps(_PagedOpsCapsOff):
@@ -893,7 +897,7 @@ class TestSDPAForward:
         assert spy.calls[-1].num_decode_requests == 1
 
     @pytest.mark.parametrize("disabled", [False, True])
-    @pytest.mark.parametrize("capability", ["none", "plan"])
+    @pytest.mark.parametrize("capability", ["none", "plan", "mixed_plan"])
     @pytest.mark.parametrize("kind", ["decode", "mixed", "expanded_verify"])
     def test_gqa_batch_metadata_is_only_forwarded_for_ordinary_decode(
         self, monkeypatch, disabled, capability, kind
@@ -919,7 +923,8 @@ class TestSDPAForward:
                 "gqa_decode": True,
                 "gqa_disable": True,
                 "decode_routing_metadata": True,
-                "gqa_length_plan": capability == "plan",
+                "gqa_length_plan": capability in ("plan", "mixed_plan"),
+                "gqa_mixed_decode_plan": capability == "mixed_plan",
             }
         )
         monkeypatch.setattr(spy, "paged_attention_capabilities", query)
@@ -936,7 +941,12 @@ class TestSDPAForward:
         total = len(ctx.slot_mapping)
         x = mx.ones((1, total, _HIDDEN), mx.float16)
         zeros = mx.zeros((1, total, _N_HEADS * _HEAD_DIM), mx.float16)
-        eligible = kind == "decode" and not disabled
+        # Ordinary decode rows: the whole decode batch, or (with the mixed
+        # capability) the leading decode rows of a mixed batch.
+        planned = capability in ("plan", "mixed_plan")
+        eligible = not disabled and (
+            kind == "decode" or (kind == "mixed" and capability == "mixed_plan")
+        )
         with (
             patch.object(sdpa_mod, "get_ops", return_value=spy),
             patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
@@ -944,16 +954,97 @@ class TestSDPAForward:
             for _layer in range(3):
                 sdpa_forward(inner, x, ctx, cache, layer_idx=0)
             plan = spy.calls[-1].gqa_length_plan
-            assert plan == ((2, 4) if eligible and capability == "plan" else None)
-            assert len(spy.length_plans) == int(eligible and capability == "plan")
+            assert plan == ((2, 4) if eligible and planned else None)
+            assert len(spy.length_plans) == int(eligible and planned)
             query.assert_called_once_with()
-            if eligible and capability == "plan":
+            if eligible and planned and kind == "decode":
                 # A new forward has new lengths and must not reuse the old plan.
                 prepare_grouped([([[1]], 4), ([[0]], 2)], [], (8,))
                 next_ctx = get_context()
                 sdpa_forward(inner, x, next_ctx, cache, layer_idx=0)
                 assert spy.length_plans == [(2, 4), (5, 3)]
                 assert spy.calls[-1].gqa_length_plan is not plan
+            if eligible and planned and kind == "mixed":
+                # Later forwards change decode membership, order and lengths;
+                # each plans only its own leading decode rows, once per forward.
+                forwards = [
+                    ([([[2]], 6), ([[0]], 2), ([[1]], 4)], [([[1]], 2, 0)], (7, 3, 5)),
+                    ([([[1]], 3)], [([[0]], 1, 0), ([[2]], 2, 1)], (4,)),
+                ]
+                expected = [(2, 4)]
+                for next_decode, next_prefill, next_plan in forwards:
+                    prepare_grouped(next_decode, next_prefill, (8,))
+                    next_ctx = get_context()
+                    tokens = len(next_ctx.slot_mapping)
+                    next_x = mx.ones((1, tokens, _HIDDEN), mx.float16)
+                    for _layer in range(2):
+                        sdpa_forward(inner, next_x, next_ctx, cache, layer_idx=0)
+                    expected.append(next_plan)
+                    assert spy.length_plans == expected
+                    assert spy.calls[-1].gqa_length_plan == next_plan
+                    assert spy.calls[-1].num_decode_requests == len(next_plan)
+
+    @pytest.mark.parametrize(
+        "supported,kind",
+        [
+            ("subset", "decode"),
+            ("subset", "prefill"),
+            ("subset", "mixed"),
+            ("subset", "expanded_verify"),
+            ("whole", "mixed"),
+            ("none", "mixed"),
+        ],
+    )
+    def test_nax_hints_follow_batch_shape_and_native_capabilities(
+        self, monkeypatch, supported, kind
+    ) -> None:
+        decode = [([[0] * 65], 511), ([[1] * 65], 511)] if kind != "prefill" else []
+        if kind == "expanded_verify":
+            decode = [([[0] * 65], 511, 2), ([[1] * 65], 511, 2)]
+        prefill = [([[2] * 32], 256, 0)] if kind != "decode" else []
+        prepare_grouped(decode, prefill, (8,))
+        ctx = get_context()
+        # Disabling GQA does not disable native mixed-batch separation.
+        ctx.gqa_disabled = True
+        spy = _PagedRoutingOpsSpy()
+        caps = {
+            **spy.paged_attention_capabilities(),
+            "nax_split_hint": supported != "none",
+            "nax_prefill_split_hint": supported == "subset",
+        }
+        monkeypatch.setattr(spy, "paged_attention_capabilities", lambda: caps)
+        work = MagicMock(wraps=sdpa_mod.nax_tile_work)
+        monkeypatch.setattr(sdpa_mod, "nax_tile_work", work)
+        inner = _make_inner()
+        inner.o_proj = lambda out: out
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            num_blocks=3,
+            block_size=8,
+            dtype=mx.float16,
+        )
+        total = len(ctx.slot_mapping)
+        x = mx.ones((1, total, _HIDDEN), mx.float16)
+        zeros = mx.zeros((1, total, _N_HEADS * _HEAD_DIM), mx.float16)
+        subset = supported == "subset" and kind == "mixed"
+        windows = (-1, 128, -1, 128) if subset else (-1,)
+        with (
+            patch.object(sdpa_mod, "get_ops", return_value=spy),
+            patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
+        ):
+            for window in windows:
+                cache.sliding_window_per_layer[0] = window
+                sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+        forwarded = supported != "none" and kind != "decode"
+        # The full prefill blocks split on their own; decode partial tiles
+        # keep the whole mixed batch unsplit, including at window 128.
+        whole_hint = int(kind == "prefill")
+        assert spy.calls[-1].nax_split_hint == (whole_hint if forwarded else -1)
+        assert spy.calls[-1].nax_prefill_split_hint == (1 if subset else -1)
+        # Matching layers reuse each whole/subset plan for their window.
+        assert work.call_count == len(set(windows)) * (int(forwarded) + int(subset))
 
     def test_mixed_batch_routes_slots_and_page_tables_by_layer_group(self) -> None:
         """Full and sliding layers consume their scheduler-group metadata."""

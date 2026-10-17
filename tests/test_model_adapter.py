@@ -109,6 +109,46 @@ class TestShouldForceTextBackbone:
         assert adapter.build_multimodal_adapter(object(), hf_config) is None
 
     @pytest.mark.parametrize(
+        ("text_type", "expected"),
+        [
+            # mlx_lm loads these text models, and there is no mistral3 adapter.
+            ("mistral", True),
+            ("ministral3", True),
+            # Mistral 4 text is MLA, which mlx_lm's mistral3 wrapper can't load.
+            ("mistral4", False),
+        ],
+    )
+    def test_mistral3_uses_text_backbone_for_mlx_lm_text_models(
+        self, text_type: str, expected: bool
+    ) -> None:
+        hf_config = SimpleNamespace(
+            model_type="mistral3",
+            architectures=["Mistral3ForConditionalGeneration"],
+            quantization={"group_size": 64, "bits": 4, "mode": "affine"},
+            text_config=SimpleNamespace(model_type=text_type),
+        )
+        adapter = DefaultModelAdapter()
+        assert adapter.should_force_text_backbone(hf_config) is expected
+        assert adapter.build_multimodal_adapter(object(), hf_config) is None
+
+    def test_mistral3_without_text_config_keeps_native_path(self) -> None:
+        hf_config = SimpleNamespace(
+            model_type="mistral3", architectures=["Mistral3ForConditionalGeneration"]
+        )
+        assert DefaultModelAdapter().should_force_text_backbone(hf_config) is False
+
+    def test_multimodal_native_mode_keeps_mistral3_native(self, monkeypatch) -> None:
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
+        reset_config()
+
+        hf_config = SimpleNamespace(
+            model_type="mistral3",
+            architectures=["Mistral3ForConditionalGeneration"],
+            text_config=SimpleNamespace(model_type="mistral"),
+        )
+        assert DefaultModelAdapter().should_force_text_backbone(hf_config) is False
+
+    @pytest.mark.parametrize(
         ("model_type", "architecture", "vision_config"),
         [
             # The flagship native-multimodal checkpoint family
@@ -582,6 +622,21 @@ class TestNormalizeModelConfig:
 
         assert model_config.multimodal_config is None
 
+    def test_clears_multimodal_config_for_mistral3_in_auto_mode(self) -> None:
+        # The frontend then rejects image input with a 400.
+        model_config = SimpleNamespace(
+            multimodal_config=SimpleNamespace(language_model_only=False),
+            hf_config=SimpleNamespace(
+                model_type="mistral3",
+                architectures=["Mistral3ForConditionalGeneration"],
+                text_config=SimpleNamespace(model_type="mistral"),
+            ),
+        )
+
+        DefaultModelAdapter().normalize_model_config(model_config)
+
+        assert model_config.multimodal_config is None
+
     @pytest.mark.parametrize(
         ("model_type", "architecture"),
         [
@@ -766,6 +821,14 @@ class _PaddleOCRLanguageModelStub:
         return None
 
 
+# Every Qwen3-VL family hf_config carries the video frame token ids.
+_QWEN3_VL_FRAME_TOKEN_IDS = {
+    "video_token_id": 248057,
+    "vision_start_token_id": 248053,
+    "vision_end_token_id": 248054,
+}
+
+
 class TestBuildMultimodalAdapter:
     def test_builds_qwen35_adapter_from_loaded_vlm(self) -> None:
         vision_tower = object()
@@ -777,7 +840,7 @@ class TestBuildMultimodalAdapter:
             vision_tower=vision_tower,
             language_model=language_model,
         )
-        hf_config = SimpleNamespace(model_type="qwen3_5")
+        hf_config = SimpleNamespace(model_type="qwen3_5", **_QWEN3_VL_FRAME_TOKEN_IDS)
 
         adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
 
@@ -795,6 +858,7 @@ class TestBuildMultimodalAdapter:
         hf_config = SimpleNamespace(
             model_type="custom",
             architectures=["Qwen3VLForConditionalGeneration"],
+            **_QWEN3_VL_FRAME_TOKEN_IDS,
         )
 
         adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)

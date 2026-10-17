@@ -162,6 +162,14 @@ class _Qwen35LanguageModelStub:
         return None
 
 
+# Every Qwen3-VL family hf_config carries the video frame token ids.
+_QWEN35_FRAME_TOKEN_IDS = {
+    "video_token_id": 248057,
+    "vision_start_token_id": 248053,
+    "vision_end_token_id": 248054,
+}
+
+
 def _qwen35_vlm_model(
     *,
     vision_tower: object | None = None,
@@ -483,6 +491,7 @@ class TestModelLifecycle:
             model_config=_runner_model_config(
                 hf_config=SimpleNamespace(
                     model_type="qwen3_5",
+                    **_QWEN35_FRAME_TOKEN_IDS,
                     architectures=["Qwen3_5ForConditionalGeneration"],
                     quantization={"group_size": 64, "bits": 4, "mode": "affine"},
                     vision_config=SimpleNamespace(spatial_merge_size=2),
@@ -514,6 +523,7 @@ class TestModelLifecycle:
             model_config=_runner_model_config(
                 hf_config=SimpleNamespace(
                     model_type="qwen3_5",
+                    **_QWEN35_FRAME_TOKEN_IDS,
                     architectures=["Qwen3_5ForConditionalGeneration"],
                     quantization_config={"quant_method": "fp8"},
                 ),
@@ -547,6 +557,7 @@ class TestModelLifecycle:
             model_config=_runner_model_config(
                 hf_config=SimpleNamespace(
                     model_type="qwen3_5",
+                    **_QWEN35_FRAME_TOKEN_IDS,
                     architectures=["Qwen3_5ForConditionalGeneration"],
                     quantization_config={"quant_method": "fp8"},
                 ),
@@ -641,6 +652,7 @@ class TestModelLifecycle:
             model_config=_runner_model_config(
                 hf_config=SimpleNamespace(
                     model_type="qwen3_5",
+                    **_QWEN35_FRAME_TOKEN_IDS,
                     architectures=["Qwen3_5ForConditionalGeneration"],
                     quantization_config={"quant_method": "fp8"},
                 ),
@@ -1318,6 +1330,65 @@ class TestResolveModelDims:
                 lifecycle.resolve_model_dims()
             assert runner.hybrid_runtime_plan is None
 
+    @pytest.mark.parametrize(
+        ("model_dtype", "ssm_dtype", "supported"),
+        [
+            (torch.bfloat16, "auto", False),
+            (torch.float16, "auto", False),
+            (torch.bfloat16, "bfloat16", False),
+            (torch.float16, "float16", False),
+            (torch.bfloat16, "float32", True),
+            (torch.float16, "float32", True),
+            (torch.float32, "auto", True),
+        ],
+    )
+    def test_gdn_speculative_decode_requires_float32_recurrent_state(
+        self, model_dtype, ssm_dtype, supported
+    ) -> None:
+        lifecycle, runner = _make_lifecycle(
+            model_args=_GDN_HYBRID_ARGS,
+            model_config=_runner_model_config(is_hybrid=True, dtype=model_dtype),
+        )
+        runner.cache_config.mamba_ssm_cache_dtype = ssm_dtype
+        runner.vllm_config.speculative_config = SimpleNamespace(method="ngram")
+
+        if supported:
+            lifecycle.resolve_model_dims()
+            assert runner.hybrid_runtime_plan.state_dtypes[1] == torch.float32
+        else:
+            with pytest.raises(
+                NotImplementedError, match="--mamba-ssm-cache-dtype float32"
+            ):
+                lifecycle.resolve_model_dims()
+            assert runner.hybrid_runtime_plan is None
+
+    def test_gdn_speculative_decode_accepts_auto_resolved_to_float32(self) -> None:
+        model_cls = SimpleNamespace(
+            get_mamba_state_dtype_from_config=lambda _: (
+                torch.bfloat16,
+                torch.float32,
+            )
+        )
+        registry = SimpleNamespace(
+            resolve_model_cls=lambda *_args, **_kwargs: (model_cls, "override")
+        )
+        lifecycle, runner = _make_lifecycle(
+            model_args=_GDN_HYBRID_ARGS,
+            model_config=_runner_model_config(
+                is_hybrid=True, dtype=torch.bfloat16, registry=registry
+            ),
+        )
+        runner.cache_config.mamba_ssm_cache_dtype = "auto"
+        runner.vllm_config.speculative_config = SimpleNamespace(method="ngram")
+
+        lifecycle.resolve_model_dims()
+
+        assert runner.cache_config.mamba_ssm_cache_dtype == "auto"
+        assert runner.hybrid_runtime_plan.state_dtypes == (
+            torch.bfloat16,
+            torch.float32,
+        )
+
     def test_routing_follows_the_typed_field_not_the_args(self) -> None:
         runner = self._resolve(_GDN_HYBRID_ARGS, is_hybrid=False)
 
@@ -1394,6 +1465,24 @@ class TestResolveModelDims:
         )
 
         assert runner.num_layers == 32
+        assert runner.num_kv_heads == 8
+        assert runner.head_dim == 128
+
+    def test_null_mla_fields_resolve_as_standard_attention(self) -> None:
+        # Mistral-Small-3.1 text config as mlx-vlm's mistral3 TextConfig gives it.
+        runner = self._resolve(
+            {
+                "num_hidden_layers": 40,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "hidden_size": 5120,
+                "head_dim": 128,
+                "kv_lora_rank": None,
+                "qk_rope_head_dim": None,
+            }
+        )
+
+        assert runner.is_mla is False
         assert runner.num_kv_heads == 8
         assert runner.head_dim == 128
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +18,8 @@ from vllm_metal.metal import build
 class _Paths:
     src: Path
     patch: Path
+    kernels: Path
+    device: Path
     bld: Path
     consts: Path
     nb_src: Path
@@ -30,6 +33,8 @@ class _Paths:
 def patched(tmp_path, monkeypatch) -> _Paths:
     src = tmp_path / "paged_ops.cpp"
     patch = tmp_path / "mlx_patch.cpp"
+    kernels = tmp_path / "paged_attention_kernels.h"
+    device = tmp_path / "metal_device.h"
     bld = tmp_path / "build.py"
     consts = tmp_path / "constants.py"
     nb_src = tmp_path / "nb_combined.cpp"
@@ -39,6 +44,8 @@ def patched(tmp_path, monkeypatch) -> _Paths:
 
     src.write_bytes(b"// source v1")
     patch.write_bytes(b"// patch v1")
+    kernels.write_bytes(b"// kernel descriptions v1")
+    device.write_bytes(b"// hardware detection v1")
     bld.write_bytes(b"# build v1")
     consts.write_bytes(b"PARTITION_SIZE = 256")
     nb_src.write_bytes(b"// nanobind combined v1")
@@ -46,6 +53,8 @@ def patched(tmp_path, monkeypatch) -> _Paths:
 
     monkeypatch.setattr(build, "_SRC", src)
     monkeypatch.setattr(build, "_MLX_PATCH", patch)
+    monkeypatch.setattr(build, "_KERNELS", kernels)
+    monkeypatch.setattr(build, "_DEVICE", device)
     monkeypatch.setattr(build, "_BUILD", bld)
     monkeypatch.setattr(build, "_CONSTANTS", consts)
     monkeypatch.setattr(build, "_OUT", out)
@@ -63,7 +72,7 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     )
     monkeypatch.setattr(build, "_build_spec", lambda: spec)
 
-    return _Paths(src, patch, bld, consts, nb_src, out, hsh, ver, spec)
+    return _Paths(src, patch, kernels, device, bld, consts, nb_src, out, hsh, ver, spec)
 
 
 def test_needs_rebuild_when_so_missing(patched):
@@ -106,7 +115,7 @@ def test_old_content_with_newer_so_mtime_still_rebuilds(patched):
     assert build.needs_rebuild() is True
 
 
-@pytest.mark.parametrize("source_name", ["src", "patch"])
+@pytest.mark.parametrize("source_name", ["src", "patch", "kernels", "device"])
 def test_hash_changes_with_source_bytes(patched, source_name):
     h1 = build._input_hash(patched.spec)
     getattr(patched, source_name).write_bytes(b"// source v2")
@@ -279,6 +288,20 @@ def test_stale_artifacts_empty_when_all_fresh(stale_env):
     assert build.stale_artifacts() == []
 
 
+def test_prepare_metallib_is_independent_of_mlx(stale_env, monkeypatch):
+    _seed_fresh()
+    monkeypatch.setattr(build, "_build_spec", _raise(AssertionError("touched MLX")))
+    name = build.METALLIB_NAMES[0]
+    lib = build.metallib_path(name)
+    assert build.prepare_metallib(name) == lib
+    build._stamp_path(lib).write_text("STALE")
+    with pytest.raises(RuntimeError, match="stale"):
+        build.prepare_metallib(name)
+    lib.unlink()
+    with pytest.raises(RuntimeError, match="missing"):
+        build.prepare_metallib(name)
+
+
 def test_stale_artifacts_empty_without_stamps_skips_build_deps(stale_env, monkeypatch):
     # Wheel install: artifacts present, no stamps. Must short-circuit to [] BEFORE
     # importing build deps -> _input_hash (which would raise here) is never hit.
@@ -377,8 +400,166 @@ def test_get_ops_rejects_an_extension_built_against_another_mlx(tmp_path, monkey
     so.write_bytes(b"")
     monkeypatch.delenv("VLLM_METAL_BUILD_FROM_SOURCE", raising=False)
     monkeypatch.setattr(metal, "_ops_module", None)
+    monkeypatch.setattr(metal, "_native_module", None)
     monkeypatch.setattr(build, "output_path", lambda: so)
     monkeypatch.setattr(build, "stale_artifacts", lambda: [])
     monkeypatch.setattr(build, "mlx_version_mismatch", lambda: ("0.32.1", "0.32.3"))
     with pytest.raises(RuntimeError, match=r"MLX 0\.32\.1.*MLX 0\.32\.3"):
         metal.get_ops()
+
+
+# --- build_metallibs() skip gate (build-side only) ---------------------------
+
+_LIB = "rope_kern"
+
+
+@pytest.fixture
+def metallib_env(tmp_path, monkeypatch):
+    """Redirect metallibs into tmp_path, fake the toolchain, and record compiles
+    instead of invoking ``xcrun metal``."""
+    state = {"source": "// rope v1", "toolchain": "tc-a", "compiled": []}
+
+    monkeypatch.setattr(build, "_THIS_DIR", tmp_path)
+    monkeypatch.setattr(build, "METALLIB_NAMES", (_LIB,))
+    monkeypatch.setattr(build, "_sdk_supports_nax", lambda: True)
+    monkeypatch.setattr(build, "NAX_METALLIB_NAME", "nax_fake")
+    monkeypatch.setattr(build, "_metallib_source", lambda name: state["source"])
+    monkeypatch.setattr(build, "_metal_toolchain_id", lambda: state["toolchain"])
+
+    def fake_run(cmd, what):
+        out = Path(cmd[cmd.index("-o") + 1])
+        state["compiled"].append(out.stem)
+        out.write_bytes(b"metallib")
+
+    monkeypatch.setattr(build, "_run_or_raise", fake_run)
+    return state
+
+
+def _lib(tmp_path) -> Path:
+    return tmp_path / f"{_LIB}.metallib"
+
+
+def test_metallib_first_build_compiles_and_writes_sidecars(metallib_env, tmp_path):
+    build.build_metallibs()
+    assert set(metallib_env["compiled"]) == {_LIB, "nax_fake"}
+    assert build._stamp_path(_lib(tmp_path)).is_file()
+    assert build._toolchain_path(_lib(tmp_path)).read_text() == "tc-a"
+
+
+def test_metallib_hit_skips_compile(metallib_env):
+    build.build_metallibs()
+    metallib_env["compiled"].clear()
+    build.build_metallibs()
+    assert metallib_env["compiled"] == []
+
+
+def test_metallib_source_change_rebuilds(metallib_env):
+    build.build_metallibs()
+    metallib_env["compiled"].clear()
+    metallib_env["source"] = "// rope v2"
+    build.build_metallibs()
+    assert set(metallib_env["compiled"]) == {_LIB, "nax_fake"}
+
+
+def test_metallib_toolchain_change_rebuilds(metallib_env):
+    build.build_metallibs()
+    metallib_env["compiled"].clear()
+    metallib_env["toolchain"] = "tc-b"
+    build.build_metallibs()
+    assert set(metallib_env["compiled"]) == {_LIB, "nax_fake"}
+
+
+@pytest.mark.parametrize(
+    "remove",
+    [
+        lambda p: p,
+        build._stamp_path,
+        build._toolchain_path,
+    ],
+    ids=["artifact", "stamp", "toolchain"],
+)
+def test_metallib_missing_file_rebuilds(metallib_env, tmp_path, remove):
+    build.build_metallibs()
+    metallib_env["compiled"].clear()
+    remove(_lib(tmp_path)).unlink()
+    build.build_metallibs()
+    assert metallib_env["compiled"] == [_LIB]
+
+
+def test_metallib_unreadable_stamp_rebuilds(metallib_env, tmp_path):
+    build.build_metallibs()
+    metallib_env["compiled"].clear()
+    stamp = build._stamp_path(_lib(tmp_path))
+    stamp.unlink()
+    stamp.mkdir()
+    assert build._metallib_is_current(_LIB, metallib_env["source"]) is False
+    # Runtime tolerance is unchanged: is_stale() never raises on a bad stamp.
+    assert build.is_stale(_lib(tmp_path), "anything") is False
+
+
+def test_metallib_undecodable_stamp_rebuilds(metallib_env, tmp_path):
+    build.build_metallibs()
+    metallib_env["compiled"].clear()
+    build._stamp_path(_lib(tmp_path)).write_bytes(b"\xff\xfe\x00bad")
+    build.build_metallibs()
+    assert metallib_env["compiled"] == [_LIB]
+
+
+def test_metallib_unavailable_toolchain_never_skips(metallib_env):
+    build.build_metallibs()
+    metallib_env["compiled"].clear()
+    metallib_env["toolchain"] = "unavailable"
+    build.build_metallibs()
+    assert set(metallib_env["compiled"]) == {_LIB, "nax_fake"}
+
+
+def test_runtime_staleness_does_not_query_toolchain(monkeypatch, tmp_path):
+    lib = tmp_path / "x.metallib"
+    lib.write_bytes(b"m")
+    build._stamp_path(lib).write_text("d")
+
+    def boom():
+        raise AssertionError("runtime must not invoke xcrun")
+
+    monkeypatch.setattr(build, "_metal_toolchain_id", boom)
+    assert build.is_stale(lib, "d") is False
+
+
+def _fake_xcrun(metal_out: str, sdk_out: str = "26.2\n"):
+    def run(cmd, **kwargs):
+        out = sdk_out if "--show-sdk-version" in cmd else metal_out
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+    return run
+
+
+def _toolchain_id_with(monkeypatch, metal_out: str) -> str:
+    monkeypatch.setattr(build.subprocess, "run", _fake_xcrun(metal_out))
+    build._metal_toolchain_id.cache_clear()
+    try:
+        return build._metal_toolchain_id()
+    finally:
+        build._metal_toolchain_id.cache_clear()
+
+
+_METAL_V1 = "Apple metal version 32023.620 (metalfe-32023.620)\nTarget: air64-apple-darwin25.0.0\n"
+
+
+def test_toolchain_id_ignores_installed_dir(monkeypatch):
+    a = _toolchain_id_with(
+        monkeypatch,
+        _METAL_V1
+        + "InstalledDir: /private/var/run/com.apple.security.cryptexd/mnt/AAA/bin\n",
+    )
+    b = _toolchain_id_with(
+        monkeypatch,
+        _METAL_V1
+        + "InstalledDir: /private/var/run/com.apple.security.cryptexd/mnt/BBB/bin\n",
+    )
+    assert a == b != "unavailable"
+
+
+def test_toolchain_id_changes_with_metal_version(monkeypatch):
+    a = _toolchain_id_with(monkeypatch, _METAL_V1)
+    b = _toolchain_id_with(monkeypatch, _METAL_V1.replace("32023.620", "32023.700"))
+    assert a != b

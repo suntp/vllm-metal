@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import asdict, dataclass, fields
 from typing import Any
 
@@ -11,7 +10,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from transformers import AutoTokenizer
 
-from vllm_metal.pytorch_backend.tensor_bridge import TORCH_TO_MLX_DTYPE
+from vllm_metal.tensor_bridge import TORCH_TO_MLX_DTYPE
 from vllm_metal.v1.pooling.backends.encoder.models.loading import (
     encoder_model_path,
     load_encoder_weights,
@@ -102,9 +101,15 @@ class XLMRobertaSelfAttention(nn.Module):
         query = self._split_heads(self.query(hidden_states))
         key = self._split_heads(self.key(hidden_states))
         value = self._split_heads(self.value(hidden_states))
-        scores = (query @ key.transpose(0, 1, 3, 2)) / math.sqrt(self.head_dim)
-        probs = mx.softmax(scores + attention_mask, axis=-1)
-        context = probs @ value
+        context = mx.fast.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            scale=self.head_dim**-0.5,
+            # Keep the additive padding mask in the projection dtype so it
+            # does not promote half-precision encoder activations to float32.
+            mask=attention_mask.astype(query.dtype),
+        )
         batch, _, seq_len, _ = context.shape
         return context.transpose(0, 2, 1, 3).reshape(
             batch,

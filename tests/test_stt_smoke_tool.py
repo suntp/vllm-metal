@@ -2,15 +2,15 @@
 
 import io
 import json
-import subprocess
 import sys
 import threading
 import urllib.error
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from types import SimpleNamespace
 
 import pytest
 
+from tests.http_test_utils import LoopbackHTTPServer
 from tools import stt_sampling_serve_smoke as smoke
 
 
@@ -31,8 +31,10 @@ def healthy_server():
         def log_message(self, *args):
             pass
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server = LoopbackHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+    )
     thread.start()
     try:
         yield server
@@ -128,12 +130,11 @@ def test_transcriptions_use_the_served_model(monkeypatch):
 
 
 def test_unrelated_startup_failure_does_not_retry(monkeypatch, capsys):
-    original_popen = subprocess.Popen
     starts = []
 
     def failed_vllm(command):
         starts.append(command)
-        return original_popen([sys.executable, "-c", "raise SystemExit(7)"])
+        return SimpleNamespace(poll=lambda: 7, wait=lambda timeout: 7)
 
     monkeypatch.setattr(smoke.subprocess, "Popen", failed_vllm)
     monkeypatch.setattr(sys, "argv", ["stt-smoke", "--audio", "unused.wav"])

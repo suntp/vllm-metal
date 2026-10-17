@@ -21,7 +21,7 @@ vllm-metal validates these variables when the engine configuration is created an
 | `VLLM_METAL_NATIVE_SAMPLING` | `0` | Opt-in MLX-native non-greedy sampling with temperature/top-k/top-p/min-p for eligible pure-decode batches. Masks are per row, so a batch may mix greedy and random requests with different top-k/top-p/min-p. Seeds, penalties, logprobs, allowed-token IDs, and bad-word constraints use the torch sampler for the whole batch; `min_p` is also supported there. `min_tokens` and `logit_bias` remain unsupported. Sampled tokens use the MLX RNG keyed from the engine seed, so outputs can differ from torch. Set to `1` to enable. |
 | `VLLM_METAL_MLA_KERNEL` | `0` | Enable the experimental absorbed-MLA single-pass Metal decode kernel ([RFC #360](https://github.com/vllm-project/vllm-metal/issues/360)). Off by default; the MLA wrapper falls back to the MLX SDPA per-request slow path. Set to `1` to route absorbed-MLA decode through the kernel when the workload matches the instantiated specialization (`kv_lora_rank=512`, `qk_rope_head_dim=64`, `block_size ∈ {16, 32}`, fp16/bf16, decode-only). At startup the engine logs whether decode-only batches take the kernel and, if not, why. |
 | `VLLM_METAL_BUILD_FROM_SOURCE` | `0` | Compile the native `_paged_ops` Metal extension from source at runtime instead of loading the prebuilt artifact shipped in the wheel. For kernel developers / source installs; requires the Xcode command-line tools (`clang++`). Off by default — release wheels ship the `.so` prebuilt. See [Contributing](CONTRIBUTING.md). |
-| `VLLM_METAL_SPEC_VERIFY_WINDOW` | `0` | Enable spec-decode verification window mode ([issue #465](https://github.com/vllm-project/vllm-metal/issues/465)): the K+1 verification rows share each KV block load instead of re-reading the context per row. Off by default; verify windows keep the expanded per-token layout. Outputs are bitwise identical either way; the win is chip- and shape-dependent (measured up to +40% e2e at concurrency 16-32 with 8k contexts on M2/M3 Ultra, and regressions single-stream on M4 Pro and at concurrency 32 on M2 Max). MLA, hybrid-GDN, and head sizes above 256 always use the expanded layout. The same opt-in also merges the `draft_model` proposer's small committed-token ingest into one window per request (head sizes above 256 keep the expanded layout there too); single-stream TPOT is within run-to-run noise of the expanded ingest (0.6B pair, 8k prefix, M4 Pro), and generated tokens are identical. With speculative decoding on, the engine logs at startup which layout the verify windows and the draft model's committed-token ingest use, and why. |
+| `VLLM_METAL_SPEC_VERIFY_WINDOW` | `0` | Enable spec-decode verification window mode ([issue #465](https://github.com/vllm-project/vllm-metal/issues/465)): the K+1 verification rows share each KV block load instead of re-reading the context per row. Off by default; non-hybrid verify windows keep the expanded per-token layout. Outputs are bitwise identical either way; the win is chip- and shape-dependent (measured up to +40% e2e at concurrency 16-32 with 8k contexts on M2/M3 Ultra, and regressions single-stream on M4 Pro and at concurrency 32 on M2 Max). Non-hybrid MLA models and head sizes above 256 use the expanded layout. Hybrid GDN targets force window mode when speculative decoding is configured (their state scan needs one segment per request); hybrid speculation with head sizes above 256 or non-GDN state families is rejected. The same opt-in also merges the `draft_model` proposer's small committed-token ingest into one window per request (head sizes above 256 keep the expanded layout there too); single-stream TPOT is within run-to-run noise of the expanded ingest (0.6B pair, 8k prefix, M4 Pro), and generated tokens are identical. With speculative decoding on, the engine logs at startup which layout the verify windows and the draft model's committed-token ingest use, and why. |
 | `VLLM_METAL_SPEC_INGEST_CHUNK` | `1024` | Maximum number of cold draft-model KV-ingest tokens processed per forward ([issue #482](https://github.com/vllm-project/vllm-metal/issues/482)). Chunking bounds each dispatch stall and the peak logits allocation; a multiple of the KV block size is recommended. Set to `0` to restore single-forward ingest; a non-integer or negative value fails the startup. |
 | `VLLM_METAL_VISIBLE_DEVICES` | — | Set automatically by the Ray executor per worker (the device-control var); not user-configurable. See [Distributed](distributed.md). |
 | `VLLM_METAL_RING_BASE_PORT` | `32323` | Base TCP port for the MLX ring data plane under pipeline parallelism, in the user-port range `[1024, 65535]`; stage *r* binds `base + r` (so the default is `32323`/`32324` for two stages). Set the **same** value on every node to move the ring off a busy port — e.g. when an `mlx.launch` job, a restart still in `TIME_WAIT`, or another PP job holds the default. See [Distributed](distributed.md#pipeline-parallelism). |
@@ -43,7 +43,7 @@ wins. Outputs are unaffected.
 
 ## Multimodal Serve Modes
 
-- `auto`: use the text-only compatibility path only for checkpoints on the compatibility allowlist — Qwen3.5/Qwen3.6 **FP8** conditional-generation wrappers (their `*_weight_scale_inv` tensors are not sanitized by the mlx_vlm loader), and architectures without a multimodal adapter (the Qwen3.6 and MoE wrappers). Non-FP8 Qwen3.5 dense checkpoints (official bf16 and MLX-affine quants) keep the native multimodal path. Gemma 4 checkpoints with vision weights, a loadable HF processor and no speculative decoding serve images through the vision sidecar on the mlx_lm text backbone (see [Supported Models](supported_models.md)); otherwise they stay text-only with a logged reason.
+- `auto`: use the text-only compatibility path only for checkpoints on the compatibility allowlist — Qwen3.5/Qwen3.6 **FP8** conditional-generation wrappers (their `*_weight_scale_inv` tensors are not sanitized by the mlx_vlm loader), and architectures without a multimodal adapter (the Qwen3.6 and MoE wrappers). Mistral 3 checkpoints with `mistral` or `ministral3` text have no multimodal adapter, so they load their text backbone through mlx_lm. Non-FP8 Qwen3.5 dense checkpoints (official bf16 and MLX-affine quants) keep the native multimodal path. Gemma 4 checkpoints with vision weights, a loadable HF processor and no speculative decoding serve images through the vision sidecar on the mlx_lm text backbone (see [Supported Models](supported_models.md)); otherwise they stay text-only with a logged reason.
 - `multimodal-native`: disable the compatibility fallback and keep the native multimodal path active when validating or developing real multimodal support.
 - `text-only`: force the text-only backbone for every multimodal checkpoint, including Gemma 4 (the pre-sidecar behaviour).
 
@@ -55,6 +55,36 @@ Pass `--speculative-config` with a JSON object to enable speculative decoding.
 Use `--no-async-scheduling` (required for all spec-decode methods on Metal).
 See [Speculative Decoding](speculative_decoding.md) for supported methods,
 model pairing, and memory considerations.
+
+## Sleep Mode
+
+Start with `--enable-sleep-mode` (or `LLM(..., enable_sleep_mode=True)`) to
+give the KV cache's memory back while the engine is idle, for example when a
+model server stays open in the background on a laptop, or when the same Mac
+runs another memory-hungry job between requests. The API is vLLM's
+[sleep mode](https://docs.vllm.ai/en/latest/features/sleep_mode.html); the
+`/sleep`, `/wake_up` and `/is_sleeping` endpoints and `LLM.sleep()` work the
+same way.
+
+Sleep levels mean something different on unified memory than on a GPU:
+
+| Level | vLLM on a GPU | vllm-metal |
+|---|---|---|
+| 1 | Copies weights to CPU memory, discards the KV cache | Discards the KV cache. Weights stay in place: unified memory has nowhere cheaper to copy them to. |
+| 2 | Discards weights and the KV cache | Not supported yet |
+
+- `llm.sleep(level=1)` frees the KV cache. `llm.wake_up()` re-creates it in
+  well under a second, and the prefix cache starts empty.
+- `llm.sleep(level=0)` followed by `llm.release_kv_cache_memory()` also frees
+  the KV cache. Restore it with `llm.wake_up(tags=["kv_cache"])`.
+- The amount freed is the part of the KV pool that was in use, because the
+  pool is allocated lazily.
+- With [KV offloading](kv_offloading.md), sleep also frees the host pool. It
+  comes back empty at wake. Prompts already on the disk tier still restore.
+
+Sleep mode supports dense and hybrid models on the MLX backend. Standalone MLA
+models and speculative decoding methods other than `ngram` are not supported
+yet.
 
 ## KV Cache Memory Settings
 
