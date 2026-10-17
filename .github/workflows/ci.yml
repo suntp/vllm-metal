@@ -115,6 +115,20 @@ jobs:
       run: |
         scripts/test.sh
 
+    - name: Test suffix decoding with the optional arctic backend
+      shell: bash
+      run: |
+        set -euo pipefail
+        source .venv-vllm-metal/bin/activate
+        python -m pip install cmake ninja grpcio-tools wheel
+        Python_ROOT_DIR="$VIRTUAL_ENV" Python_FIND_STRATEGY=LOCATION \
+          python -m pip install --no-build-isolation --no-deps \
+          --no-binary arctic-inference arctic-inference==0.3.0
+        # Fail on a missing native backend instead of silently skipping the
+        # real-tree regressions through pytest.importorskip.
+        python -c "from arctic_inference.suffix_decoding import SuffixDecodingCache; SuffixDecodingCache(max_tree_depth=24)"
+        pytest -q tests/test_suffix_proposer.py -rs
+
     # Save only after a fully successful Test step: a build that failed midway
     # would leave an artifact missing, and an exact-key hit never re-saves, so
     # that incomplete entry would force the same rebuild on every later run.
