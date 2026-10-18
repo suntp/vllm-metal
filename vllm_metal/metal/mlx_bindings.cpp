@@ -58,10 +58,13 @@ static int min_decode_grid() {
   return gpu_core_count() * kernels::kDecodeGroupsPerCore;
 }
 
-static bool nax_hardware_supported() {
+static bool supports_apple10() {
   auto* device = metal::device(Device::gpu).mtl_device();
-  return hardware::nax_supported(
-      device->supportsFamily(static_cast<MTL::GPUFamily>(hardware::kApple10)));
+  return device->supportsFamily(static_cast<MTL::GPUFamily>(hardware::kApple10));
+}
+
+static bool nax_hardware_supported() {
+  return hardware::nax_supported(supports_apple10());
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +230,9 @@ NB_MODULE(_paged_ops, m) {
   m.def("init_nax_library_path", &init_nax_library_path,
         nb::arg("path"),
         "Load the precompiled NAX prefill .metallib from disk.");
+
+  m.def("supports_apple10", &supports_apple10,
+        "True when the GPU supports Apple10, independently of NAX availability.");
 
   m.def("nax_supported", &nax_hardware_supported,
         "True when the OS and GPU expose NAX tensor units.");

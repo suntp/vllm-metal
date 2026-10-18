@@ -11,7 +11,7 @@ import mlx.core as mx
 
 import vllm_metal.envs as envs
 from vllm_metal.attention.caches.state_cache import PagedStateCache
-from vllm_metal.metal import _read_v2_metal_source
+from vllm_metal.metal import _load_native_module, _read_v2_metal_source
 
 _GDN_CONV1D_V2_SOURCE = _read_v2_metal_source("gdn_conv1d_silu_decode.metal")
 _GDN_CONV1D_PREFILL_V2_SOURCE = _read_v2_metal_source("gdn_conv1d_silu_prefill.metal")
@@ -108,6 +108,7 @@ class GDNLazyKernels:
         recurrent_prefill_packed_kernel: Any | None = None,
     ) -> None:
         self._enabled = enabled
+        self._packed_prefill_auto: bool | None = None
         if not enabled:
             self._conv_kernel = None
             self._conv_prefill_kernel = None
@@ -459,6 +460,15 @@ class GDNLazyKernels:
         )
         return y_out
 
+    def _packed_prefill_enabled(self) -> bool:
+        mode = envs.VLLM_METAL_PACKED_GDN_PREFILL
+        if mode != "auto":
+            return mode == "1"
+        # Cache the hardware fact, but keep explicit overrides live for A/B.
+        if self._packed_prefill_auto is None:
+            self._packed_prefill_auto = bool(_load_native_module().supports_apple10())
+        return self._packed_prefill_auto
+
     def try_recurrent_prefill(
         self,
         request: GDNRecurrentPrefillRequest,
@@ -523,7 +533,7 @@ class GDNLazyKernels:
             self._recurrent_prefill_packed_kernel is not None
             and d_k == _RECURRENT_PREFILL_PACKED_KEY_HEAD_DIM
             and d_v % _RECURRENT_PREFILL_PACKED_ROWS_PER_SIMDGROUP == 0
-            and envs.VLLM_METAL_PACKED_GDN_PREFILL
+            and self._packed_prefill_enabled()
         )
         if use_packed_prefill:
             prefill_kernel = self._recurrent_prefill_packed_kernel

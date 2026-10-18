@@ -27,6 +27,7 @@ MLX_DEVICES = ("gpu", "cpu")
 MULTIMODAL_MODES = ("auto", "multimodal-native", "text-only")
 MM_PREFIX_PATHS = ("kernel", "recompute")
 TQ_PREFILL_MODES = ("auto", "0", "1")
+PACKED_GDN_PREFILL_MODES = ("auto", "0", "1")
 
 
 def _choice(
@@ -117,7 +118,7 @@ if TYPE_CHECKING:
     VLLM_METAL_MM_PREFIX_PATH: str | None = None
     VLLM_METAL_MODELSCOPE_CACHE: str | None = None
     VLLM_METAL_GDN_LAZY_KERNELS: bool = True
-    VLLM_METAL_PACKED_GDN_PREFILL: bool = False
+    VLLM_METAL_PACKED_GDN_PREFILL: str = "auto"
     VLLM_METAL_DECODE_PIPELINE: bool = True
     VLLM_METAL_COMPILED_MLP: bool = False
     VLLM_METAL_NATIVE_SAMPLING: bool = False
@@ -159,9 +160,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable lazy GDN kernels by default.
     # Set to "0" to force the eager conv / C++ recurrent fallback path.
     "VLLM_METAL_GDN_LAZY_KERNELS": _bool("VLLM_METAL_GDN_LAZY_KERNELS", True),
-    # Opt in to packed lazy GDN prefill for Dk == 128 and Dv % 8 == 0.
-    # Serving performance evidence currently covers only M5 Pro.
-    "VLLM_METAL_PACKED_GDN_PREFILL": _bool("VLLM_METAL_PACKED_GDN_PREFILL", False),
+    # Auto enables packed lazy GDN prefill on Apple10 (M5) GPUs, independently
+    # of NAX. Explicit 0/1 overrides hardware policy, not shape eligibility.
+    "VLLM_METAL_PACKED_GDN_PREFILL": _choice(
+        "VLLM_METAL_PACKED_GDN_PREFILL", "auto", PACKED_GDN_PREFILL_MODES
+    ),
     # One-step-ahead decode pipelining (default on). Eligible pure-decode
     # greedy steps defer the sampling sync one step so the next step's graph
     # build and submit overlap the in-flight GPU forward. Set to "0" to
