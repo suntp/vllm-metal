@@ -33,6 +33,7 @@ _INTERNAL = _THIS_DIR / "ops_internal.h"
 _MLX_PATCH = _THIS_DIR / "mlx_patch.cpp"
 _KERNELS = _THIS_DIR / "paged_attention_kernels.h"
 _DEVICE = _THIS_DIR / "metal_device.h"
+_DEVICE_SRC = _THIS_DIR / "metal_device.cpp"
 _BUILD = _THIS_DIR / "build.py"
 _CONSTANTS = _THIS_DIR / "constants.py"
 _EXT_SUFFIX = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
@@ -373,7 +374,7 @@ def _build_spec() -> _BuildSpec:
         "Metal",
         "-framework",
         "Foundation",
-        # IOKit + CoreFoundation: shared GPU detection in metal_device.h queries the
+        # IOKit + CoreFoundation: shared GPU detection in metal_device.cpp queries the
         # IORegistry. Explicit -framework is load-bearing — "-undefined
         # dynamic_lookup" below resolves only against already-loaded images,
         # and nothing else loads IOKit.
@@ -403,6 +404,7 @@ def _build_spec() -> _BuildSpec:
         str(_GDN),
         str(_MLA),
         str(_MLX_PATCH),
+        str(_DEVICE_SRC),
         "-o",
         str(_OUT),
     ]
@@ -438,6 +440,7 @@ def _input_hash(spec: _BuildSpec) -> str:
         _MLX_PATCH,
         _KERNELS,
         _DEVICE,
+        _DEVICE_SRC,
         _BUILD,
         _CONSTANTS,
         spec.nb_src,
@@ -569,7 +572,14 @@ def _mps_input_hash() -> str:
     import torch
 
     h = hashlib.sha256(str(torch.__version__).encode())
-    for path in (_MPS_DIR / "mps_ops.mm", _KERNELS, _DEVICE, _BUILD, _CONSTANTS):
+    for path in (
+        _MPS_DIR / "mps_ops.mm",
+        _KERNELS,
+        _DEVICE,
+        _DEVICE_SRC,
+        _BUILD,
+        _CONSTANTS,
+    ):
         h.update(path.name.encode() + b"\0" + path.read_bytes() + b"\0")
     return h.hexdigest()
 
@@ -592,7 +602,7 @@ def build_mps() -> Path:
         return _MPS_OUT
     extension = CppExtension(
         "_mps_ops",
-        sources=[str(_MPS_DIR / "mps_ops.mm")],
+        sources=[str(_MPS_DIR / "mps_ops.mm"), str(_DEVICE_SRC)],
         extra_compile_args=[
             "-O3",
             f"-mmacosx-version-min={MIN_MACOS_VERSION}",
@@ -613,7 +623,7 @@ def build_mps() -> Path:
         ],
     )
     command = BuildExtension(Distribution({"ext_modules": [extension]}))
-    # A single host source needs no Ninja dependency.
+    # The host sources need no Ninja dependency.
     command.use_ninja = False
     command.ensure_finalized()
     command.build_lib = str(_MPS_DIR)

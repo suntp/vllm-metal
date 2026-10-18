@@ -11,16 +11,13 @@
 #include <string>
 #include <vector>
 
+#include "metal_device.h"
 #include "paged_attention_kernels.h"
 
 #include "mlx/mlx.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/primitives.h"
 
-namespace vllm_metal::hardware {
-int detected_gpu_core_count();
-int gpu_core_count();
-}
 namespace kernels = vllm_metal::kernels;
 namespace hardware = vllm_metal::hardware;
 using namespace mlx::core;

@@ -6,8 +6,10 @@ from __future__ import annotations
 import dataclasses
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,6 +26,7 @@ class _Paths:
     patch: Path
     kernels: Path
     device: Path
+    device_src: Path
     bld: Path
     consts: Path
     nb_src: Path
@@ -43,6 +46,7 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     patch = tmp_path / "mlx_patch.cpp"
     kernels = tmp_path / "paged_attention_kernels.h"
     device = tmp_path / "metal_device.h"
+    device_src = tmp_path / "metal_device.cpp"
     bld = tmp_path / "build.py"
     consts = tmp_path / "constants.py"
     nb_src = tmp_path / "nb_combined.cpp"
@@ -54,6 +58,7 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     patch.write_bytes(b"// patch v1")
     kernels.write_bytes(b"// kernel descriptions v1")
     device.write_bytes(b"// hardware detection v1")
+    device_src.write_bytes(b"// hardware detection source v1")
     bld.write_bytes(b"# build v1")
     consts.write_bytes(b"PARTITION_SIZE = 256")
     nb_src.write_bytes(b"// nanobind combined v1")
@@ -71,6 +76,7 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     monkeypatch.setattr(build, "_MLX_PATCH", patch)
     monkeypatch.setattr(build, "_KERNELS", kernels)
     monkeypatch.setattr(build, "_DEVICE", device)
+    monkeypatch.setattr(build, "_DEVICE_SRC", device_src)
     monkeypatch.setattr(build, "_BUILD", bld)
     monkeypatch.setattr(build, "_CONSTANTS", consts)
     monkeypatch.setattr(build, "_OUT", out)
@@ -97,6 +103,7 @@ def patched(tmp_path, monkeypatch) -> _Paths:
         patch,
         kernels,
         device,
+        device_src,
         bld,
         consts,
         nb_src,
@@ -149,12 +156,38 @@ def test_old_content_with_newer_so_mtime_still_rebuilds(patched):
 
 @pytest.mark.parametrize(
     "source_name",
-    ["src", "patch", "kernels", "device", "paged_attention", "gdn", "mla", "internal"],
+    [
+        "src",
+        "patch",
+        "kernels",
+        "device",
+        "paged_attention",
+        "gdn",
+        "mla",
+        "internal",
+        "device_src",
+    ],
 )
 def test_hash_changes_with_source_bytes(patched, source_name):
     h1 = build._input_hash(patched.spec)
     getattr(patched, source_name).write_bytes(b"// source v2")
     assert build._input_hash(patched.spec) != h1
+
+
+@pytest.mark.parametrize(
+    "source_name", ["mps_src", "kernels", "device", "device_src", "bld", "consts"]
+)
+def test_mps_hash_changes_with_source_bytes(
+    patched, tmp_path, monkeypatch, source_name
+):
+    mps_src = tmp_path / "mps_ops.mm"
+    mps_src.write_bytes(b"// source v1")
+    monkeypatch.setattr(build, "_MPS_DIR", tmp_path)
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(__version__="0.0.0"))
+    h1 = build._mps_input_hash()
+    source = mps_src if source_name == "mps_src" else getattr(patched, source_name)
+    source.write_bytes(b"// source v2")
+    assert build._mps_input_hash() != h1
 
 
 def test_hash_changes_with_constants_bytes(patched):

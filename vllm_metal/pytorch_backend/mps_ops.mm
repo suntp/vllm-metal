@@ -5,6 +5,7 @@
 #include <torch/extension.h>
 #include <ATen/mps/MPSStream.h>
 #include <ATen/native/mps/OperationUtils.h>
+#include <string>
 #include <unordered_map>
 
 #include "../metal/metal_device.h"
