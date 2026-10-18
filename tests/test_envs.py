@@ -121,7 +121,7 @@ def test_a_good_value_parses(
     ("name", "expected"),
     [
         ("VLLM_METAL_GDN_LAZY_KERNELS", True),
-        ("VLLM_METAL_PACKED_GDN_PREFILL", True),
+        ("VLLM_METAL_PACKED_GDN_PREFILL", False),
         ("VLLM_METAL_DECODE_PIPELINE", True),
         ("VLLM_METAL_COMPILED_MLP", False),
         ("VLLM_METAL_NATIVE_SAMPLING", False),
