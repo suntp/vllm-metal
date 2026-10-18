@@ -249,12 +249,20 @@ def test_replay_rejects_broken_generation_and_closes_stream(monkeypatch, problem
 
 
 @pytest.mark.parametrize(
-    "audit_passed,legacy_passed", [(False, True), (True, False), (True, True)]
+    "audit_passed,token_status",
+    [
+        (None, "exact"),
+        (None, "top_k"),
+        (False, "exact"),
+        (True, "fail"),
+        (True, "top_k"),
+        (True, "exact"),
+    ],
 )
 @pytest.mark.parametrize("hub_models", [False, True])
 @pytest.mark.parametrize("method", ["dspark", "suffix"])
 def test_cli_requires_both_audits_and_preserves_the_report(
-    monkeypatch, tmp_path, audit_passed, legacy_passed, hub_models, method
+    monkeypatch, tmp_path, audit_passed, token_status, hub_models, method
 ):
     import tools.speculative_parity as tool
     from tools import check_parity as cli
@@ -283,7 +291,7 @@ def test_cli_requires_both_audits_and_preserves_the_report(
                 if method != "suffix"
                 else []
             ),
-            "--audit-continuations",
+            *(["--audit-continuations"] if audit_passed is not None else []),
             "--output-dir",
             str(output),
         ],
@@ -347,7 +355,12 @@ def test_cli_requires_both_audits_and_preserves_the_report(
                                     "input_ids": [0],
                                     "tokens": [1] * 10
                                     if worker == "target"
-                                    else [2 if legacy_passed else 9] + [1] * 9,
+                                    else [
+                                        {"exact": 1, "top_k": 2, "fail": 9}[
+                                            token_status
+                                        ]
+                                    ]
+                                    + [1] * 9,
                                     "text": "test",
                                     "top_logprobs": [
                                         [
@@ -358,7 +371,12 @@ def test_cli_requires_both_audits_and_preserves_the_report(
                                                 "logprob": -rank,
                                             }
                                             for rank, token in enumerate(
-                                                [2, 1] if legacy_passed else [9, 8], 1
+                                                {
+                                                    "exact": [1, 2],
+                                                    "top_k": [2, 1],
+                                                    "fail": [9, 8],
+                                                }[token_status],
+                                                1,
                                             )
                                         ]
                                     ]
@@ -374,16 +392,27 @@ def test_cli_requires_both_audits_and_preserves_the_report(
     # A TOP_K_MATCH success must not override the strict audit result.
     with pytest.raises(SystemExit) as caught:
         cli.main()
-    assert caught.value.code == (0 if audit_passed and legacy_passed else 1)
+    expected = (
+        audit_passed is not False
+        and token_status != "fail"
+        and (method != "suffix" or token_status == "exact")
+    )
+    assert caught.value.code == (0 if expected else 1)
     summary = json.loads((output / "summary.json").read_text())
-    assert summary["passed"] == (audit_passed and legacy_passed)
-    assert summary["continuation_audit_passed"] == audit_passed
-    assert json.loads((output / "continuation-audit.json").read_text()) == report
+    assert summary["passed"] == expected
+    if method == "suffix":
+        assert summary["target_suffix_exact_passed"] == (token_status == "exact")
+    if audit_passed is not None:
+        assert summary["continuation_audit_passed"] == audit_passed
+        assert json.loads((output / "continuation-audit.json").read_text()) == report
+    else:
+        assert "continuation_audit_passed" not in summary
+        assert not (output / "continuation-audit.json").exists()
     assert [command[-1] for command in commands] == [
         "native",
         "target",
         method,
-        "replay",
+        *(["replay"] if audit_passed is not None else []),
     ]
     if method == "suffix":
         assert all("--draft" not in command for command in commands)

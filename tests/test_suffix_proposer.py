@@ -34,6 +34,7 @@ class _FakeVllmSuffix:
         self.num_speculative_tokens = num_speculative_tokens
         self.calls: list[tuple[int, object, list[list[int]]]] = []
         self.extra_draft: dict[int, list[int]] = {}
+        self.suffix_cache = _FakeSuffixCache()
 
     def propose(self, num_speculative_tokens, input_batch, sampled_token_ids):
         # Upstream asserts the configured width.
@@ -208,6 +209,7 @@ class TestSuffixMarshalling:
 
     def test_finished_ids_and_release_clear_bookkeeping(self) -> None:
         fake = _FakeVllmSuffix()
+        fake.suffix_cache.active_requests.update({"r0", "r1"})
         proposer = _proposer(fake)
         state0 = _request_state([1, 2, 3, 4, 5], prompt_len=2)
         proposer.propose(_context(decode_reqs=[("r0", state0)]))
@@ -219,6 +221,8 @@ class TestSuffixMarshalling:
         proposer.propose(_context(decode_reqs=[("r1", state0)]))
         proposer.release_requests({"r1"})
         assert "r1" not in proposer._last_len
+        assert fake.suffix_cache.stopped == ["r0", "r1"]
+        assert not fake.suffix_cache.active_requests
 
     def test_disabled_or_empty_drafting_returns_none(self) -> None:
         fake = _FakeVllmSuffix()

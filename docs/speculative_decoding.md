@@ -229,17 +229,14 @@ version above for this backend. CI installs this optional dependency and
 runs the suffix tests with the real native cache; it is not required for
 other speculative methods. The package is Apache-2.0 licensed.
 
-Greedy outputs with suffix (as with n-gram) are not guaranteed to match a
-run without speculation token for token: the verify forward has a different
-shape than a single-token decode, so a near-tie logit can round the other
-way and the two runs diverge from that position on. Equivalence is not
-established by locating the first divergent position — that only shows
-*where* the runs differ, not that the difference is a harmless near-tie.
-Follow the repository's spec-decoding standard instead: compare fresh,
-independently started spec-off and spec-on runs with the same inputs and
-settings via `tools/check_parity.py --method suffix --top-k 5`, and accept
-`EXACT`, or a first divergence with mutual `TOP_K_MATCH` membership, with
-zero `FAIL`.
+Suffix qualification requires fresh, independently started spec-off and
+spec-on greedy runs with identical input token IDs and settings to produce
+identical complete output token sequences. Run
+`tools/check_parity.py --method suffix --top-k 5`; its suffix-versus-target
+gate requires exact token equality and exits unsuccessfully on any
+divergence. `TOP_K_MATCH` and first-divergence logprobs remain diagnostic
+information, not evidence of speculative-decoding equivalence. A divergence
+must be investigated and resolved before suffix decoding is qualified.
 
 With `--enable-sleep-mode`, suffix decoding supports the worker's
 `sleep(level=1)` → `wake_up()` cycle. Suffix trees remain in host memory

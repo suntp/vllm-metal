@@ -46,9 +46,8 @@ Metal-specific decisions on top of upstream's loop:
 Draft lengths are dynamic per request (the tree speculates as deep as the
 matched suffix and the probability floor allow), bounded by this step's
 scheduled width; the verify half is the established greedy span path
-shared with n-gram. Like n-gram, greedy outputs can differ from a
-no-speculation run: the verify forward has a different shape than a
-single-token decode, so near-tie logits may round differently.
+shared with n-gram. Qualification requires identical output token IDs in
+fresh greedy runs with and without suffix decoding.
 """
 
 from __future__ import annotations
@@ -154,8 +153,8 @@ class SuffixProposer(NoOwnKVProposer):
     def _stop(self, req_id: str) -> None:
         anchor = self._last_len.pop(req_id, None)
         state = self._states.pop(req_id, None)
-        cache = getattr(self._vllm, "suffix_cache", None)
-        if cache is not None and req_id in cache.active_requests:
+        cache = self._vllm.suffix_cache
+        if req_id in cache.active_requests:
             # Feed the final committed segment before archiving. The request
             # leaves after its last drafting step (finished, preempted or
             # evicted), so the tokens committed since then -- the verify
