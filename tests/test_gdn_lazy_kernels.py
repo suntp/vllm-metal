@@ -6,7 +6,6 @@ from __future__ import annotations
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -1111,23 +1110,24 @@ class TestLazyRecurrentPrefill:
         )
 
     @pytest.mark.parametrize(
-        ("mode", "apple10", "d_k", "d_v", "use_packed"),
+        ("mode", "d_k", "d_v", "use_packed"),
         [
-            ("1", False, 128, 8, True),
-            ("1", False, 128, 24, True),
-            ("1", False, 64, 8, False),
-            ("1", False, 256, 8, False),
-            ("1", False, 128, 7, False),
-            ("0", True, 128, 8, False),
-            (None, True, 128, 8, True),
-            ("auto", False, 128, 8, False),
+            ("1", 128, 8, True),
+            ("1", 128, 24, True),
+            ("1", 64, 8, False),
+            ("1", 256, 8, False),
+            ("1", 128, 7, False),
+            ("0", 128, 8, False),
+            (None, 128, 8, True),
+            ("auto", 128, 8, True),
+            ("auto", 64, 8, False),
+            ("auto", 128, 7, False),
         ],
     )
-    def test_packed_prefill_shape_gate_and_hardware_policy(
+    def test_packed_prefill_shape_gate_and_mode(
         self,
         monkeypatch: pytest.MonkeyPatch,
         mode: str | None,
-        apple10: bool,
         d_k: int,
         d_v: int,
         use_packed: bool,
@@ -1137,12 +1137,6 @@ class TestLazyRecurrentPrefill:
         else:
             monkeypatch.setenv("VLLM_METAL_PACKED_GDN_PREFILL", mode)
         monkeypatch.setenv("VLLM_METAL_DISABLE_NAX", "1")
-        # No NAX API or library: packed auto needs only the hardware fact.
-        detect = Mock(return_value=apple10)
-        monkeypatch.setattr(
-            "vllm_metal.attention.impls.gdn_lazy._load_native_module",
-            lambda: SimpleNamespace(supports_apple10=detect),
-        )
         # Exercise real dispatch with stub kernels and deferred state on CPU.
         with mx.stream(mx.cpu):
             selected_kernel = _ConstantKernel(
@@ -1178,19 +1172,10 @@ class TestLazyRecurrentPrefill:
             np.testing.assert_array_equal(
                 np.array(cache.pending_recurrent_state(0, [2])), 9
             )
-        if mode in (None, "auto"):
-            detect.assert_called_once_with()
-        else:
-            detect.assert_not_called()
 
-    def test_packed_prefill_overrides_remain_live_after_auto_detection(
+    def test_packed_prefill_overrides_remain_live(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        detect = Mock(return_value=True)
-        monkeypatch.setattr(
-            "vllm_metal.attention.impls.gdn_lazy._load_native_module",
-            lambda: SimpleNamespace(supports_apple10=detect),
-        )
         kernels = GDNLazyKernels(enabled=False)
         for mode, expected in [
             ("auto", True),
@@ -1200,7 +1185,6 @@ class TestLazyRecurrentPrefill:
         ]:
             monkeypatch.setenv("VLLM_METAL_PACKED_GDN_PREFILL", mode)
             assert kernels._packed_prefill_enabled() is expected
-        detect.assert_called_once_with()
 
     @pytest.mark.parametrize(
         ("dtype", "compute_dtype", "state_dtype", "d_v", "n_hv"),

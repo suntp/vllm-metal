@@ -160,8 +160,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable lazy GDN kernels by default.
     # Set to "0" to force the eager conv / C++ recurrent fallback path.
     "VLLM_METAL_GDN_LAZY_KERNELS": _bool("VLLM_METAL_GDN_LAZY_KERNELS", True),
-    # Auto enables packed lazy GDN prefill on Apple10 (M5) GPUs, independently
-    # of NAX. Explicit 0/1 overrides hardware policy, not shape eligibility.
+    # Auto enables packed lazy GDN prefill independently of GPU family and NAX.
+    # Explicit 0 disables packed; all enabled modes retain shape eligibility.
     "VLLM_METAL_PACKED_GDN_PREFILL": _choice(
         "VLLM_METAL_PACKED_GDN_PREFILL", "auto", PACKED_GDN_PREFILL_MODES
     ),
