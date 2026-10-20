@@ -193,7 +193,8 @@ model and no KV cache; unlike n-gram it learns *across* requests, so its
 wins concentrate in agentic and templated workloads where responses re-emit
 near-identical scaffolding (tool-call envelopes, structured lists, repeated
 phrasing). Draft lengths are dynamic per request and per step, bounded by
-`num_speculative_tokens`. Targets are full-attention paged-attention models
+`num_speculative_tokens`. Support is limited to MLX, text-only,
+full-attention paged-attention models
 (hybrid GDN targets keep the ngram-only gate for now). Verification is
 greedy-only and requires `--no-async-scheduling`, like every Metal
 speculator.
@@ -229,14 +230,24 @@ version above for this backend. CI installs this optional dependency and
 runs the suffix tests with the real native cache; it is not required for
 other speculative methods. The package is Apache-2.0 licensed.
 
-Suffix qualification requires fresh, independently started spec-off and
-spec-on greedy runs with identical input token IDs and settings to produce
-identical complete output token sequences. Run
-`tools/check_parity.py --method suffix --top-k 5`; its suffix-versus-target
-gate requires exact token equality and exits unsuccessfully on any
-divergence. `TOP_K_MATCH` and first-divergence logprobs remain diagnostic
-information, not evidence of speculative-decoding equivalence. A divergence
-must be investigated and resolved before suffix decoding is qualified.
+Suffix uses the existing greedy verifier: each accepted draft must match the
+target's argmax at that position, and the first rejection emits the target's
+correction. It does not use approximate acceptance rules. As described in
+vLLM's [numerical limitations](https://docs.vllm.ai/en/latest/features/speculative_decoding/#lossless-guarantees-of-speculative-decoding),
+floating-point and batch-shape effects can still change output tokens between
+ordinary and speculative execution. This integration keeps the default Metal
+model kernels; it does not enable batch-invariant execution or guarantee
+identical complete output sequences. A separate opt-in reproducibility mode
+is outside this feature's scope.
+
+For diagnostics, compare fresh spec-off/spec-on runs with identical input
+token IDs and settings using `tools/check_parity.py --method suffix --top-k 5`.
+The tool retains its stricter check: any suffix-versus-target token divergence
+returns an unsuccessful exit status and is recorded in the summary.
+`TOP_K_MATCH` and first-divergence logprobs do not prove equivalence or identify
+the cause. Investigate divergences to distinguish numerical variation from
+incorrect verification or request state; the diagnostic tool does not change
+the engine's execution mode.
 
 With `--enable-sleep-mode`, suffix decoding supports the worker's
 `sleep(level=1)` → `wake_up()` cycle. Suffix trees remain in host memory

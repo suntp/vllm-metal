@@ -46,8 +46,9 @@ Metal-specific decisions on top of upstream's loop:
 Draft lengths are dynamic per request (the tree speculates as deep as the
 matched suffix and the probability floor allow), bounded by this step's
 scheduled width; the verify half is the established greedy span path
-shared with n-gram. Qualification requires identical output token IDs in
-fresh greedy runs with and without suffix decoding.
+shared with n-gram. As with vLLM's default execution, floating-point and
+batch-shape effects can change output tokens relative to ordinary decode;
+this adapter does not install batch-invariant model kernels.
 """
 
 from __future__ import annotations
