@@ -59,7 +59,7 @@ jobs:
             --repo "$GITHUB_WORKSPACE" \
             --output "$GITHUB_WORKSPACE/timing-results" \
             --wheel-dir "$RUNNER_TEMP/arctic-wheels" \
-            --repeats 3
+            --repeats 5 --measure-cached-flow
       - uses: actions/upload-artifact@v4
         if: always()
         with:

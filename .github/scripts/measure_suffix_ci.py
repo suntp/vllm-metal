@@ -19,6 +19,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--wheel-dir", type=Path, required=True)
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--measure-cached-flow", action="store_true")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     args.wheel_dir.mkdir(parents=True, exist_ok=True)
@@ -136,6 +137,36 @@ def main():
     metrics = {name: statistics.median(p[name] for p in pairs) for name in pairs[0] if name.endswith("_seconds")}
     metrics["wheel_install_seconds"] = statistics.median(r["seconds"] for r in records if r["label"].startswith("wheel-install-"))
     metrics["backend_check_seconds"] = statistics.median(r["seconds"] for r in records if r["label"].startswith("backend-check-"))
+    flows = []
+    if args.measure_cached_flow:
+        for i in range(args.repeats):
+            order = ["baseline", "flow"] if i % 2 == 0 else ["flow", "baseline"]
+            row = {}
+            for arm in order:
+                if arm == "baseline":
+                    row["baseline_seconds"] = pytest_run(
+                        f"flow-baseline-{i}", common, "not slow and not suffix"
+                    )["seconds"]
+                else:
+                    target = args.output / f"flow-installed-{i}"
+                    assert not target.exists()
+                    start = time.perf_counter()
+                    run(f"flow-install-{i}", [
+                        "uv", "pip", "install", "--python", sys.executable,
+                        "--target", str(target), "--no-deps", "--no-index", str(wheel),
+                    ])
+                    env["PYTHONPATH"] = str(target) + os.pathsep + str(args.repo)
+                    run(f"flow-check-{i}", [
+                        sys.executable, "-c",
+                        "from arctic_inference.suffix_decoding import SuffixDecodingCache; "
+                        "SuffixDecodingCache(max_tree_depth=24)",
+                    ])
+                    pytest_run(f"flow-pytest-{i}", common, "not slow")
+                    row["flow_seconds"] = time.perf_counter() - start
+            row["increment_seconds"] = row["flow_seconds"] - row["baseline_seconds"]
+            flows.append(row)
+        metrics["cached_flow_seconds"] = statistics.median(r["flow_seconds"] for r in flows)
+        metrics["cached_flow_increment_seconds"] = statistics.median(r["increment_seconds"] for r in flows)
     summary = {
         "platform": platform.platform(),
         "cpu": subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip(),
@@ -147,6 +178,7 @@ def main():
         "scope": "Focused existing unit suite, not full CI or a model/E2E workload. Installation targets are empty; common dependencies are already prepared. Cache service transfer is excluded.",
         "metrics_median": metrics,
         "pairs": pairs,
+        "cached_flows": flows,
         "records": records,
     }
     (args.output / "RESULTS.json").write_text(json.dumps(summary, indent=2) + "\n")
