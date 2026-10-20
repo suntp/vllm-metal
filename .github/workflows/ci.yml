@@ -111,23 +111,19 @@ jobs:
         restore-keys: |
           native-${{ matrix.os }}-${{ runner.arch }}-${{ steps.native-toolchain.outputs.hash }}-
 
+    - name: Cache Arctic wheel
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/arctic-wheels
+        # Native wheels require an exact toolchain match; do not restore a
+        # wheel built for a different Python, architecture, or SDK.
+        key: arctic-${{ matrix.os }}-${{ runner.arch }}-${{ steps.native-toolchain.outputs.hash }}-${{ hashFiles('scripts/lib.sh', '.github/vllm-release-tag.commit') }}
+
     - name: Test
+      env:
+        VLLM_METAL_ARCTIC_WHEEL_DIR: ${{ runner.temp }}/arctic-wheels
       run: |
         scripts/test.sh
-
-    - name: Test suffix decoding with the optional arctic backend
-      shell: bash
-      run: |
-        set -euo pipefail
-        source .venv-vllm-metal/bin/activate
-        python -m pip install cmake ninja grpcio-tools wheel
-        Python_ROOT_DIR="$VIRTUAL_ENV" Python_FIND_STRATEGY=LOCATION \
-          python -m pip install --no-build-isolation --no-deps \
-          --no-binary arctic-inference arctic-inference==0.3.0
-        # Fail on a missing native backend instead of silently skipping the
-        # real-tree regressions through pytest.importorskip.
-        python -c "from arctic_inference.suffix_decoding import SuffixDecodingCache; SuffixDecodingCache(max_tree_depth=24)"
-        pytest -q tests/test_suffix_proposer.py -rs
 
     # Save only after a fully successful Test step: a build that failed midway
     # would leave an artifact missing, and an exact-key hit never re-saves, so

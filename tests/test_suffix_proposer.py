@@ -316,6 +316,7 @@ class TestSuffixMarshalling:
         assert cache.added == [("r0", [5, 6])]
 
 
+@pytest.mark.suffix
 class TestSuffixRealTree:
     def test_repetitive_history_drafts_continuation(self) -> None:
         pytest.importorskip(
@@ -427,6 +428,7 @@ class TestSuffixBatchShape:
         assert fake.calls[-1][2][0] == [3, 4, 5, 6]
 
 
+@pytest.mark.suffix
 class TestSuffixRealLifecycle:
     _PROMPT = [1, 2, 3, 4, 5, 6, 7, 8]
     _RESPONSE = [20, 21, 22, 23, 24, 25]
