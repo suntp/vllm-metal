@@ -1,0 +1,70 @@
+name: Suffix CI timing
+
+on:
+  push:
+    branches: [suntp/suffix-ci-timing-20261020]
+
+permissions:
+  contents: read
+
+jobs:
+  timing:
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      PYTORCH_ENABLE_MPS_FALLBACK: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Prepare common test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          source scripts/lib.sh
+          setup_dev_env
+          tag=$(read_vllm_release_tag)
+          version="${tag#v}"
+          uv pip install "https://github.com/vllm-project/vllm/releases/download/${tag}/vllm-${version}%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl"
+      - name: Fingerprint Arctic build environment
+        id: toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .venv-vllm-metal/bin/activate
+          {
+            clang --version
+            xcrun -sdk macosx --show-sdk-version
+            python -c 'import sys; print(sys.version)'
+            cat pyproject.toml .github/vllm-release-tag.commit
+            echo "$DEVELOPER_DIR $MACOSX_DEPLOYMENT_TARGET"
+          } > "$RUNNER_TEMP/arctic-toolchain"
+          echo "hash=$(shasum -a 256 "$RUNNER_TEMP/arctic-toolchain" | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - name: Cache Arctic wheel
+        id: arctic-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/arctic-wheels
+          key: suffix-timing-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.hash }}
+      - name: Measure installation and pytest processes
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .venv-vllm-metal/bin/activate
+          python .github/scripts/measure_suffix_ci.py \
+            --repo "$GITHUB_WORKSPACE" \
+            --output "$GITHUB_WORKSPACE/timing-results" \
+            --wheel-dir "$RUNNER_TEMP/arctic-wheels" \
+            --repeats 3
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: suffix-ci-timing
+          path: |
+            timing-results/*.json
+            timing-results/*.xml
+            timing-results/*.log

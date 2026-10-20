@@ -226,9 +226,16 @@ the interpreter so CMake does not select a different Homebrew Python:
 
 Serving without the package installed fails at config time with vLLM's own
 error, which may suggest `arctic-inference==0.1.1`. Use the tested 0.3.0
-version above for this backend. CI installs this optional dependency and
-runs the suffix tests with the real native cache; it is not required for
-other speculative methods. The package is Apache-2.0 licensed.
+version above for this backend. It is not required for other speculative
+methods. The package is Apache-2.0 licensed.
+
+`scripts/test.sh` and CI include the real Arctic tests in the main pytest
+run. CI caches the compiled wheel for the matching toolchain; cache hits
+skip the build tools and source compilation. Local runs keep the wheel in
+the test environment's `arctic-wheels` directory. To omit the optional
+backend for a shorter local check, use `VLLM_METAL_TEST_SUFFIX=0 scripts/test.sh`;
+lightweight suffix unit tests still run. For an already prepared environment,
+`pytest -m suffix tests/test_suffix_proposer.py` runs just the real-backend tests.
 
 Suffix uses the existing greedy verifier: each accepted draft must match the
 target's argmax at that position, and the first rejection emits the target's
