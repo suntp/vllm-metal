@@ -72,8 +72,36 @@ halves live output accumulators without scratch buffers or a reduction pass.
 Complete KV tiles in full Q blocks omit bounds checks; partial Q blocks and
 partial KV tiles retain the guarded loads and masks.
 
-The existing host tile-work hint enables this path with at least four full
+The common host tile-work hint enables this path with at least four full
 Q blocks and eight times as much full-block as partial-block KV-tile work.
-Short or partial-dominated launches, callers without sequence metadata, and
-the MPS launcher retain the original D512 loop. Other head sizes keep their
-existing kernels and selection rules.
+Callers without sequence metadata and the MPS launcher retain the original
+D512 loop.
+
+### Cached-prefix NAX admission
+
+Single-request full-attention prefills have an additional measured admission
+scope on M5 10-core, M5 Pro 20-core and M5 Max 40-core GPUs. Other device
+profiles, multi-request NAX launches and sliding-window attention keep the
+common rule. A native mixed-batch split can apply the extra scope to its
+single-request prefill subset through the existing separate hint.
+
+D512 admits two-slice output accumulation at cached contexts of at least
+2,048 tokens for 8/2 Q/KV heads, and 32,768 tokens for 16/2 or 32/8 heads.
+This also benefits partial Q blocks: the value/output slice reduces the live
+accumulator state even when bounds checks remain necessary. The extension
+requires at least two query rows; single-row attention retains its existing
+route, including YOCO's reduced prefill.
+
+D256 with 24/4 Q/KV heads and block size 16 additionally admits contexts of
+at least 8,192 tokens using these full-block work requirements:
+
+| GPU profile | Minimum full Q blocks | Full / partial KV-tile work |
+|---|---:|---:|
+| M5, 10 cores | 2 | at least 1 |
+| M5 Pro, 20 cores | 2 | at least 2 |
+| M5 Max, 40 cores | 3 | at least 3 |
+
+The common rule still applies first, preserving existing long-prefill
+admission. Hardware facts are captured once per forward; lengths and the
+prefill subset come from the existing CPU attention metadata. D128 keeps
+the common rule because its short-prefill results vary with shape and device.

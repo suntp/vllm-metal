@@ -155,6 +155,8 @@ class PagedAttentionContext:
     # NAX tile counts keyed by (sliding window, first sequence), so whole
     # batches and prefill subsets are shared only by matching layers.
     nax_tile_work: Any = None
+    # Hardware facts shared by this forward's NAX admission decisions.
+    nax_device_profile: tuple[str, int] | None = None
 
 
 def set_context(ctx: PagedAttentionContext) -> None:

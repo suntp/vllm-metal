@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Host-side NAX split/unsplit pipeline choice (vllm_metal.attention.nax_split)."""
 
-import mlx.core as mx
 import pytest
 
-from tests.gqa_test_utils import _primitive
-from tests.test_gqa_decode_routing import _mixed_call, _mixed_inputs
 from vllm_metal.attention.nax_split import (
+    nax_device_profile,
     nax_split_hint,
     nax_split_kwargs,
     nax_tile_work,
@@ -108,7 +106,9 @@ def test_sliding_window_counts_only_tiles_inside_the_window():
     assert nax_split_hint(causal, 128) == 1
     assert nax_split_hint(windowed, 128) == 0
     # A window wider than the context changes nothing.
-    assert nax_tile_work(cu, kv, sliding_window=1 << 20) == causal
+    wide = nax_tile_work(cu, kv, sliding_window=1 << 20)
+    assert wide.full_tiles == causal.full_tiles
+    assert wide.partial_tiles == causal.partial_tiles
 
 
 def test_length_mismatch_is_rejected():
@@ -116,8 +116,115 @@ def test_length_mismatch_is_rejected():
         nax_tile_work([0, 4], [4, 5])
 
 
+_APPEND_DEVICES = (("applegpu_g17g", 10), ("applegpu_g17s", 20), ("applegpu_g17s", 40))
+
+
+@pytest.mark.parametrize(
+    "query,expected",
+    [
+        (65, (0, 0, 0)),
+        (128, (1, 1, 0)),
+        (129, (1, 0, 0)),
+        (192, (1, 1, 1)),
+        (193, (1, 1, 0)),
+    ],
+)
+def test_cached_d256_full_and_partial_blocks_follow_device(query, expected):
+    work = _work([(query, 8192)])
+    for profile, hint in zip(_APPEND_DEVICES, expected, strict=True):
+        assert (
+            nax_split_hint(
+                work, 256, device_profile=profile, num_heads=24, num_kv_heads=4
+            )
+            == hint
+        )
+
+
+@pytest.mark.parametrize(
+    "heads,kv_heads,minimum", [(8, 2, 2048), (16, 2, 32768), (32, 8, 32768)]
+)
+def test_cached_d512_admission_keeps_measured_context_boundary(
+    heads, kv_heads, minimum
+):
+    for profile in _APPEND_DEVICES:
+        kwargs = {
+            "device_profile": profile,
+            "num_heads": heads,
+            "num_kv_heads": kv_heads,
+        }
+        assert nax_split_hint(_work([(63, minimum - 1)]), 512, **kwargs) == 0
+        assert nax_split_hint(_work([(63, minimum)]), 512, **kwargs) == 1
+        assert nax_split_hint(_work([(1, minimum)]), 512, **kwargs) == 0
+
+
+def test_cached_extension_retains_unmeasured_and_windowed_fallbacks():
+    common = {
+        "device_profile": _APPEND_DEVICES[1],
+        "num_heads": 24,
+        "num_kv_heads": 4,
+    }
+    assert nax_split_hint(_work([(128, 8191)]), 256, **common) == 0
+    assert nax_split_hint(_work([(128, 8192)]), 256, block_size=32, **common) == 0
+    assert nax_split_hint(_work([(128, 8192)]), 128, **common) == 0
+    assert (
+        nax_split_hint(
+            _work([(128, 8192)]),
+            256,
+            device_profile=("applegpu_g17s", 0),
+            num_heads=24,
+            num_kv_heads=4,
+        )
+        == 0
+    )
+    assert (
+        nax_split_hint(_work([(2048, 8192)]), 256, device_profile=("unknown", 0)) == 1
+    )
+    assert (
+        nax_split_hint(
+            nax_tile_work([0, 63], [8192 + 63], sliding_window=512),
+            512,
+            device_profile=_APPEND_DEVICES[1],
+            num_heads=8,
+            num_kv_heads=2,
+        )
+        == 0
+    )
+    assert (
+        nax_split_hint(
+            _work([(63, 32768)]),
+            512,
+            device_profile=_APPEND_DEVICES[1],
+            num_heads=16,
+            num_kv_heads=4,
+        )
+        == 0
+    )
+    assert nax_device_profile(object()) == ("", 0)
+
+
+def test_cached_append_hint_describes_only_the_native_prefill_subset():
+    whole = nax_tile_work([0, 1, 64], [32769, 32831])
+    prefill = nax_tile_work([1, 64], [32831])
+    caps = {"nax_split_hint": True, "nax_prefill_split_hint": True}
+    kwargs = {
+        "device_profile": _APPEND_DEVICES[1],
+        "num_heads": 8,
+        "num_kv_heads": 2,
+    }
+    assert nax_split_kwargs(caps, whole, 512, prefill_work=prefill, **kwargs) == {
+        "nax_split_hint": 0,
+        "nax_prefill_split_hint": 1,
+    }
+    assert nax_split_kwargs(
+        {"nax_split_hint": True}, whole, 512, prefill_work=prefill, **kwargs
+    ) == {"nax_split_hint": 0}
+
+
 @pytest.mark.parametrize("head_size", [128, 512])
 def test_native_hint_does_not_change_outputs(head_size):
+    import mlx.core as mx
+
+    from tests.test_gqa_decode_routing import _mixed_call, _mixed_inputs
     from vllm_metal.metal import get_ops
 
     ops = get_ops()
@@ -146,6 +253,8 @@ def test_native_hint_does_not_change_outputs(head_size):
 @pytest.mark.parametrize("name", ["nax_split_hint", "nax_prefill_split_hint"])
 def test_native_rejects_invalid_hints_before_evaluation(name):
     """Public argument validation also runs on machines without NAX."""
+    from tests.test_gqa_decode_routing import _mixed_call, _mixed_inputs
+
     inputs = _mixed_inputs([2], prefill_kv=2, geometry=(8, 2, 128, 16))
     for invalid in (-2, 2):
         with pytest.raises(ValueError, match=name):
@@ -173,20 +282,30 @@ def test_native_prefill_hint_only_applies_after_decode_separation(
     nax_prefill, decode_kv, decode_rows, metadata, separated, head_size
 ):
     """Conflicting hints expose the native subset choice and preserve row ownership."""
+    import mlx.core as mx
+
+    from tests.gqa_test_utils import _primitive
+    from tests.test_gqa_decode_routing import _mixed_call, _mixed_inputs
+
     ops = nax_prefill
+    # D512's cached-append extension must preserve both output slices on a
+    # partial Q block after the native dispatcher removes the decode prefix.
+    prefill_rows = 63 if head_size == 512 else 256
     inputs = _mixed_inputs(
         [decode_kv], prefill_kv=256, geometry=(8, 2, head_size, 16), dtype=mx.float16
     )
     inputs.update(
-        query=mx.random.normal((decode_rows + 256, 8, head_size)).astype(mx.float16),
-        cu_seqlens_q=mx.array([0, decode_rows, decode_rows + 256], mx.int32),
+        query=mx.random.normal((decode_rows + prefill_rows, 8, head_size)).astype(
+            mx.float16
+        ),
+        cu_seqlens_q=mx.array([0, decode_rows, decode_rows + prefill_rows], mx.int32),
         num_decode_tokens=decode_rows,
         nax_split_hint=0,
     )
     if decode_rows > 1:
         inputs.update(
             cu_seqlens_q=mx.array(
-                [*range(decode_rows + 1), decode_rows + 256], mx.int32
+                [*range(decode_rows + 1), decode_rows + prefill_rows], mx.int32
             ),
             block_tables=inputs["block_tables"][mx.array([0] * decode_rows + [1])],
             seq_lens=mx.array(
