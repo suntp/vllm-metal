@@ -4,7 +4,7 @@
 import pytest
 
 from vllm_metal.attention.nax_split import (
-    nax_device_profile,
+    nax_gpu_core_count,
     nax_split_hint,
     nax_split_kwargs,
     nax_tile_work,
@@ -116,9 +116,6 @@ def test_length_mismatch_is_rejected():
         nax_tile_work([0, 4], [4, 5])
 
 
-_APPEND_DEVICES = (("applegpu_g17g", 10), ("applegpu_g17s", 20), ("applegpu_g17s", 40))
-
-
 @pytest.mark.parametrize(
     "query,expected",
     [
@@ -129,88 +126,49 @@ _APPEND_DEVICES = (("applegpu_g17g", 10), ("applegpu_g17s", 20), ("applegpu_g17s
         (193, (1, 1, 0)),
     ],
 )
-def test_cached_d256_full_and_partial_blocks_follow_device(query, expected):
+def test_cached_d256_full_and_partial_work_scales_with_capacity(query, expected):
     work = _work([(query, 8192)])
-    for profile, hint in zip(_APPEND_DEVICES, expected, strict=True):
-        assert (
-            nax_split_hint(
-                work, 256, device_profile=profile, num_heads=24, num_kv_heads=4
-            )
-            == hint
-        )
+    for cores, hint in zip((10, 20, 40), expected, strict=True):
+        assert nax_split_hint(work, 256, gpu_core_count=cores, num_heads=24) == hint
 
 
-@pytest.mark.parametrize(
-    "heads,kv_heads,minimum", [(8, 2, 2048), (16, 2, 32768), (32, 8, 32768)]
-)
-def test_cached_d512_admission_keeps_measured_context_boundary(
-    heads, kv_heads, minimum
-):
-    for profile in _APPEND_DEVICES:
-        kwargs = {
-            "device_profile": profile,
-            "num_heads": heads,
-            "num_kv_heads": kv_heads,
-        }
-        assert nax_split_hint(_work([(63, minimum - 1)]), 512, **kwargs) == 0
-        assert nax_split_hint(_work([(63, minimum)]), 512, **kwargs) == 1
-        assert nax_split_hint(_work([(1, minimum)]), 512, **kwargs) == 0
+def test_d256_parallelism_accepts_head_and_core_counts_without_profiles():
+    # The complete-block grid crosses capacity between 32 and 33 cores.
+    full = _work([(128, 8192)])
+    assert nax_split_hint(full, 256, gpu_core_count=32, num_heads=24) == 1
+    assert nax_split_hint(full, 256, gpu_core_count=33, num_heads=24) == 0
+    # More query heads can also amortize the same partial-block work.
+    tail = _work([(129, 8192)])
+    assert nax_split_hint(tail, 256, gpu_core_count=20, num_heads=24) == 0
+    assert nax_split_hint(tail, 256, gpu_core_count=20, num_heads=26) == 1
 
 
-def test_cached_extension_retains_unmeasured_and_windowed_fallbacks():
-    common = {
-        "device_profile": _APPEND_DEVICES[1],
-        "num_heads": 24,
-        "num_kv_heads": 4,
-    }
-    assert nax_split_hint(_work([(128, 8191)]), 256, **common) == 0
-    assert nax_split_hint(_work([(128, 8192)]), 256, block_size=32, **common) == 0
-    assert nax_split_hint(_work([(128, 8192)]), 128, **common) == 0
-    assert (
-        nax_split_hint(
-            _work([(128, 8192)]),
-            256,
-            device_profile=("applegpu_g17s", 0),
-            num_heads=24,
-            num_kv_heads=4,
-        )
-        == 0
-    )
-    assert (
-        nax_split_hint(_work([(2048, 8192)]), 256, device_profile=("unknown", 0)) == 1
-    )
-    assert (
-        nax_split_hint(
-            nax_tile_work([0, 63], [8192 + 63], sliding_window=512),
-            512,
-            device_profile=_APPEND_DEVICES[1],
-            num_heads=8,
-            num_kv_heads=2,
-        )
-        == 0
-    )
-    assert (
-        nax_split_hint(
-            _work([(63, 32768)]),
-            512,
-            device_profile=_APPEND_DEVICES[1],
-            num_heads=16,
-            num_kv_heads=4,
-        )
-        == 0
-    )
-    assert nax_device_profile(object()) == ("", 0)
+def test_d512_short_append_uses_tile_work_without_head_or_device_profiles():
+    # 63 query rows + these prefixes visit 255 versus 256 KV tiles.
+    below, enough = _work([(63, 8097)]), _work([(63, 8098)])
+    for heads in (1, 7, 37):
+        assert nax_split_hint(below, 512, num_heads=heads) == 0
+        assert nax_split_hint(enough, 512, num_heads=heads) == 1
+    assert nax_split_hint(_work([(1, 32768)]), 512, num_heads=7) == 0
+
+
+def test_append_retains_common_rule_for_small_windowed_or_missing_work():
+    kwargs = {"gpu_core_count": 20, "num_heads": 24}
+    assert nax_split_hint(_work([(128, 2048)]), 256, **kwargs) == 0
+    assert nax_split_hint(_work([(128, 8192)]), 128, **kwargs) == 0
+    assert nax_split_hint(_work([(128, 8192)]), 256, num_heads=24) == 0
+    assert nax_split_hint(_work([(63, 32768)]), 512) == 0
+    assert nax_split_hint(_work([(2048, 8192)]), 256) == 1
+    windowed = nax_tile_work([0, 63], [32768 + 63], sliding_window=32768)
+    assert nax_split_hint(windowed, 512, **kwargs) == 0
+    assert nax_gpu_core_count(object()) == 0
 
 
 def test_cached_append_hint_describes_only_the_native_prefill_subset():
     whole = nax_tile_work([0, 1, 64], [32769, 32831])
     prefill = nax_tile_work([1, 64], [32831])
     caps = {"nax_split_hint": True, "nax_prefill_split_hint": True}
-    kwargs = {
-        "device_profile": _APPEND_DEVICES[1],
-        "num_heads": 8,
-        "num_kv_heads": 2,
-    }
+    kwargs = {"gpu_core_count": 20, "num_heads": 8}
     assert nax_split_kwargs(caps, whole, 512, prefill_work=prefill, **kwargs) == {
         "nax_split_hint": 0,
         "nax_prefill_split_hint": 1,

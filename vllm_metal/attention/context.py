@@ -156,7 +156,7 @@ class PagedAttentionContext:
     # batches and prefill subsets are shared only by matching layers.
     nax_tile_work: Any = None
     # Hardware facts shared by this forward's NAX admission decisions.
-    nax_device_profile: tuple[str, int] | None = None
+    nax_gpu_core_count: int | None = None
 
 
 def set_context(ctx: PagedAttentionContext) -> None:

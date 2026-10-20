@@ -13,16 +13,15 @@ The choice needs every sequence's query and KV length, which the kernel
 dispatcher can only read from the GPU.  The attention context holds them on
 the CPU, so the rule is evaluated here once per forward and passed down as
 ``nax_split_hint``. The common thresholds were calibrated on an M5 Max
-(BF16, block size 16). Measured device/geometry profiles additionally admit
-single-request cached-prefix work. D512's two output slices benefit partial Q
-blocks too; D256 still needs enough full-block work for the executing GPU.
+(BF16, block size 16). Additional single-request admission uses KV-tile work
+and query-head parallelism relative to GPU cores. D512's two output slices
+benefit partial Q blocks too; D256 still needs enough full-block work.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Any
 
 _BQ = 64  # Q rows per NAX threadgroup
@@ -36,17 +35,9 @@ MIN_FULL_BLOCKS = 4
 _MIN_FULL_TO_PARTIAL = {256: 1, 512: 8}
 _MIN_FULL_TO_PARTIAL_DEFAULT = 8
 
-# Additional cached-prefix scope measured on M5 10-core, M5 Pro 20-core,
-# and M5 Max 40-core. Unrecognized devices retain the common rule above.
-# D256 (24/4 heads): minimum full Q blocks, full/partial KV-tile work ratio.
-_APPEND_PROFILES = {
-    ("applegpu_g17g", 10): (2, 1),
-    ("applegpu_g17s", 20): (2, 2),
-    ("applegpu_g17s", 40): (3, 3),
-}
-# D512's two output slices also speed up guarded partial Q blocks. Keep the
-# extension within the measured cached-prefix ranges for each geometry.
-_APPEND_D512_MIN_CONTEXT = {(8, 2): 2048, (16, 2): 32768, (32, 8): 32768}
+# Amortize pipeline overhead with 256 visited KV tiles per Q block on average
+# (roughly an 8K-token span), leaving smaller workloads on the common rule.
+_MIN_APPEND_TILES_PER_Q_BLOCK = 256
 
 
 @dataclass(frozen=True)
@@ -58,23 +49,13 @@ class NaxTileWork:
     partial_tiles: int = 0
     sequences: int = 0
     query_tokens: int = 0
-    min_context: int = 0
     sliding_window: int = -1
 
 
-@lru_cache(maxsize=1)
-def _gpu_architecture() -> str:
-    import mlx.core as mx
-
-    return str(mx.device_info().get("architecture", ""))
-
-
-def nax_device_profile(ops: Any) -> tuple[str, int]:
-    """Hardware facts only; no policy override or GPU array readback."""
+def nax_gpu_core_count(ops: Any) -> int:
+    """Detected capacity, without a device-name policy or guessed fallback."""
     detect = getattr(ops, "detected_gpu_core_count", None)
-    if detect is None:
-        return "", 0
-    return _gpu_architecture(), int(detect())
+    return int(detect()) if detect is not None else 0
 
 
 def _tiles(kv_end: int) -> int:
@@ -101,7 +82,6 @@ def nax_tile_work(
         return max(0, (q_abs + 1 - sliding_window) // _TILE_KV)
 
     full_blocks = full_tiles = partial_tiles = sequences = query_tokens = 0
-    min_context = None
     for i, kv in enumerate(kv_lens):
         q = cu_seqlens[i + 1] - cu_seqlens[i]
         if q <= 0:
@@ -109,7 +89,6 @@ def nax_tile_work(
         context = kv - q
         sequences += 1
         query_tokens += q
-        min_context = context if min_context is None else min(min_context, context)
         n_full = q // _BQ
         full_blocks += n_full
         for j in range(n_full):
@@ -123,7 +102,6 @@ def nax_tile_work(
         partial_tiles,
         sequences,
         query_tokens,
-        0 if min_context is None else min_context,
         sliding_window,
     )
 
@@ -132,10 +110,8 @@ def nax_split_hint(
     work: NaxTileWork,
     head_size: int,
     *,
-    device_profile: tuple[str, int] | None = None,
+    gpu_core_count: int = 0,
     num_heads: int = 0,
-    num_kv_heads: int = 0,
-    block_size: int = 16,
 ) -> int:
     """1 to use the split pipeline, 0 for the original loop."""
     if head_size > 512:
@@ -147,24 +123,28 @@ def nax_split_hint(
     ):
         return 1
     if (
-        device_profile is None
-        or device_profile not in _APPEND_PROFILES
+        num_heads <= 0
         or work.sequences != 1
         or work.query_tokens < 2
         or work.sliding_window >= 0
     ):
         return 0
+    q_blocks = (work.query_tokens + _BQ - 1) // _BQ
+    if work.full_tiles + work.partial_tiles < _MIN_APPEND_TILES_PER_Q_BLOCK * q_blocks:
+        return 0
     if head_size == 512:
-        minimum = _APPEND_D512_MIN_CONTEXT.get((num_heads, num_kv_heads))
-        return int(minimum is not None and work.min_context >= minimum)
-    if (
-        head_size == 256
-        and (num_heads, num_kv_heads, block_size) == (24, 4, 16)
-        and work.min_context >= 8192
-    ):
-        blocks, ratio = _APPEND_PROFILES[device_profile]
+        # Both full and partial Q blocks benefit from smaller accumulators.
+        return 1
+    if head_size == 256 and gpu_core_count > 0:
+        # Require two full blocks and >=1.5 full-block threadgroups per core.
+        # Weight tail work by capacity: sparse full-block grids need a larger
+        # margin to hide the slower guarded tail. Integer products avoid
+        # rounding a device into a discrete profile or dividing by zero tails.
         return int(
-            work.full_blocks >= blocks and work.full_tiles >= ratio * work.partial_tiles
+            work.full_blocks >= 2
+            and 2 * num_heads * work.full_blocks >= 3 * gpu_core_count
+            and 2 * num_heads * work.full_tiles
+            >= 5 * gpu_core_count * work.partial_tiles
         )
     return 0
 
@@ -175,10 +155,8 @@ def nax_split_kwargs(
     head_size: int,
     *,
     prefill_work: NaxTileWork | None = None,
-    device_profile: tuple[str, int] | None = None,
+    gpu_core_count: int = 0,
     num_heads: int = 0,
-    num_kv_heads: int = 0,
-    block_size: int = 16,
 ) -> dict[str, int]:
     """``nax_split_hint`` keyword for one prefill ``paged_attention_primitive``.
 
@@ -195,10 +173,8 @@ def nax_split_kwargs(
         return nax_split_hint(
             batch_work,
             head_size,
-            device_profile=device_profile,
+            gpu_core_count=gpu_core_count,
             num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            block_size=block_size,
         )
 
     kwargs = {"nax_split_hint": hint(work)}

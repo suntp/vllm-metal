@@ -79,29 +79,33 @@ D512 loop.
 
 ### Cached-prefix NAX admission
 
-Single-request full-attention prefills have an additional measured admission
-scope on M5 10-core, M5 Pro 20-core and M5 Max 40-core GPUs. Other device
-profiles, multi-request NAX launches and sliding-window attention keep the
-common rule. A native mixed-batch split can apply the extra scope to its
-single-request prefill subset through the existing separate hint.
+The common long-prefill rule runs first. Additional admission uses workload
+and detected GPU capacity, without a GPU-model or Q/KV-head-combination table.
+Native NAX eligibility still owns architecture, dtype and page support.
 
-D512 admits two-slice output accumulation at cached contexts of at least
-2,048 tokens for 8/2 Q/KV heads, and 32,768 tokens for 16/2 or 32/8 heads.
-This also benefits partial Q blocks: the value/output slice reduces the live
-accumulator state even when bounds checks remain necessary. The extension
-requires at least two query rows; single-row attention retains its existing
-route, including YOCO's reduced prefill.
+The extension is limited to one nonempty full-attention sequence with at
+least two query rows. A native mixed-batch split can apply it to its remaining
+single-request prefill subset through the existing separate hint. Multi-request
+launches, sliding-window attention and YOCO's one-row shared layers retain
+existing admission.
 
-D256 with 24/4 Q/KV heads and block size 16 additionally admits contexts of
-at least 8,192 tokens using these full-block work requirements:
+Let `B = ceil(query_rows / 64)`, `F` be the number of complete 64-row Q blocks,
+and `Wf` / `Wp` count the 32-token KV tiles visited by complete / partial
+Q blocks, including the causal extent. Both D512 and D256 require
+`Wf + Wp >= 256 * B`: an average of 256 KV tiles per Q block, roughly an 8K-token
+span. This conservative floor intentionally leaves smaller workloads unchanged.
 
-| GPU profile | Minimum full Q blocks | Full / partial KV-tile work |
-|---|---:|---:|
-| M5, 10 cores | 2 | at least 1 |
-| M5 Pro, 20 cores | 2 | at least 2 |
-| M5 Max, 40 cores | 3 | at least 3 |
+- **D512:** that work floor is sufficient. Its existing two 256-column output
+  slices reduce live accumulator state for complete and partial Q blocks;
+  partial blocks keep their guards and masks.
+- **D256:** with `H` query heads and `C` detected GPU cores, also require
+  `F >= 2`, `2 * H * F >= 3 * C`, and `2 * H * Wf >= 5 * C * Wp`.
+  The first capacity condition requires at least 1.5 complete-block threadgroups
+  per core. The second gives sparse grids a conservative margin over guarded
+  tail work. When `Wp == 0`, the tail condition passes without division.
+  Missing core counts retain the common D256 rule.
 
-The common rule still applies first, preserving existing long-prefill
-admission. Hardware facts are captured once per forward; lengths and the
-prefill subset come from the existing CPU attention metadata. D128 keeps
-the common rule because its short-prefill results vary with shape and device.
+The same coefficients apply to every head count and supported NAX GPU; KV
+head count is not a policy input. D128 retains the common rule. Hardware
+capacity is captured once per forward, and the tile counts and prefill subset
+come from existing CPU attention metadata without GPU array readback.
