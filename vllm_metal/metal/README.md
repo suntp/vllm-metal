@@ -72,46 +72,48 @@ halves live output accumulators without scratch buffers or a reduction pass.
 Complete KV tiles in full Q blocks omit bounds checks; partial Q blocks and
 partial KV tiles retain the guarded loads and masks.
 
-The common host tile-work hint enables this path with at least four full
-Q blocks and eight times as much full-block as partial-block KV-tile work.
-Callers without sequence metadata and the MPS launcher retain the original
-D512 loop.
+The host chooses the pipeline from CPU sequence metadata. Callers without
+sequence metadata and the MPS launcher retain the original D512 loop.
 
-### Cached-prefix NAX admission
+### NAX prefill admission
 
-The common long-prefill rule runs first. Additional admission uses workload
-and detected GPU capacity, without a GPU-model or Q/KV-head-combination table.
-Native NAX eligibility still owns architecture, dtype and page support.
+A single full-attention request uses one workload score for D64, D96, D128,
+D256 and D512, whether its prefix is empty or cached. There is no prefix-length
+floor, GPU-model table or Q/KV-head-pair table. Native NAX eligibility still
+owns architecture, dtype and page support.
 
-The extension is limited to one nonempty full-attention sequence with at
-least two query rows. A native mixed-batch split can apply it to its remaining
-single-request prefill subset through the existing separate hint. Multi-request
-launches, sliding-window attention and YOCO's one-row shared layers retain
-existing admission.
+Let `F` count complete 64-row Q blocks, and `Wf` / `Wp` count the 32-token KV
+tiles visited by complete / partial Q blocks, including the causal extent.
+`H` is query heads, `C` is detected GPU cores, `d = max(D, 128) / 128` is the
+conservative width weight, and `s = ceil(D / 256)` is the existing kernel's
+output-slice count. The same calculations apply to every supported dimension:
 
-Let `B = ceil(query_rows / 64)`, `F` be the number of complete 64-row Q blocks,
-and `Wf` / `Wp` count the 32-token KV tiles visited by complete / partial
-Q blocks, including the causal extent. `H` is query heads and `C` is detected
-GPU cores. Both D512 and D256 require
-`Wf + Wp >= 256 * B`: an average of 256 KV tiles per Q block, roughly an 8K-token
-span. This conservative floor intentionally leaves smaller workloads unchanged.
+- Four or more complete Q blocks without a partial block receive full credit
+  `Wf`, preserving their established admission even on sparse grids. Otherwise,
+  full-block credit is `Wf * min(1, H*F / (4*C))` when `d*F >= 4` and
+  `H*F >= 1.5*C`; if neither applies it is zero.
+- Output-slice credit is `(s-1) * min(1, C/H) * (Wf+Wp)`.
+- Guarded-tail cost is `8*Wp / d**2`.
+- Select the optimized pipeline when the two credits together exceed or equal
+  the guarded-tail cost plus eight tile-work units.
 
-- **D512:** also require a complete Q block (`F >= 1`), or a partial-only
-  query-head grid no larger than detected GPU capacity (`H <= C`). Two output
-  slices reduce live accumulators, but duplicate QK and softmax. Partial-only
-  blocks have no unguarded full-Q tiles to offset that cost; the capacity gate
-  conservatively retains the original loop for wider partial-only grids,
-  including some that would improve. Partial blocks keep guards and masks.
-- **D256:** also require
-  `F >= 2`, `2 * H * F >= 3 * C`, and `2 * H * Wf >= 5 * C * Wp`.
-  The first capacity condition requires at least 1.5 complete-block threadgroups
-  per core. The second gives sparse grids a conservative margin over guarded
-  tail work. When `Wp == 0`, the tail condition passes without division.
-  Missing core counts retain the common D256 rule.
+These are conservative workload credits, not predicted milliseconds or a
+fitted latency model. Full blocks need enough normalized work and parallel
+threadgroups; the four-groups-per-core weight discounts sparse grids. The
+slice credit discounts duplicate QK/softmax work as query heads outgrow the
+GPU. The small-work margin applies to the combined score, so its effective
+prefix boundary depends on the whole shape rather than a fixed token count.
+Small dimensions share a minimum width weight; this deliberately leaves some
+profitable short requests guarded. Partial Q blocks always retain guards,
+including when output slicing makes their optimized pipeline faster.
 
-The same coefficients apply to every head count and supported NAX GPU; KV
-head count is not a policy input. D64 and D128 retain the common rule:
-`F >= 4` and `Wf >= 8 * Wp`. They receive no additional short-append admission;
-D128 calibration includes regressions, and D64 has no short-append calibration.
-Hardware capacity is captured once per forward, and the tile counts and
-prefill subset come from existing CPU attention metadata without GPU readback.
+The score needs one nonempty full-attention sequence, at least two query rows,
+and known head/core counts. A native mixed-batch split can apply it to its
+remaining single-prefill subset. Multi-request launches, sliding-window
+attention, YOCO one-row shared layers and missing-capacity callers retain the
+established rule: `F >= 4`, with `Wf >= Wp` for D256 or `Wf >= 8*Wp` otherwise.
+Multiple prefills can therefore still select the optimized pipeline.
+
+Hardware capacity is captured once per forward. Tile counts and the prefill
+subset come from existing CPU metadata without GPU readback. The native
+kernel, output slices, cache allocation and decode separation are unchanged.

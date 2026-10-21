@@ -12,10 +12,10 @@ does not fill the GPU enough to hide that.
 The choice needs every sequence's query and KV length, which the kernel
 dispatcher can only read from the GPU.  The attention context holds them on
 the CPU, so the rule is evaluated here once per forward and passed down as
-``nax_split_hint``. The common thresholds were calibrated on an M5 Max
-(BF16, block size 16). Additional single-request admission uses KV-tile work
-and query-head parallelism relative to GPU cores. D512's two output slices
-can benefit partial Q blocks too; D256 still needs enough full-block work.
+``nax_split_hint``. Single-request full attention uses the same conservative
+tile-work score for full and cached prefills at every supported head size.
+It credits complete query blocks and the kernel's output slices separately.
+Windowed, multi-request and legacy callers retain the established rule.
 """
 
 from __future__ import annotations
@@ -34,10 +34,6 @@ MIN_FULL_BLOCKS = 4
 # only ~15%, so the latter needs a much larger share of full-block work.
 _MIN_FULL_TO_PARTIAL = {256: 1, 512: 8}
 _MIN_FULL_TO_PARTIAL_DEFAULT = 8
-
-# Amortize pipeline overhead with 256 visited KV tiles per Q block on average
-# (roughly an 8K-token span), leaving smaller workloads on the common rule.
-_MIN_APPEND_TILES_PER_Q_BLOCK = 256
 
 
 @dataclass(frozen=True)
@@ -116,39 +112,40 @@ def nax_split_hint(
     """1 to use the split pipeline, 0 for the original loop."""
     if head_size > 512:
         return 0
-    factor = _MIN_FULL_TO_PARTIAL.get(head_size, _MIN_FULL_TO_PARTIAL_DEFAULT)
-    if (
-        work.full_blocks >= MIN_FULL_BLOCKS
-        and work.full_tiles >= factor * work.partial_tiles
-    ):
-        return 1
     if (
         num_heads <= 0
+        or gpu_core_count <= 0
         or work.sequences != 1
         or work.query_tokens < 2
         or work.sliding_window >= 0
     ):
-        return 0
-    q_blocks = (work.query_tokens + _BQ - 1) // _BQ
-    if work.full_tiles + work.partial_tiles < _MIN_APPEND_TILES_PER_Q_BLOCK * q_blocks:
-        return 0
-    if head_size == 512:
-        # Partial-only launches cannot use unguarded full-Q tiles. Expanding
-        # an already broad grid can lose to duplicated QK/softmax, so only
-        # add partial-only slices when the original grid is <=1 group/core.
-        return int(work.full_blocks > 0 or num_heads <= gpu_core_count)
-    if head_size == 256 and gpu_core_count > 0:
-        # Require two full blocks and >=1.5 full-block threadgroups per core.
-        # Weight tail work by capacity: sparse full-block grids need a larger
-        # margin to hide the slower guarded tail. Integer products avoid
-        # rounding a device into a discrete profile or dividing by zero tails.
+        factor = _MIN_FULL_TO_PARTIAL.get(head_size, _MIN_FULL_TO_PARTIAL_DEFAULT)
         return int(
-            work.full_blocks >= 2
-            and 2 * num_heads * work.full_blocks >= 3 * gpu_core_count
-            and 2 * num_heads * work.full_tiles
-            >= 5 * gpu_core_count * work.partial_tiles
+            work.full_blocks >= MIN_FULL_BLOCKS
+            and work.full_tiles >= factor * work.partial_tiles
         )
-    return 0
+
+    # A tile-work heuristic, not a latency prediction. Small heads share a
+    # minimum width unit because fixed tile costs dominate their QK/PV work.
+    width = max(head_size, 128) / 128
+    full_groups = num_heads * work.full_blocks
+    full_credit = 0.0
+    if work.full_blocks >= 4 and work.partial_tiles == 0:
+        # Preserve established admission of packed Q blocks on sparse grids.
+        full_credit = float(work.full_tiles)
+    elif width * work.full_blocks >= 4 and 2 * full_groups >= 3 * gpu_core_count:
+        full_credit = work.full_tiles * min(1.0, full_groups / (4 * gpu_core_count))
+
+    # This is the actual output partition, not a shape-specific admission list.
+    # Wider grids receive less credit for duplicating QK and softmax.
+    slices = (head_size + 255) // 256
+    slice_credit = (
+        (slices - 1)
+        * min(1.0, gpu_core_count / num_heads)
+        * (work.full_tiles + work.partial_tiles)
+    )
+    tail_cost = 8 * work.partial_tiles / (width * width)
+    return int(full_credit + slice_credit >= tail_cost + 8)
 
 
 def nax_split_kwargs(

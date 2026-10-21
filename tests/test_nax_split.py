@@ -121,7 +121,7 @@ def test_length_mismatch_is_rejected():
     [
         (65, (0, 0, 0)),
         (128, (1, 1, 0)),
-        (129, (1, 0, 0)),
+        (129, (0, 0, 0)),
         (192, (1, 1, 1)),
         (193, (1, 1, 0)),
     ],
@@ -138,14 +138,15 @@ def test_d256_parallelism_accepts_head_and_core_counts_without_profiles():
     assert nax_split_hint(full, 256, gpu_core_count=32, num_heads=24) == 1
     assert nax_split_hint(full, 256, gpu_core_count=33, num_heads=24) == 0
     # More query heads can also amortize the same partial-block work.
-    tail = _work([(129, 8192)])
-    assert nax_split_hint(tail, 256, gpu_core_count=20, num_heads=24) == 0
-    assert nax_split_hint(tail, 256, gpu_core_count=20, num_heads=26) == 1
+    tail = _work([(193, 8192)])
+    assert nax_split_hint(tail, 256, gpu_core_count=20, num_heads=18) == 0
+    assert nax_split_hint(tail, 256, gpu_core_count=20, num_heads=19) == 1
 
 
 def test_d512_short_append_uses_tile_work_without_head_or_device_profiles():
-    # 63 query rows + these prefixes visit 255 versus 256 KV tiles.
-    below, enough = _work([(63, 8097)]), _work([(63, 8098)])
+    # The same short prefix boundary applies across arbitrary equal-capacity
+    # grids. It follows tile work, without an 8K prefix gate.
+    below, enough = _work([(63, 417)]), _work([(63, 418)])
     for heads in (1, 7, 37):
         kwargs = {"num_heads": heads, "gpu_core_count": heads}
         assert nax_split_hint(below, 512, **kwargs) == 0
@@ -154,14 +155,14 @@ def test_d512_short_append_uses_tile_work_without_head_or_device_profiles():
             nax_split_hint(enough, 512, num_heads=heads, gpu_core_count=heads - 1) == 0
         )
     assert nax_split_hint(enough, 512, num_heads=7) == 0
-    # Complete Q blocks also gain the unguarded tile loop, even with a wide grid.
-    assert nax_split_hint(_work([(64, 8192)]), 512, num_heads=37) == 1
+    # Missing capacity retains the established rule, including for full blocks.
+    assert nax_split_hint(_work([(64, 8192)]), 512, num_heads=37) == 0
     assert nax_split_hint(_work([(1, 32768)]), 512, num_heads=7, gpu_core_count=20) == 0
 
 
-def test_append_retains_common_rule_for_small_windowed_or_missing_work():
+def test_append_metadata_gates_preserve_legacy_admission():
     kwargs = {"gpu_core_count": 20, "num_heads": 24}
-    assert nax_split_hint(_work([(128, 2048)]), 256, **kwargs) == 0
+    assert nax_split_hint(_work([(128, 2048)]), 256, **kwargs) == 1
     assert nax_split_hint(_work([(128, 8192)]), 128, **kwargs) == 0
     assert nax_split_hint(_work([(128, 8192)]), 256, num_heads=24) == 0
     assert nax_split_hint(_work([(63, 32768)]), 512) == 0
@@ -169,6 +170,36 @@ def test_append_retains_common_rule_for_small_windowed_or_missing_work():
     windowed = nax_tile_work([0, 63], [32768 + 63], sliding_window=32768)
     assert nax_split_hint(windowed, 512, **kwargs) == 0
     assert nax_gpu_core_count(object()) == 0
+
+
+@pytest.mark.parametrize(
+    "head_size,query,prefix,expected",
+    [
+        (64, 256, 0, 1),
+        (96, 256, 0, 1),
+        (128, 513, 8192, 0),
+        (256, 128, 512, 1),
+        (512, 257, 0, 1),
+        (512, 63, 512, 1),
+    ],
+)
+def test_full_and_cached_prefill_use_the_same_work_score(
+    head_size, query, prefix, expected
+):
+    # Preserve full-tile admission, reject the measured D128 guarded-tail
+    # regression, and admit profitable short workloads without a prefix floor.
+    assert (
+        nax_split_hint(
+            _work([(query, prefix)]), head_size, num_heads=16, gpu_core_count=20
+        )
+        == expected
+    )
+
+
+def test_packed_query_blocks_keep_admission_on_sparse_grids():
+    assert (
+        nax_split_hint(_work([(256, 2048)]), 64, num_heads=14, gpu_core_count=40) == 1
+    )
 
 
 def test_cached_append_hint_describes_only_the_native_prefill_subset():
