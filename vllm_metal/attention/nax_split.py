@@ -130,9 +130,12 @@ def nax_split_hint(
     width = max(head_size, 128) / 128
     full_groups = num_heads * work.full_blocks
     full_credit = 0.0
-    if work.full_blocks >= 4 and work.partial_tiles == 0:
-        # Preserve established admission of packed Q blocks on sparse grids.
+    startup_margin = 8
+    if work.full_blocks >= MIN_FULL_BLOCKS:
+        # Enough complete blocks retain their full credit, including tails.
+        # Discounting them can disable a previously faster pipeline.
         full_credit = float(work.full_tiles)
+        startup_margin = 0
     elif width * work.full_blocks >= 4 and 2 * full_groups >= 3 * gpu_core_count:
         full_credit = work.full_tiles * min(1.0, full_groups / (4 * gpu_core_count))
 
@@ -145,7 +148,7 @@ def nax_split_hint(
         * (work.full_tiles + work.partial_tiles)
     )
     tail_cost = 8 * work.partial_tiles / (width * width)
-    return int(full_credit + slice_credit >= tail_cost + 8)
+    return int(full_credit + slice_credit >= tail_cost + startup_margin)
 
 
 def nax_split_kwargs(

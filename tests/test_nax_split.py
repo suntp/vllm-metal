@@ -196,9 +196,16 @@ def test_full_and_cached_prefill_use_the_same_work_score(
     )
 
 
-def test_packed_query_blocks_keep_admission_on_sparse_grids():
+@pytest.mark.parametrize(
+    "head_size,heads,query,prefix",
+    [(64, 14, 256, 2048), (256, 36, 257, 0), (256, 10, 257, 1536)],
+)
+def test_complete_blocks_keep_established_admission(head_size, heads, query, prefix):
     assert (
-        nax_split_hint(_work([(256, 2048)]), 64, num_heads=14, gpu_core_count=40) == 1
+        nax_split_hint(
+            _work([(query, prefix)]), head_size, num_heads=heads, gpu_core_count=40
+        )
+        == 1
     )
 
 

@@ -88,21 +88,25 @@ tiles visited by complete / partial Q blocks, including the causal extent.
 conservative width weight, and `s = ceil(D / 256)` is the existing kernel's
 output-slice count. The same calculations apply to every supported dimension:
 
-- Four or more complete Q blocks without a partial block receive full credit
-  `Wf`, preserving their established admission even on sparse grids. Otherwise,
+- Four or more complete Q blocks receive full credit `Wf`, including when
+  a guarded tail is present. Otherwise,
   full-block credit is `Wf * min(1, H*F / (4*C))` when `d*F >= 4` and
   `H*F >= 1.5*C`; if neither applies it is zero.
 - Output-slice credit is `(s-1) * min(1, C/H) * (Wf+Wp)`.
 - Guarded-tail cost is `8*Wp / d**2`.
 - Select the optimized pipeline when the two credits together exceed or equal
-  the guarded-tail cost plus eight tile-work units.
+  the guarded-tail cost plus eight tile-work units for fewer than four complete
+  Q blocks. At four or more complete blocks the extra margin is zero.
 
 These are conservative workload credits, not predicted milliseconds or a
-fitted latency model. Full blocks need enough normalized work and parallel
-threadgroups; the four-groups-per-core weight discounts sparse grids. The
+fitted latency model. Short requests need enough normalized full-block work and parallel
+threadgroups; the four-groups-per-core weight discounts their sparse grids. The
 slice credit discounts duplicate QK/softmax work as query heads outgrow the
-GPU. The small-work margin applies to the combined score, so its effective
-prefix boundary depends on the whole shape rather than a fixed token count.
+GPU. The small-work margin applies only below four complete Q blocks, so its
+effective prefix boundary depends on the whole shape rather than a fixed
+token count. Existing admissions are preserved: small heads keep their
+full/partial work ratio, and for a single full-attention sequence with at least
+four complete Q blocks, `Wf >= 2*Wp` also preserves D256 admission.
 Small dimensions share a minimum width weight; this deliberately leaves some
 profitable short requests guarded. Partial Q blocks always retain guards,
 including when output slicing makes their optimized pipeline faster.
