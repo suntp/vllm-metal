@@ -106,6 +106,8 @@ span. This conservative floor intentionally leaves smaller workloads unchanged.
   Missing core counts retain the common D256 rule.
 
 The same coefficients apply to every head count and supported NAX GPU; KV
-head count is not a policy input. D128 retains the common rule. Hardware
-capacity is captured once per forward, and the tile counts and prefill subset
-come from existing CPU attention metadata without GPU array readback.
+head count is not a policy input. D64 and D128 retain the common rule:
+`F >= 4` and `Wf >= 8 * Wp`. They receive no additional short-append admission;
+D128 calibration includes regressions, and D64 has no short-append calibration.
+Hardware capacity is captured once per forward, and the tile counts and
+prefill subset come from existing CPU attention metadata without GPU readback.
