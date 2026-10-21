@@ -147,9 +147,16 @@ def test_d512_short_append_uses_tile_work_without_head_or_device_profiles():
     # 63 query rows + these prefixes visit 255 versus 256 KV tiles.
     below, enough = _work([(63, 8097)]), _work([(63, 8098)])
     for heads in (1, 7, 37):
-        assert nax_split_hint(below, 512, num_heads=heads) == 0
-        assert nax_split_hint(enough, 512, num_heads=heads) == 1
-    assert nax_split_hint(_work([(1, 32768)]), 512, num_heads=7) == 0
+        kwargs = {"num_heads": heads, "gpu_core_count": heads}
+        assert nax_split_hint(below, 512, **kwargs) == 0
+        assert nax_split_hint(enough, 512, **kwargs) == 1
+        assert (
+            nax_split_hint(enough, 512, num_heads=heads, gpu_core_count=heads - 1) == 0
+        )
+    assert nax_split_hint(enough, 512, num_heads=7) == 0
+    # Complete Q blocks also gain the unguarded tile loop, even with a wide grid.
+    assert nax_split_hint(_work([(64, 8192)]), 512, num_heads=37) == 1
+    assert nax_split_hint(_work([(1, 32768)]), 512, num_heads=7, gpu_core_count=20) == 0
 
 
 def test_append_retains_common_rule_for_small_windowed_or_missing_work():

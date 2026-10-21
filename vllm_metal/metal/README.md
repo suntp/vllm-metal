@@ -91,14 +91,18 @@ existing admission.
 
 Let `B = ceil(query_rows / 64)`, `F` be the number of complete 64-row Q blocks,
 and `Wf` / `Wp` count the 32-token KV tiles visited by complete / partial
-Q blocks, including the causal extent. Both D512 and D256 require
+Q blocks, including the causal extent. `H` is query heads and `C` is detected
+GPU cores. Both D512 and D256 require
 `Wf + Wp >= 256 * B`: an average of 256 KV tiles per Q block, roughly an 8K-token
 span. This conservative floor intentionally leaves smaller workloads unchanged.
 
-- **D512:** that work floor is sufficient. Its existing two 256-column output
-  slices reduce live accumulator state for complete and partial Q blocks;
-  partial blocks keep their guards and masks.
-- **D256:** with `H` query heads and `C` detected GPU cores, also require
+- **D512:** also require a complete Q block (`F >= 1`), or a partial-only
+  query-head grid no larger than detected GPU capacity (`H <= C`). Two output
+  slices reduce live accumulators, but duplicate QK and softmax. Partial-only
+  blocks have no unguarded full-Q tiles to offset that cost; the capacity gate
+  conservatively retains the original loop for wider partial-only grids,
+  including some that would improve. Partial blocks keep guards and masks.
+- **D256:** also require
   `F >= 2`, `2 * H * F >= 3 * C`, and `2 * H * Wf >= 5 * C * Wp`.
   The first capacity condition requires at least 1.5 complete-block threadgroups
   per core. The second gives sparse grids a conservative margin over guarded

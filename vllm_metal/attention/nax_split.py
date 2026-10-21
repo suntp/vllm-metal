@@ -15,7 +15,7 @@ the CPU, so the rule is evaluated here once per forward and passed down as
 ``nax_split_hint``. The common thresholds were calibrated on an M5 Max
 (BF16, block size 16). Additional single-request admission uses KV-tile work
 and query-head parallelism relative to GPU cores. D512's two output slices
-benefit partial Q blocks too; D256 still needs enough full-block work.
+can benefit partial Q blocks too; D256 still needs enough full-block work.
 """
 
 from __future__ import annotations
@@ -133,8 +133,10 @@ def nax_split_hint(
     if work.full_tiles + work.partial_tiles < _MIN_APPEND_TILES_PER_Q_BLOCK * q_blocks:
         return 0
     if head_size == 512:
-        # Both full and partial Q blocks benefit from smaller accumulators.
-        return 1
+        # Partial-only launches cannot use unguarded full-Q tiles. Expanding
+        # an already broad grid can lose to duplicated QK/softmax, so only
+        # add partial-only slices when the original grid is <=1 group/core.
+        return int(work.full_blocks > 0 or num_heads <= gpu_core_count)
     if head_size == 256 and gpu_core_count > 0:
         # Require two full blocks and >=1.5 full-block threadgroups per core.
         # Weight tail work by capacity: sparse full-block grids need a larger
