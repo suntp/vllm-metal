@@ -97,11 +97,31 @@ class _ConstantKernel:
         self.outputs = outputs
         self.grid: tuple[int, int, int] | None = None
         self.output_shapes: list[tuple[int, ...]] | None = None
+        self.template: list[tuple[str, Any]] | None = None
+        self.threadgroup: tuple[int, int, int] | None = None
 
     def __call__(self, **kwargs: Any) -> tuple[mx.array, mx.array]:
         self.grid = kwargs.get("grid")
         self.output_shapes = kwargs.get("output_shapes")
+        self.template = kwargs.get("template")
+        self.threadgroup = kwargs.get("threadgroup")
         return self.outputs
+
+
+def _force_generic_prefill(kernels: GDNLazyKernels) -> None:
+    """Exercise the generic specialization at packed-eligible shapes in tests."""
+    kernel = kernels._recurrent_prefill_kernel
+    assert kernel is not None
+
+    def generic(**kwargs: Any) -> tuple[mx.array, mx.array]:
+        template = dict(kwargs["template"])
+        template["Packed"] = False
+        kwargs["template"] = list(template.items())
+        kwargs["grid"] = (32, template["Dv"], kwargs["grid"][2])
+        kwargs["threadgroup"] = (32, 4, 1)
+        return kernel(**kwargs)
+
+    kernels._recurrent_prefill_kernel = generic
 
 
 class _RecordingStateKernel(_ConstantKernel):
@@ -1110,32 +1130,22 @@ class TestLazyRecurrentPrefill:
         )
 
     @pytest.mark.parametrize(
-        ("mode", "d_k", "d_v", "use_packed"),
+        ("d_k", "d_v", "use_packed"),
         [
-            ("1", 128, 8, True),
-            ("1", 128, 24, True),
-            ("1", 64, 8, False),
-            ("1", 256, 8, False),
-            ("1", 128, 7, False),
-            ("0", 128, 8, False),
-            (None, 128, 8, True),
-            ("auto", 128, 8, True),
-            ("auto", 64, 8, False),
-            ("auto", 128, 7, False),
+            (128, 8, True),
+            (128, 24, True),
+            (64, 8, False),
+            (256, 8, False),
+            (128, 7, False),
         ],
     )
-    def test_packed_prefill_shape_gate_and_mode(
+    def test_prefill_specialization_follows_shape_independently_of_nax(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        mode: str | None,
         d_k: int,
         d_v: int,
         use_packed: bool,
     ) -> None:
-        if mode is None:
-            monkeypatch.delenv("VLLM_METAL_PACKED_GDN_PREFILL", raising=False)
-        else:
-            monkeypatch.setenv("VLLM_METAL_PACKED_GDN_PREFILL", mode)
         monkeypatch.setenv("VLLM_METAL_DISABLE_NAX", "1")
         # Exercise real dispatch with stub kernels and deferred state on CPU.
         with mx.stream(mx.cpu):
@@ -1148,12 +1158,7 @@ class TestLazyRecurrentPrefill:
                 conv_kernel=_RaisingKernel(),
                 conv_prefill_kernel=_RaisingKernel(),
                 recurrent_decode_kernel=_RaisingKernel(),
-                recurrent_prefill_kernel=(
-                    _RaisingKernel() if use_packed else selected_kernel
-                ),
-                recurrent_prefill_packed_kernel=(
-                    selected_kernel if use_packed else _RaisingKernel()
-                ),
+                recurrent_prefill_kernel=selected_kernel,
             ).try_recurrent_prefill(
                 _recurrent_prefill_request(
                     q=mx.zeros((1, 2, 1, d_k)),
@@ -1168,23 +1173,13 @@ class TestLazyRecurrentPrefill:
                 )
             )
             assert result is not None
+            assert dict(selected_kernel.template or [])["Packed"] is use_packed
+            assert selected_kernel.grid == (32, d_v // 8 if use_packed else d_v, 1)
+            assert selected_kernel.threadgroup == (32, 2 if use_packed else 4, 1)
             np.testing.assert_array_equal(np.array(result), 1)
             np.testing.assert_array_equal(
                 np.array(cache.pending_recurrent_state(0, [2])), 9
             )
-
-    def test_packed_prefill_overrides_remain_live(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        kernels = GDNLazyKernels(enabled=False)
-        for mode, expected in [
-            ("auto", True),
-            ("0", False),
-            ("1", True),
-            ("auto", True),
-        ]:
-            monkeypatch.setenv("VLLM_METAL_PACKED_GDN_PREFILL", mode)
-            assert kernels._packed_prefill_enabled() is expected
 
     @pytest.mark.parametrize(
         ("dtype", "compute_dtype", "state_dtype", "d_v", "n_hv"),
@@ -1201,7 +1196,6 @@ class TestLazyRecurrentPrefill:
     )
     def test_packed_prefill_matches_generic_with_ragged_strided_state(
         self,
-        monkeypatch: pytest.MonkeyPatch,
         dtype: mx.Dtype,
         compute_dtype: mx.Dtype | None,
         state_dtype: mx.Dtype,
@@ -1229,7 +1223,9 @@ class TestLazyRecurrentPrefill:
         initial[:, width:] = 99
         results = []
         for packed in (False, True):
-            monkeypatch.setenv("VLLM_METAL_PACKED_GDN_PREFILL", str(int(packed)))
+            kernels = GDNLazyKernels(enabled=True)
+            if not packed:
+                _force_generic_prefill(kernels)
             cache = _make_state_cache(
                 max_seqs=4,
                 num_v_heads=n_hv,
@@ -1243,7 +1239,7 @@ class TestLazyRecurrentPrefill:
                 backing, (4, n_hv, d_v, d_k), (width + 32, d_v * d_k, d_k, 1)
             )
             untouched = np.array(backing.astype(mx.float32))
-            out = GDNLazyKernels(enabled=True).try_recurrent_prefill(
+            out = kernels.try_recurrent_prefill(
                 _recurrent_prefill_request(
                     q=q,
                     k=k,
@@ -1278,7 +1274,6 @@ class TestLazyRecurrentPrefill:
     )
     def test_packed_prefill_continuation_and_deferred_decode_match_full_sequence(
         self,
-        monkeypatch: pytest.MonkeyPatch,
         n_hk: int,
         n_hv: int,
         d_v: int,
@@ -1303,8 +1298,9 @@ class TestLazyRecurrentPrefill:
         ]
         for cache in (full_cache, chunked_cache):
             cache.recurrent_states[0] = mx.array(initial)
-        monkeypatch.setenv("VLLM_METAL_PACKED_GDN_PREFILL", "0")
-        expected = GDNLazyKernels(enabled=True).try_recurrent_prefill(
+        generic_kernels = GDNLazyKernels(enabled=True)
+        _force_generic_prefill(generic_kernels)
+        expected = generic_kernels.try_recurrent_prefill(
             _recurrent_prefill_request(
                 q=q,
                 k=k,
@@ -1318,7 +1314,6 @@ class TestLazyRecurrentPrefill:
         )
         assert expected is not None
         mx.eval(expected, full_cache.recurrent_states[0])
-        monkeypatch.setenv("VLLM_METAL_PACKED_GDN_PREFILL", "1")
         kernels = GDNLazyKernels(enabled=True)
         for indices, slots, lengths in (
             ([0, 1, 7, 8], [3, 1], [0, 2, 4]),
@@ -1710,14 +1705,14 @@ class TestLazyRecurrentPrefill:
         ("d_k", "d_v", "n_hk", "n_hv", "cu_seqlens"),
         [
             (32, 4, 1, 1, [0, 2, 5]),
-            (32, 4, 1, 1, [0, 1, 3]),
+            (64, 7, 1, 1, [0, 1, 3]),
+            (256, 7, 1, 1, [0, 1, 3]),
             (128, 24, 1, 1, [0, 1, 4]),
             pytest.param(128, 128, 2, 6, [0, 1, 4], id="gqa3-fp32"),
         ],
     )
     def test_matches_cpp_recurrent_path_for_prefill(
         self,
-        monkeypatch: pytest.MonkeyPatch,
         d_k: int,
         d_v: int,
         n_hk: int,
@@ -1726,7 +1721,6 @@ class TestLazyRecurrentPrefill:
     ) -> None:
         # Arrange
         _require_metal()
-        monkeypatch.setenv("VLLM_METAL_PACKED_GDN_PREFILL", "1")
         mx.random.seed(2)
         total_tokens = cu_seqlens[-1]
         slot_ids = [1, 0]
@@ -2049,7 +2043,6 @@ class TestGDNLazySharedOwner:
             "gdn_conv1d_silu_prefill_v2",
             "gdn_recurrent_decode_v2",
             "gdn_recurrent_prefill_v2",
-            "gdn_recurrent_prefill_packed_v2",
         ]
 
         monkeypatch.setenv("VLLM_METAL_GDN_LAZY_KERNELS", "0")
@@ -2060,7 +2053,6 @@ class TestGDNLazySharedOwner:
             "gdn_conv1d_silu_prefill_v2",
             "gdn_recurrent_decode_v2",
             "gdn_recurrent_prefill_v2",
-            "gdn_recurrent_prefill_packed_v2",
         ]
 
 

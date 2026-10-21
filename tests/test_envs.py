@@ -63,11 +63,6 @@ import vllm_metal.envs as envs
             "VLLM_METAL_TQ_PREFILL must be one of auto, 0, 1, got 'AUTO'",
         ),
         (
-            "VLLM_METAL_PACKED_GDN_PREFILL",
-            "AUTO",
-            "VLLM_METAL_PACKED_GDN_PREFILL must be one of auto, 0, 1, got 'AUTO'",
-        ),
-        (
             "VLLM_METAL_TQ_PREFILL_MAX_MIB",
             "64MiB",
             "VLLM_METAL_TQ_PREFILL_MAX_MIB must be auto or a nonnegative integer "
@@ -102,9 +97,6 @@ def test_a_bad_value_names_the_variable_and_the_value(
         ("VLLM_METAL_MULTIMODAL_MODE", "text-only", "text-only"),
         ("VLLM_MLX_DEVICE", "cpu", "cpu"),
         ("VLLM_METAL_TQ_PREFILL", "1", "1"),
-        ("VLLM_METAL_PACKED_GDN_PREFILL", "auto", "auto"),
-        ("VLLM_METAL_PACKED_GDN_PREFILL", "1", "1"),
-        ("VLLM_METAL_PACKED_GDN_PREFILL", "0", "0"),
         ("VLLM_METAL_TQ_PREFILL_MAX_MIB", "auto", "auto"),
         ("VLLM_METAL_TQ_PREFILL_MAX_MIB", "0", 0),
         ("VLLM_METAL_TQ_PREFILL_MAX_MIB", "256", 256),
