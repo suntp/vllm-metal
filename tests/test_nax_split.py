@@ -167,6 +167,15 @@ def test_prefix_reuse_counts_complete_scheduler_pages_only():
         ([(1, 255)] * 4 + [(128, 8192)], 96, 32, 32, 40, 0),
         ([(128, 32768)], 128, 18, 3, 40, 0),
         ([(128, 32768)], 128, 27, 1, 40, 1),
+        ([(64, 8192)] * 2, 96, 32, 32, 20, 0),
+        (
+            [(1, 127), (1, 255), (1, 383), (128, 6144), (255, 128), (31, 768)],
+            256,
+            13,
+            13,
+            40,
+            1,
+        ),
     ],
     ids=[
         "single-full-blocks",
@@ -177,6 +186,8 @@ def test_prefix_reuse_counts_complete_scheduler_pages_only():
         "decode-passengers",
         "underfilled-grid",
         "shared-kv-stream",
+        "no-margin-independent-streams",
+        "wide-groups-with-decode-passengers",
     ],
 )
 def test_batch_score_accounts_for_work_and_capacity(
