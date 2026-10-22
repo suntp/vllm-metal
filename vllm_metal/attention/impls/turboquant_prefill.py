@@ -325,7 +325,9 @@ def _turboquant_prefill_plan(
     fallback_ids = [i for i in range(len(lengths)) if i not in selected]
     query_order: list[int] = []
 
-    def batch(ids: list[int], tables: mx.array) -> _AttentionBatch:
+    def batch(
+        ids: list[int], tables: mx.array, host_tables: list[list[int]] | None = None
+    ) -> _AttentionBatch:
         if not fallback_ids:
             # The whole batch keeps its original query order and metadata.
             return _AttentionBatch(
@@ -334,7 +336,12 @@ def _turboquant_prefill_plan(
                 meta.seq_lens,
                 meta.cu_seqlens_q,
                 meta.max_seq_len,
-                nax_tile_work(cu_seqlens, ctx.context_lens),
+                nax_tile_work(
+                    cu_seqlens,
+                    ctx.context_lens,
+                    block_tables=host_tables,
+                    block_size=kernel_bs,
+                ),
             )
         indices = [q for i in ids for q in range(cu_seqlens[i], cu_seqlens[i + 1])]
         query_order.extend(indices)
@@ -348,11 +355,11 @@ def _turboquant_prefill_plan(
             mx.array(kv_lens, dtype=mx.int32),
             mx.array(cu, dtype=mx.int32),
             max(kv_lens),
-            nax_tile_work(cu, kv_lens),
+            nax_tile_work(cu, kv_lens, block_tables=host_tables, block_size=kernel_bs),
         )
 
     tables = mx.array([row + [0] * (table_width - len(row)) for row in rows], mx.int32)
-    prefill = batch(prefill_ids, tables)
+    prefill = batch(prefill_ids, tables, rows)
     fallback = (
         batch(fallback_ids, meta.block_tables[mx.array(fallback_ids, mx.int32)])
         if fallback_ids

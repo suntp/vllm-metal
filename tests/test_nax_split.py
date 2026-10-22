@@ -130,6 +130,32 @@ def test_sequence_boundaries_retain_kv_loop_depth():
     assert nax_split_hint(multiple, 96, **kwargs) == 0
 
 
+def test_shared_cached_pages_do_not_count_as_independent_streams():
+    cu, kv = [64 * i for i in range(6)], [576] * 5
+    independent = nax_tile_work(cu, kv)
+    shared = nax_tile_work(
+        cu,
+        kv,
+        block_tables=[[*range(8), 8 + i] for i in range(5)],
+        block_size=64,
+    )
+    assert shared.full_stream_tiles == independent.full_stream_tiles == 90
+    assert shared.repeated_prefix_tiles == 64
+    kwargs = {"num_heads": 4, "num_kv_heads": 4, "gpu_core_count": 4}
+    assert nax_split_hint(independent, 128, **kwargs) == 0
+    assert nax_split_hint(shared, 128, **kwargs) == 1
+
+
+def test_prefix_reuse_counts_complete_scheduler_pages_only():
+    kwargs = {"block_tables": [[5, 6], [5, 7]], "block_size": 784}
+    work = nax_tile_work([0, 64, 128], [896, 896], **kwargs)
+    # 832 cached tokens: only the complete 784-token page is shared.
+    assert work.full_stream_tiles == 56
+    assert work.repeated_prefix_tiles == 784 / 32
+    windowed = nax_tile_work([0, 64, 128], [896, 896], 128, **kwargs)
+    assert windowed.repeated_prefix_tiles == 0
+
+
 @pytest.mark.parametrize(
     "seqs,dimension,heads,kv_heads,cores,expected",
     [

@@ -90,10 +90,12 @@ complete block. Define:
 
 - `F = sum(Fi)`, `Wf = sum(Wfi)`, `Wp = sum(Wpi)`.
 - `U = sum(Wfi / Fi for Fi > 0)`: the sum of per-sequence mean KV-loop depths.
+- `R`: repeated cached-page footprint among those complete-block streams,
+  in 32-token tile units, counted from the existing CPU page tables.
 - `H`, `K`, `C`: query heads, KV heads and detected GPU cores.
 - `d = max(D, 128) / 128`, `s = ceil(D / 256)`.
 - `r = sqrt(H/K)+1`: a conservative shared-KV reuse weight.
-- `p = H*F / C + 3*(s-1)`: a shared capacity score for complete blocks and
+- `p = d*H*F / C + 3*(s-1)`: a shared capacity score for complete blocks and
   the kernel's actual output slices. A nonpositive score keeps the original loop.
 
 The final choice is one net-benefit comparison:
@@ -101,12 +103,14 @@ The final choice is one net-benefit comparison:
 ```text
 benefit = d² * [Wf + (s-1) * min(1, C/H) * (Wf+Wp)]
 guarded_cost = 8*Wp * max(3*(1+K/H)/p, 1/r)
-stream_cost = 10*(D/128)*U / [r * min(3, p)]
-split = benefit >= max(guarded_cost, stream_cost)
+stream_cost = 8*(D/128)*(U-R) / [r * min(3, p)]
+split = benefit > max(guarded_cost, stream_cost)
 ```
 
 `U` prevents independent short KV streams from being mistaken for one long
-prefill merely because their aggregate tile counts match. The stream term
+prefill merely because their aggregate tile counts match. Shared cached pages
+reduce the distinct footprint to `U-R`. This estimates the working set, not
+DRAM traffic: cache lines can still be fetched more than once. The stream term
 accounts for width and partial reuse of KV across query heads; its capacity
 discount stops at saturation. Guarded work retains a KV-traffic floor even
 when a larger batch supplies many parallel blocks. The slice term accounts for the existing
@@ -122,6 +126,7 @@ Pure decode and YOCO one-row views retain their decode routes. Sliding-window
 attention and callers missing head/core metadata keep the established rule:
 `F >= 4`, with `Wf >= Wp` for D256 or `Wf >= 8*Wp` otherwise.
 
-Hardware capacity is captured once per forward. Tile counts and the prefill
-subset come from existing CPU metadata without GPU readback. The native
+Hardware capacity is captured once per forward. Tile counts, shared-page
+footprints and the prefill subset come from existing CPU metadata without
+GPU readback, memoized separately for each KV group and block size. The native
 kernel, output slices, cache allocation and decode separation are unchanged.

@@ -1075,12 +1075,19 @@ def sdpa_forward(
                     ctx.nax_tile_work = {}
 
                 def tile_work(first_seq: int):
-                    key = (layer_sliding_window, first_seq)
+                    key = (
+                        layer_sliding_window,
+                        first_seq,
+                        group_index,
+                        cache_block_size,
+                    )
                     if key not in ctx.nax_tile_work:
                         ctx.nax_tile_work[key] = nax_tile_work(
                             ctx.cu_seqlens[first_seq:],
                             ctx.context_lens[first_seq:],
                             layer_sliding_window,
+                            block_tables=raw_block_tables[first_seq:],
+                            block_size=cache_block_size,
                         )
                     return ctx.nax_tile_work[key]
 
