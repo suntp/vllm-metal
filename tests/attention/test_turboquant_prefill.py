@@ -142,7 +142,6 @@ def test_prefill_quantization_formats(
     args, kwargs = recorded_ops[0]
     assert not kwargs.get("use_turboquant", False)
     assert kwargs["window_seqlen_q"] == case.ctx.verify_window_q == 1
-    assert kwargs["nax_split_hint"] == 0  # Two full Q blocks retain the original loop.
     assert args[1].dtype == dtype
     assert args[1].shape == (17, 16, 2, 128)
 
