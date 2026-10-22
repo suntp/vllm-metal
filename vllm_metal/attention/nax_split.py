@@ -12,16 +12,18 @@ does not fill the GPU enough to hide that.
 The choice needs every sequence's query and KV length, which the kernel
 dispatcher can only read from the GPU.  The attention context holds them on
 the CPU, so the rule is evaluated here once per forward and passed down as
-``nax_split_hint``. Single-request full attention uses the same conservative
-tile-work score for full and cached prefills at every supported head size.
-It credits complete query blocks and the kernel's output slices separately.
-Windowed, multi-request and legacy callers retain the established rule.
+``nax_split_hint``. Full attention uses one batch work score for full and
+cached prefills at every supported head size. Per-sequence loop depth keeps
+many short requests distinct from one long request with the same tile count.
+Native dispatch decides whether to use the whole-batch or prefill-subset score.
+Windowed attention and callers missing layout metadata retain the legacy rule.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from math import sqrt
 from typing import Any
 
 _BQ = 64  # Q rows per NAX threadgroup
@@ -46,6 +48,8 @@ class NaxTileWork:
     sequences: int = 0
     query_tokens: int = 0
     sliding_window: int = -1
+    # Sum of each sequence's mean KV-loop length over its complete Q blocks.
+    full_stream_tiles: float = 0.0
 
 
 def nax_gpu_core_count(ops: Any) -> int:
@@ -78,6 +82,7 @@ def nax_tile_work(
         return max(0, (q_abs + 1 - sliding_window) // _TILE_KV)
 
     full_blocks = full_tiles = partial_tiles = sequences = query_tokens = 0
+    full_stream_tiles = 0.0
     for i, kv in enumerate(kv_lens):
         q = cu_seqlens[i + 1] - cu_seqlens[i]
         if q <= 0:
@@ -87,9 +92,13 @@ def nax_tile_work(
         query_tokens += q
         n_full = q // _BQ
         full_blocks += n_full
+        sequence_full_tiles = 0
         for j in range(n_full):
             start = context + j * _BQ
-            full_tiles += _tiles(start + _BQ) - first_tile(start)
+            sequence_full_tiles += _tiles(start + _BQ) - first_tile(start)
+        full_tiles += sequence_full_tiles
+        if n_full:
+            full_stream_tiles += sequence_full_tiles / n_full
         if q % _BQ:
             partial_tiles += _tiles(kv) - first_tile(context + n_full * _BQ)
     return NaxTileWork(
@@ -99,6 +108,7 @@ def nax_tile_work(
         sequences,
         query_tokens,
         sliding_window,
+        full_stream_tiles,
     )
 
 
@@ -108,6 +118,7 @@ def nax_split_hint(
     *,
     gpu_core_count: int = 0,
     num_heads: int = 0,
+    num_kv_heads: int = 0,
 ) -> int:
     """1 to use the split pipeline, 0 for the original loop."""
     if head_size > 512:
@@ -115,8 +126,8 @@ def nax_split_hint(
     if (
         num_heads <= 0
         or gpu_core_count <= 0
-        or work.sequences != 1
-        or work.query_tokens < 2
+        or num_kv_heads <= 0
+        or work.query_tokens <= work.sequences
         or work.sliding_window >= 0
     ):
         factor = _MIN_FULL_TO_PARTIAL.get(head_size, _MIN_FULL_TO_PARTIAL_DEFAULT)
@@ -125,30 +136,36 @@ def nax_split_hint(
             and work.full_tiles >= factor * work.partial_tiles
         )
 
-    # A tile-work heuristic, not a latency prediction. Small heads share a
-    # minimum width unit because fixed tile costs dominate their QK/PV work.
+    # A calibrated work score, not a latency prediction. The complete-block
+    # grid and actual output slices share one capacity estimate across shapes.
     width = max(head_size, 128) / 128
-    full_groups = num_heads * work.full_blocks
-    full_credit = 0.0
-    startup_margin = 8
-    if work.full_blocks >= MIN_FULL_BLOCKS:
-        # Enough complete blocks retain their full credit, including tails.
-        # Discounting them can disable a previously faster pipeline.
-        full_credit = float(work.full_tiles)
-        startup_margin = 0
-    elif width * work.full_blocks >= 4 and 2 * full_groups >= 3 * gpu_core_count:
-        full_credit = work.full_tiles * min(1.0, full_groups / (4 * gpu_core_count))
-
-    # This is the actual output partition, not a shape-specific admission list.
-    # Wider grids receive less credit for duplicating QK and softmax.
     slices = (head_size + 255) // 256
-    slice_credit = (
-        (slices - 1)
-        * min(1.0, gpu_core_count / num_heads)
-        * (work.full_tiles + work.partial_tiles)
+    parallelism = num_heads * work.full_blocks / gpu_core_count + 3 * (slices - 1)
+    if parallelism <= 0:
+        return 0
+
+    slice_credit = (slices - 1) * min(1.0, gpu_core_count / num_heads)
+    benefit = (
+        width
+        * width
+        * (work.full_tiles + slice_credit * (work.full_tiles + work.partial_tiles))
     )
-    tail_cost = 8 * work.partial_tiles / (width * width)
-    return int(full_credit + slice_credit >= tail_cost + startup_margin)
+    reuse = sqrt(num_heads / num_kv_heads) + 1
+    # A larger grid cannot make the guarded KV traffic disappear.
+    guarded_cost = (
+        8
+        * work.partial_tiles
+        * max(3 * (1 + num_kv_heads / num_heads) / parallelism, 1 / reuse)
+    )
+    # Stream bytes scale with D. Discount shared KV reads conservatively rather
+    # than assuming perfect reuse across GQA heads; cap occupancy at saturation.
+    stream_cost = (
+        10
+        * (head_size / 128)
+        * work.full_stream_tiles
+        / (reuse * min(3.0, parallelism))
+    )
+    return int(benefit >= max(guarded_cost, stream_cost))
 
 
 def nax_split_kwargs(
@@ -159,6 +176,7 @@ def nax_split_kwargs(
     prefill_work: NaxTileWork | None = None,
     gpu_core_count: int = 0,
     num_heads: int = 0,
+    num_kv_heads: int = 0,
 ) -> dict[str, int]:
     """``nax_split_hint`` keyword for one prefill ``paged_attention_primitive``.
 
@@ -177,6 +195,7 @@ def nax_split_kwargs(
             head_size,
             gpu_core_count=gpu_core_count,
             num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
         )
 
     kwargs = {"nax_split_hint": hint(work)}

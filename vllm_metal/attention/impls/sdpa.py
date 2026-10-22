@@ -990,6 +990,7 @@ def sdpa_forward(
                     q_3d.shape[2],
                     gpu_core_count=ctx.nax_gpu_core_count,
                     num_heads=q_3d.shape[1],
+                    num_kv_heads=cache_kv_heads,
                 ),
             )
             if plan.fallback is not None:
@@ -1099,6 +1100,7 @@ def sdpa_forward(
                     prefill_work=prefill_work,
                     gpu_core_count=ctx.nax_gpu_core_count,
                     num_heads=q_3d.shape[1],
+                    num_kv_heads=cache_kv_heads,
                 )
             )
         out = ops.paged_attention_primitive(

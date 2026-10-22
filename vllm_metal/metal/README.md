@@ -77,46 +77,50 @@ sequence metadata and the MPS launcher retain the original D512 loop.
 
 ### NAX prefill admission
 
-A single full-attention request uses one workload score for D64, D96, D128,
-D256 and D512, whether its prefix is empty or cached. There is no prefix-length
-floor, GPU-model table or Q/KV-head-pair table. Native NAX eligibility still
-owns architecture, dtype and page support.
+Full-attention batches use the same workload score for D64, D96, D128, D256
+and D512. It applies to single and multiple prefills, including cached
+appends and mixed decode/prefill batches. There is no prefix-length floor,
+device-name table or Q/KV-head-pair table. Native eligibility still owns
+architecture, dtype, page support and whether decode is separated.
 
-Let `F` count complete 64-row Q blocks, and `Wf` / `Wp` count the 32-token KV
-tiles visited by complete / partial Q blocks, including the causal extent.
-`H` is query heads, `C` is detected GPU cores, `d = max(D, 128) / 128` is the
-conservative width weight, and `s = ceil(D / 256)` is the existing kernel's
-output-slice count. The same calculations apply to every supported dimension:
+For each sequence, count complete 64-row Q blocks `Fi` and the 32-token KV
+tiles visited by complete / partial Q blocks, `Wfi` / `Wpi`. Keep the causal
+extent of each sequence; query rows from different requests never form one
+complete block. Define:
 
-- Four or more complete Q blocks receive full credit `Wf`, including when
-  a guarded tail is present. Otherwise,
-  full-block credit is `Wf * min(1, H*F / (4*C))` when `d*F >= 4` and
-  `H*F >= 1.5*C`; if neither applies it is zero.
-- Output-slice credit is `(s-1) * min(1, C/H) * (Wf+Wp)`.
-- Guarded-tail cost is `8*Wp / d**2`.
-- Select the optimized pipeline when the two credits together exceed or equal
-  the guarded-tail cost plus eight tile-work units for fewer than four complete
-  Q blocks. At four or more complete blocks the extra margin is zero.
+- `F = sum(Fi)`, `Wf = sum(Wfi)`, `Wp = sum(Wpi)`.
+- `U = sum(Wfi / Fi for Fi > 0)`: the sum of per-sequence mean KV-loop depths.
+- `H`, `K`, `C`: query heads, KV heads and detected GPU cores.
+- `d = max(D, 128) / 128`, `s = ceil(D / 256)`.
+- `r = sqrt(H/K)+1`: a conservative shared-KV reuse weight.
+- `p = H*F / C + 3*(s-1)`: a shared capacity score for complete blocks and
+  the kernel's actual output slices. A nonpositive score keeps the original loop.
 
-These are conservative workload credits, not predicted milliseconds or a
-fitted latency model. Short requests need enough normalized full-block work and parallel
-threadgroups; the four-groups-per-core weight discounts their sparse grids. The
-slice credit discounts duplicate QK/softmax work as query heads outgrow the
-GPU. The small-work margin applies only below four complete Q blocks, so its
-effective prefix boundary depends on the whole shape rather than a fixed
-token count. Existing admissions are preserved: small heads keep their
-full/partial work ratio, and for a single full-attention sequence with at least
-four complete Q blocks, `Wf >= 2*Wp` also preserves D256 admission.
-Small dimensions share a minimum width weight; this deliberately leaves some
-profitable short requests guarded. Partial Q blocks always retain guards,
-including when output slicing makes their optimized pipeline faster.
+The final choice is one net-benefit comparison:
 
-The score needs one nonempty full-attention sequence, at least two query rows,
-and known head/core counts. A native mixed-batch split can apply it to its
-remaining single-prefill subset. Multi-request launches, sliding-window
-attention, YOCO one-row shared layers and missing-capacity callers retain the
-established rule: `F >= 4`, with `Wf >= Wp` for D256 or `Wf >= 8*Wp` otherwise.
-Multiple prefills can therefore still select the optimized pipeline.
+```text
+benefit = d² * [Wf + (s-1) * min(1, C/H) * (Wf+Wp)]
+guarded_cost = 8*Wp * max(3*(1+K/H)/p, 1/r)
+stream_cost = 10*(D/128)*U / [r * min(3, p)]
+split = benefit >= max(guarded_cost, stream_cost)
+```
+
+`U` prevents independent short KV streams from being mistaken for one long
+prefill merely because their aggregate tile counts match. The stream term
+accounts for width and partial reuse of KV across query heads; its capacity
+discount stops at saturation. Guarded work retains a KV-traffic floor even
+when a larger batch supplies many parallel blocks. The slice term accounts for the existing
+register-pressure reduction and repeated QK/softmax work. These shared
+coefficients form an empirical work score, not predicted milliseconds or a
+measured occupancy value. Partial Q blocks and partial KV tiles retain guards.
+
+The host supplies scores for both the whole batch and the potential prefill
+suffix. Only native dispatch decides whether ordinary decode rows are split
+off, and consumes the suffix score only in that case. This supports a suffix
+containing multiple prefills without duplicating the native decode-work gate.
+Pure decode and YOCO one-row views retain their decode routes. Sliding-window
+attention and callers missing head/core metadata keep the established rule:
+`F >= 4`, with `Wf >= Wp` for D256 or `Wf >= 8*Wp` otherwise.
 
 Hardware capacity is captured once per forward. Tile counts and the prefill
 subset come from existing CPU metadata without GPU readback. The native

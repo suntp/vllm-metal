@@ -116,110 +116,122 @@ def test_length_mismatch_is_rejected():
         nax_tile_work([0, 4], [4, 5])
 
 
-@pytest.mark.parametrize(
-    "query,expected",
-    [
-        (65, (0, 0, 0)),
-        (128, (1, 1, 0)),
-        (129, (0, 0, 0)),
-        (192, (1, 1, 1)),
-        (193, (1, 1, 0)),
-    ],
-)
-def test_cached_d256_full_and_partial_work_scales_with_capacity(query, expected):
-    work = _work([(query, 8192)])
-    for cores, hint in zip((10, 20, 40), expected, strict=True):
-        assert nax_split_hint(work, 256, gpu_core_count=cores, num_heads=24) == hint
-
-
-def test_d256_parallelism_accepts_head_and_core_counts_without_profiles():
-    # The complete-block grid crosses capacity between 32 and 33 cores.
-    full = _work([(128, 8192)])
-    assert nax_split_hint(full, 256, gpu_core_count=32, num_heads=24) == 1
-    assert nax_split_hint(full, 256, gpu_core_count=33, num_heads=24) == 0
-    # More query heads can also amortize the same partial-block work.
-    tail = _work([(193, 8192)])
-    assert nax_split_hint(tail, 256, gpu_core_count=20, num_heads=18) == 0
-    assert nax_split_hint(tail, 256, gpu_core_count=20, num_heads=19) == 1
-
-
-def test_d512_short_append_uses_tile_work_without_head_or_device_profiles():
-    # The same short prefix boundary applies across arbitrary equal-capacity
-    # grids. It follows tile work, without an 8K prefix gate.
-    below, enough = _work([(63, 417)]), _work([(63, 418)])
-    for heads in (1, 7, 37):
-        kwargs = {"num_heads": heads, "gpu_core_count": heads}
-        assert nax_split_hint(below, 512, **kwargs) == 0
-        assert nax_split_hint(enough, 512, **kwargs) == 1
-        assert (
-            nax_split_hint(enough, 512, num_heads=heads, gpu_core_count=heads - 1) == 0
-        )
-    assert nax_split_hint(enough, 512, num_heads=7) == 0
-    # Missing capacity retains the established rule, including for full blocks.
-    assert nax_split_hint(_work([(64, 8192)]), 512, num_heads=37) == 0
-    assert nax_split_hint(_work([(1, 32768)]), 512, num_heads=7, gpu_core_count=20) == 0
-
-
-def test_append_metadata_gates_preserve_legacy_admission():
-    kwargs = {"gpu_core_count": 20, "num_heads": 24}
-    assert nax_split_hint(_work([(128, 2048)]), 256, **kwargs) == 1
-    assert nax_split_hint(_work([(128, 8192)]), 128, **kwargs) == 0
-    assert nax_split_hint(_work([(128, 8192)]), 256, num_heads=24) == 0
-    assert nax_split_hint(_work([(63, 32768)]), 512) == 0
-    assert nax_split_hint(_work([(2048, 8192)]), 256) == 1
-    windowed = nax_tile_work([0, 63], [32768 + 63], sliding_window=32768)
-    assert nax_split_hint(windowed, 512, **kwargs) == 0
-    assert nax_gpu_core_count(object()) == 0
+def test_sequence_boundaries_retain_kv_loop_depth():
+    # Equal aggregate work must not turn four independent one-block streams
+    # into the better-amortized stream of one four-block prefill.
+    single = _work([(256, 0)])
+    multiple = _work([(64, 96)] * 4)
+    for work in (single, multiple):
+        assert (work.full_blocks, work.full_tiles, work.partial_tiles) == (4, 20, 0)
+    assert single.full_stream_tiles == 5
+    assert multiple.full_stream_tiles == 20
+    kwargs = {"num_heads": 32, "num_kv_heads": 32, "gpu_core_count": 20}
+    assert nax_split_hint(single, 96, **kwargs) == 1
+    assert nax_split_hint(multiple, 96, **kwargs) == 0
 
 
 @pytest.mark.parametrize(
-    "head_size,query,prefix,expected",
+    "seqs,dimension,heads,kv_heads,cores,expected",
     [
-        (64, 256, 0, 1),
-        (96, 256, 0, 1),
-        (128, 513, 8192, 0),
-        (256, 128, 512, 1),
-        (512, 257, 0, 1),
-        (512, 63, 512, 1),
+        ([(128, 8192)], 256, 24, 4, 40, 1),
+        ([(129, 8192)], 256, 24, 4, 40, 0),
+        ([(257, 0)], 256, 36, 9, 40, 1),
+        ([(63, 8192)] * 4, 512, 8, 2, 10, 1),
+        ([(64, 8192)] * 4, 64, 14, 2, 40, 1),
+        ([(1, 255)] * 4 + [(128, 8192)], 96, 32, 32, 40, 0),
+        ([(128, 32768)], 128, 18, 3, 40, 0),
+        ([(128, 32768)], 128, 27, 1, 40, 1),
+    ],
+    ids=[
+        "single-full-blocks",
+        "expensive-tail",
+        "established-complete-blocks",
+        "multiple-output-slices",
+        "multiple-full-blocks",
+        "decode-passengers",
+        "underfilled-grid",
+        "shared-kv-stream",
     ],
 )
-def test_full_and_cached_prefill_use_the_same_work_score(
-    head_size, query, prefix, expected
+def test_batch_score_accounts_for_work_and_capacity(
+    seqs, dimension, heads, kv_heads, cores, expected
 ):
-    # Preserve full-tile admission, reject the measured D128 guarded-tail
-    # regression, and admit profitable short workloads without a prefix floor.
     assert (
         nax_split_hint(
-            _work([(query, prefix)]), head_size, num_heads=16, gpu_core_count=20
+            _work(seqs),
+            dimension,
+            num_heads=heads,
+            num_kv_heads=kv_heads,
+            gpu_core_count=cores,
         )
         == expected
     )
 
 
-@pytest.mark.parametrize(
-    "head_size,heads,query,prefix",
-    [(64, 14, 256, 2048), (256, 36, 257, 0), (256, 10, 257, 1536)],
-)
-def test_complete_blocks_keep_established_admission(head_size, heads, query, prefix):
+def test_short_queries_do_not_form_complete_blocks_across_requests():
+    work = _work([(63, 128)] * 5)
+    assert work.query_tokens > 256 and work.full_blocks == 0
+    assert work.full_stream_tiles == 0
+    kwargs = {"num_heads": 8, "num_kv_heads": 2, "gpu_core_count": 20}
+    assert nax_split_hint(work, 128, **kwargs) == 0
+    assert nax_split_hint(work, 512, **kwargs) == 1
+    # One-row YOCO/decode views retain their native decode route.
+    assert nax_split_hint(_work([(1, 8192)] * 4), 512, **kwargs) == 0
+
+
+def test_parallel_blocks_do_not_erase_guarded_kv_traffic():
+    # The full grid is large, but each MHA stream has only two complete
+    # blocks before a one-row tail. Admitting this batch regressed on M5.
     assert (
         nax_split_hint(
-            _work([(query, prefix)]), head_size, num_heads=heads, gpu_core_count=40
+            _work([(129, 8192)] * 4),
+            96,
+            num_heads=32,
+            num_kv_heads=32,
+            gpu_core_count=10,
+        )
+        == 0
+    )
+
+
+@pytest.mark.parametrize("missing", ["num_heads", "num_kv_heads", "gpu_core_count"])
+def test_missing_layout_metadata_keeps_legacy_admission(missing):
+    kwargs = {"num_heads": 8, "num_kv_heads": 2, "gpu_core_count": 20}
+    work = _work([(16, 0)])
+    assert nax_split_hint(work, 512, **kwargs) == 1
+    kwargs.pop(missing)
+    assert nax_split_hint(work, 512, **kwargs) == 0
+    assert nax_gpu_core_count(object()) == 0
+
+
+@pytest.mark.parametrize("dimension", [64, 96, 128, 256, 512])
+@pytest.mark.parametrize("query", [2047, 2048])
+def test_long_prefill_keeps_the_optimized_pipeline(dimension, query):
+    assert (
+        nax_split_hint(
+            _work([(query, 0)]),
+            dimension,
+            num_heads=16,
+            num_kv_heads=4,
+            gpu_core_count=40,
         )
         == 1
     )
 
 
-def test_cached_append_hint_describes_only_the_native_prefill_subset():
-    whole = nax_tile_work([0, 1, 64], [32769, 32831])
-    prefill = nax_tile_work([1, 64], [32831])
+def test_cached_append_hint_describes_the_potential_prefill_batch():
+    # Native may execute this whole batch or split its decode prefix under
+    # either native decode-work gate. Python must provide both correct scores.
+    whole = _work([(1, 131071), (64, 8192), (64, 8192)])
+    prefill = _work([(64, 8192), (64, 8192)])
     caps = {"nax_split_hint": True, "nax_prefill_split_hint": True}
-    kwargs = {"gpu_core_count": 20, "num_heads": 8}
-    assert nax_split_kwargs(caps, whole, 512, prefill_work=prefill, **kwargs) == {
+    kwargs = {"gpu_core_count": 20, "num_heads": 24, "num_kv_heads": 4}
+    assert nax_split_kwargs(caps, whole, 256, prefill_work=prefill, **kwargs) == {
         "nax_split_hint": 0,
         "nax_prefill_split_hint": 1,
     }
     assert nax_split_kwargs(
-        {"nax_split_hint": True}, whole, 512, prefill_work=prefill, **kwargs
+        {"nax_split_hint": True}, whole, 256, prefill_work=prefill, **kwargs
     ) == {"nax_split_hint": 0}
 
 
