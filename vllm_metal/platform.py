@@ -45,16 +45,6 @@ _METAL_DENSE_KV_CACHE_DTYPES: dict[str, torch.dtype] = {
 _METAL_DENSE_KV_CACHE_DTYPE_NAMES: dict[torch.dtype, str] = {
     dtype: name for name, dtype in _METAL_DENSE_KV_CACHE_DTYPES.items()
 }
-# Structured-read extra_args (vllm#57250) that DiffusionGemmaRuntime does not
-# read yet. A diffusion_canvas_length that reaches validate_request equals the
-# served canvas (narrower ones need async scheduling), so it is a no-op.
-_UNSUPPORTED_DIFFUSION_ARGS = (
-    "diffusion_seed_canvas",
-    "diffusion_pinned",
-    "diffusion_max_steps",
-    "diffusion_read_only",
-    "diffusion_constrained",
-)
 
 
 def _pick_mb_buffer_default(
@@ -122,6 +112,8 @@ class MetalPlatform(Platform):
     # Whether the configured model is a block-diffusion LM, whose runner has
     # its own sampler; set by check_and_update_config for validate_request.
     _serves_diffusion: ClassVar[bool] = False
+    # Its served canvas_length, recorded by _check_diffusion_config.
+    _diffusion_canvas_length: ClassVar[int | None] = None
 
     # --- Ray distributed executor support (Phase 1) ---
     # Advertise the Apple GPU as a custom Ray resource named "mlx".  Because this
@@ -351,6 +343,10 @@ class MetalPlatform(Platform):
             for name, enabled in (
                 ("logit_bias", bool(params.logit_bias)),
                 ("min_tokens", params.min_tokens > 0),
+                (
+                    "thinking_token_budget",
+                    getattr(params, "thinking_token_budget", None) is not None,
+                ),
             )
             if enabled
         ]
@@ -373,7 +369,6 @@ class MetalPlatform(Platform):
                     "logprob_token_ids",
                     "prompt_logprobs",
                     "structured_outputs",
-                    "thinking_token_budget",
                 )
                 if getattr(params, name, None) is not None
             ]
@@ -384,16 +379,14 @@ class MetalPlatform(Platform):
                 f"vLLM logits processors ({controls}).",
                 parameter=unsupported_controls[0],
             )
-        # Upstream's diffusion sampler applies top_k/top_p to the canvas and
-        # reads the structured-read extra_args; the Metal one does not, so
-        # refuse them rather than ignore them.
+        # Upstream's diffusion sampler applies top_k/top_p to the canvas; the
+        # Metal one does not, so refuse them rather than ignore them.
         if cls._serves_diffusion:
             if params.logprobs == -1:
                 raise VLLMValidationError(
                     "logprobs=-1 is not supported for diffusion models on Metal.",
                     parameter="logprobs",
                 )
-            extra_args = params.extra_args or {}
             for name, enabled in (
                 ("prompt_logprobs", params.prompt_logprobs is not None),
                 (
@@ -402,13 +395,21 @@ class MetalPlatform(Platform):
                 ),
                 ("top_k", params.top_k > 0),
                 ("top_p", params.top_p < 1.0),
-                *((key, key in extra_args) for key in _UNSUPPORTED_DIFFUSION_ARGS),
             ):
                 if enabled:
                     raise VLLMValidationError(
                         f"{name} is not supported for diffusion models on Metal yet.",
                         parameter=name,
                     )
+            # DiffusionGemmaRuntime always denoises the served canvas, and since
+            # vllm#59107 vLLM no longer refuses a smaller one without async scheduling.
+            width = (params.extra_args or {}).get("diffusion_canvas_length")
+            if width is not None and width < cls._diffusion_canvas_length:
+                raise VLLMValidationError(
+                    "A diffusion_canvas_length smaller than the served canvas is "
+                    "not supported for diffusion models on Metal.",
+                    parameter="diffusion_canvas_length",
+                )
 
     @classmethod
     def get_torch_device(cls, device_id: int = 0) -> torch.device:
@@ -741,15 +742,6 @@ class MetalPlatform(Platform):
 
         if model_config is not None and model_config.is_hybrid:
             cache_config = vllm_config.cache_config
-            if cache_config.mamba_cache_mode == "all":
-                # Before the downgrades below, which overwrite the mode: an
-                # explicit --mamba-cache-mode all must fail fast on every path.
-                raise NotImplementedError(
-                    "mamba_cache_mode='all' is not supported for hybrid "
-                    "models on Metal (nor upstream, which falls back to "
-                    "'align' for models without SupportsMambaPrefixCaching). "
-                    "Use align mode: --enable-prefix-caching resolves to it."
-                )
             from vllm_metal.attention.runtime.factory import (
                 state_family_for_model_type,
             )
@@ -978,12 +970,10 @@ class MetalPlatform(Platform):
                 scheduler_config.max_num_batched_tokens,
             )
 
-        # Disable cascade attention (not supported), then let the adapter
-        # apply any model-specific normalisations (e.g. clearing
+        # Let the adapter apply any model-specific normalisations (e.g. clearing
         # ``multimodal_config`` for model types served on the text-only
         # backbone — see ``DefaultModelAdapter.normalize_model_config``).
         if model_config is not None:
-            model_config.disable_cascade_attn = True
             from vllm_metal.v1.model_adapter import DefaultModelAdapter
 
             DefaultModelAdapter().normalize_model_config(
@@ -1000,6 +990,9 @@ class MetalPlatform(Platform):
                         "Video token pruning is not supported on Metal. "
                         "Remove --video-pruning-rate."
                     )
+                # MLX vision towers take the processor's normalized pixels;
+                # vLLM's device-side normalization only runs in its own models.
+                model_config.multimodal_config.mm_device_do_normalize = False
                 mode = DefaultModelAdapter().multimodal_backbone_mode(
                     model_config, speculative_config=vllm_config.speculative_config
                 )
@@ -1143,6 +1136,7 @@ class MetalPlatform(Platform):
                 "Diffusion models on Metal require --diffusion-config with a "
                 "canvas_length, e.g. --diffusion-config '{\"canvas_length\": 32}'."
             )
+        cls._diffusion_canvas_length = diffusion_config.canvas_length
         if vllm_config.speculative_config is not None:
             raise NotImplementedError(
                 "Speculative decoding is not supported with diffusion models."
@@ -1216,11 +1210,9 @@ class MetalPlatform(Platform):
         else-branch would have, instead of failing a default launch.
         """
         cache_config = vllm_config.cache_config
-        if cache_config.user_specified_mamba_block_size:
-            # --mamba-block-size requires prefix caching (upstream's
-            # validate_mamba_block_size rejects it once APC is off), so the
-            # user's two explicit choices conflict; fail with the Metal
-            # constraint before upstream's misleading error fires.
+        # With prefix caching on, vLLM fills an unset mamba_block_size with
+        # block_size before this hook, so any other value is the user's.
+        if cache_config.mamba_block_size != cache_config.block_size:
             raise NotImplementedError(
                 "Prefix caching for hybrid models on Metal cannot serve "
                 f"this configuration ({reason}), and --mamba-block-size "
