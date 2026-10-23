@@ -8,8 +8,6 @@
 // Library caching
 // ---------------------------------------------------------------------------
 
-static std::string v2_paged_attention_source_;
-
 std::atomic<PagedDispatch> g_last_dispatch{PagedDispatch::None};
 std::atomic<int> g_last_gqa_partition{0};
 std::atomic<int> g_last_gqa_requests{0};
@@ -80,6 +78,14 @@ std::string gqa_decode_kernel_name(
     const std::string& dtype, int head_size, int block_size, int partition_size) {
   return "paged_attention_gqa_decode_" + dtype + "_hs" + std::to_string(head_size)
       + "_bs" + std::to_string(block_size) + "_ps" + std::to_string(partition_size);
+}
+
+std::string gqa_decode_tq_kernel_name(
+    const std::string& dtype, const std::string& k_cache_dtype, int head_size,
+    int block_size, int partition_size) {
+  return "paged_attention_gqa_decode_tq_" + dtype + "_cache_" + k_cache_dtype
+      + "_hs" + std::to_string(head_size) + "_bs" + std::to_string(block_size)
+      + "_ps" + std::to_string(partition_size);
 }
 
 static bool paged_reduce_memory_fits(
@@ -176,14 +182,6 @@ int gqa_decode_plan_for_lengths(
       ? partition : 0;
 }
 
-void init_v2_library(const std::string& v2_src) {
-  v2_paged_attention_source_ = v2_src;
-  auto& d = metal::device(Device::gpu);
-  d.get_library(
-      "paged_attention_v2_kern",
-      [&]() { return v2_paged_attention_source_; });
-}
-
 // Load a precompiled .metallib instead of compiling its source. Uses MLX's
 // get_library(name, path) overload, which loads the library at `path` and
 // caches it under `name`; a later dispatch's get_library(name) (no path) then
@@ -198,16 +196,8 @@ void init_library_path(const std::string& name, const std::string& path) {
 // NAX (M5 tensor-unit) prefill kernel support
 // ---------------------------------------------------------------------------
 
-static std::string nax_source_;
 bool nax_lib_ready_ = false;   // a NAX library was registered
 bool nax_enabled_ = true;      // test / A-B switch
-
-void init_nax_library(const std::string& nax_src) {
-  nax_source_ = nax_src;
-  auto& d = metal::device(Device::gpu);
-  d.get_library("paged_attention_nax_kern", [&]() { return nax_source_; });
-  nax_lib_ready_ = true;
-}
 
 void init_nax_library_path(const std::string& path) {
   init_library_path("paged_attention_nax_kern", path);
@@ -315,6 +305,7 @@ struct NaxAttentionPlan {
   bool split_full;
   int q_blocks;
   int num_threads;
+  int value_slices;
 };
 
 static NaxAttentionPlan make_nax_attention_plan(
@@ -332,10 +323,12 @@ static NaxAttentionPlan make_nax_attention_plan(
 
   std::string base_kname =
       kernels::nax_name(dtype_to_metal(dtype), head_size, block_size);
+  const int value_slices = head_size == 512 && split_full ? 2 : 1;
+  if (value_slices > 1) base_kname += "_v256";
   std::string hash_name = base_kname + "_sk" + (use_sinks ? "1" : "0")
                           + "_sf" + (split_full ? "1" : "0");
   return {std::move(base_kname), std::move(hash_name), use_sinks, split_full,
-          total_q_blocks - q_block_offset, kernels::kNaxThreads};
+          total_q_blocks - q_block_offset, kernels::kNaxThreads, value_slices};
 }
 
 // Same buffer ABI as the tiled kernel, with BQ=64 and no threadgroup memory.
@@ -379,7 +372,7 @@ static void dispatch_paged_attention_nax(
   }
 
   enc.dispatch_threadgroups(
-      MTL::Size::Make(num_heads, plan.q_blocks, 1),
+      MTL::Size::Make(num_heads, plan.q_blocks, plan.value_slices),
       MTL::Size::Make(plan.num_threads, 1, 1));
 }
 
@@ -669,14 +662,12 @@ static PagedAttentionPlan select_paged_attention_route(
     // CPU from the lengths it already holds (vllm_metal.attention.nax_split).
     // Without it (-1) the host only knows totals here, so it falls back to an
     // average of at least 128 query tokens (two Q blocks) per sequence.
-    // head_size 512 stays unsplit either way: conservative enablement scope for
-    // this change to avoid regressing measured shapes (the split was slower on
-    // long D512 prefill; register pressure is suspected but unverified). D512
-    // can be optimized separately later.
-    bool split_full = m.head_size < 512
-        && (split_hint >= 0
-                ? split_hint == 1
-                : m.query_tokens >= kNaxSplitMinAvgQ * m.query_sequences);
+    // D512 uses two 256-column output slices to limit register pressure.
+    // Keep legacy callers on the original loop without per-sequence metadata.
+    bool split_full = split_hint >= 0
+        ? split_hint == 1
+        : (m.head_size < 512 &&
+           m.query_tokens >= kNaxSplitMinAvgQ * m.query_sequences);
     plan.route = split_mixed_batch
         ? (split_full ? PagedAttentionRoute::MixedNaxSplit
                       : PagedAttentionRoute::MixedNaxUnsplit)
@@ -746,12 +737,18 @@ static PagedAttentionPlan select_paged_attention_route(
         m.num_decode_tokens == num_seqs));
   // Enforce geometry at the actual dispatch boundary, including the private
   // forced-partition entry. That entry bypasses only occupancy selection.
+  // TurboQuant caches reach the GQA producer only through that entry for now:
+  // default routing keeps them on the per-token / split-KV kernels.
+  const bool gqa_turboquant = m.use_turboquant && m.gqa_test_partition > 0
+      && (m.key_dtype == int8 || m.key_dtype == uint8)
+      && m.value_dtype == uint8;
+  const bool gqa_cache_dtypes = m.use_turboquant
+      ? gqa_turboquant
+      : m.query_dtype == m.key_dtype && m.query_dtype == m.value_dtype;
   const bool gqa_supported = !m.gqa_disabled
       && !has_prefill && m.window_seqlen_q <= 1 && gqa_decode_rows
       && (m.query_dtype == float16 || m.query_dtype == bfloat16)
-      && m.query_dtype == m.key_dtype
-      && m.query_dtype == m.value_dtype
-      && !m.use_turboquant && m.softcap <= 0.f && !m.use_sinks
+      && gqa_cache_dtypes && m.softcap <= 0.f && !m.use_sinks
       && m.sliding_window < 0
       && gqa_decode_geometry_supported(
           m.num_heads, m.num_kv_heads,
@@ -863,6 +860,24 @@ static array make_paged_attention_temp(
   return a;
 }
 
+// TurboQuant scale/zero/centroid buffers (slots 22-29), shared by the
+// per-token and GQA producers.
+static void bind_turboquant_buffers(
+    metal::CommandEncoder& enc, const PagedAttentionArrays& arrays) {
+  enc.set_input_array(*arrays.key_scale_cache,   22);
+  enc.set_input_array(*arrays.value_scale_cache, 23);
+  int32_t v_block_stride_i = static_cast<int32_t>(arrays.value_cache.strides()[0]);
+  int32_t v_head_stride_i  = static_cast<int32_t>(arrays.value_cache.strides()[2]);
+  enc.set_bytes(v_block_stride_i, 24);
+  enc.set_bytes(v_head_stride_i,  25);
+  enc.set_input_array(*arrays.key_zero_cache, 26);
+  enc.set_input_array(*arrays.v_centroids, 27);
+  int64_t scale_block_stride = arrays.key_scale_cache->strides()[0];
+  enc.set_bytes(scale_block_stride, 28);
+  int64_t scale_head_stride = arrays.key_scale_cache->strides()[2];
+  enc.set_bytes(scale_head_stride, 29);
+}
+
 static void dispatch_paged_attention_gqa_decode(
     const PagedAttentionArrays& arrays, const PagedAttentionMetadata& metadata,
     const PagedAttentionPlan& plan, const PagedAttentionEncoding& encoding,
@@ -871,17 +886,34 @@ static void dispatch_paged_attention_gqa_decode(
   const int gqa_num_partitions = static_cast<int>(plan.gqa_partitions);
   record_paged_dispatch(
       PagedDispatch::GqaDecode, plan.gqa_partition_size, plan.num_seqs);
-  std::string name = gqa_decode_kernel_name(
-      encoding.dt, metadata.head_size, metadata.block_size, plan.gqa_partition_size);
+  const bool tq = metadata.use_turboquant;
+  std::string name = tq
+      ? gqa_decode_tq_kernel_name(encoding.dt, encoding.k_cache_dt,
+                                  metadata.head_size, metadata.block_size,
+                                  plan.gqa_partition_size)
+      : gqa_decode_kernel_name(encoding.dt, metadata.head_size,
+                               metadata.block_size, plan.gqa_partition_size);
   std::string hash = name + (plan.compact ? "_compact1" : "_compact0");
+  if (tq) {
+    hash += "_kb" + std::to_string(metadata.k_bits)
+        + "_vb" + std::to_string(metadata.v_bits);
+  }
   const int num_threads = 32 * (metadata.num_heads / metadata.num_kv_heads);
   // Instantiated in pagedattention.metal and shipped in the v2 metallib.
   // A missing specialization is a build/packaging bug: fail loudly
   // rather than silently drop eligible long decode back to the slower
   // per-token kernel.
-  auto* gkernel = encoding.device->get_kernel(
-      name, encoding.library, hash,
-      {{&plan.compact, MTL::DataType::DataTypeBool, NS::UInteger(130)}});
+  int k_bits = metadata.k_bits;
+  int v_bits = metadata.v_bits;
+  auto* gkernel = tq
+      ? encoding.device->get_kernel(
+            name, encoding.library, hash,
+            {{&plan.compact, MTL::DataType::DataTypeBool, NS::UInteger(130)},
+             {&k_bits,       MTL::DataType::DataTypeInt,  NS::UInteger(60)},
+             {&v_bits,       MTL::DataType::DataTypeInt,  NS::UInteger(70)}})
+      : encoding.device->get_kernel(
+            name, encoding.library, hash,
+            {{&plan.compact, MTL::DataType::DataTypeBool, NS::UInteger(130)}});
 
   Shape stats_shape = plan.offsets
       ? Shape{static_cast<int>(plan.offsets->back()), metadata.num_heads}
@@ -914,6 +946,7 @@ static void dispatch_paged_attention_gqa_decode(
   enc.set_bytes(g_max_blocks, 13);
   bind_paged_attn_strides(enc, arrays.query, arrays.key_cache, metadata.block_size);
   if (plan.compact) enc.set_input_array(*g_offsets, 18);
+  if (tq) bind_turboquant_buffers(enc, arrays);
   // One threadgroup per (partition, kv head, sequence); each simdgroup
   // owns one query head of the GQA group.
   enc.dispatch_threadgroups(
@@ -925,7 +958,7 @@ static void dispatch_paged_attention_gqa_decode(
       arrays.seq_lens, arrays.cu_seqlens_q, plan.num_seqs, plan.total_q_tokens,
       metadata.num_heads, metadata.head_size,
       gqa_num_partitions, encoding.dt, /*use_sinks=*/false, nullptr,
-      /*use_tq_fc=*/false, plan.gqa_partition_size, gqa_rkernel,
+      /*use_tq_fc=*/tq, plan.gqa_partition_size, gqa_rkernel,
       plan.compact ? &*g_offsets : nullptr);
   return;
 }
@@ -956,21 +989,8 @@ static void dispatch_paged_attention_per_token(
   const int grid_z = plan.partition ? plan.max_num_partitions : 1;
   constexpr int num_threads = 256;
 
-  // TurboQuant scale/zero/centroid buffers (slots 22-27); shared by both paths.
   auto bind_turboquant = [&]() {
-    if (!metadata.use_turboquant) return;
-    enc.set_input_array(*arrays.key_scale_cache,   22);
-    enc.set_input_array(*arrays.value_scale_cache, 23);
-    int32_t v_block_stride_i = static_cast<int32_t>(arrays.value_cache.strides()[0]);
-    int32_t v_head_stride_i  = static_cast<int32_t>(arrays.value_cache.strides()[2]);
-    enc.set_bytes(v_block_stride_i, 24);
-    enc.set_bytes(v_head_stride_i,  25);
-    enc.set_input_array(*arrays.key_zero_cache, 26);
-    enc.set_input_array(*arrays.v_centroids, 27);
-    int64_t scale_block_stride = arrays.key_scale_cache->strides()[0];
-    enc.set_bytes(scale_block_stride, 28);
-    int64_t scale_head_stride = arrays.key_scale_cache->strides()[2];
-    enc.set_bytes(scale_head_stride, 29);
+    if (metadata.use_turboquant) bind_turboquant_buffers(enc, arrays);
   };
 
   // Sink logits (slot 18); bound only when the kernel was specialized with
@@ -1130,7 +1150,7 @@ static void dispatch_paged_attention_v2_online(
     // static workspace exceeds the device limit. Reuse this pipeline below.
     gqa_rkernel = paged_attention_v2_reduce_kernel(
         *encoding.device, encoding.dt, metadata.head_size,
-        plan.gqa_partition_size, false, false, plan.compact);
+        plan.gqa_partition_size, false, metadata.use_turboquant, plan.compact);
     // This compiled-pipeline check is the only GQA-to-per-token fallback.
     if (!paged_reduce_memory_fits(
             kernels::paged_reduce_threadgroup_bytes(plan.gqa_partitions),
@@ -1522,6 +1542,13 @@ array paged_attention_primitive_fn(
           "); an understated value leaves window rows unwritten");
     }
   }
+  if (use_turboquant &&
+      (key_scale_cache == nullptr || value_scale_cache == nullptr ||
+       key_zero_cache == nullptr || v_centroids == nullptr)) {
+    throw std::invalid_argument(
+        "TurboQuant requires key_scale_cache, value_scale_cache, "
+        "key_zero_cache, and v_centroids");
+  }
   int k_bits = use_turboquant ? get_bits(quant_type) : 8;
   auto prim = std::make_shared<PagedAttentionPrimitive>(
       default_stream(Device::gpu),
@@ -1713,7 +1740,7 @@ class TQEncodePrimitive : public Primitive {
   bool k_signed_;
 };
 
-std::vector<array> tq_encode_primitive_fn(
+std::tuple<array, array, array, array, array> tq_encode_primitive_fn(
     const array& key, const array& value,
     const array& key_cache, const array& value_cache,
     const array& key_scale_cache, const array& value_scale_cache,
@@ -1743,7 +1770,7 @@ std::vector<array> tq_encode_primitive_fn(
   auto prim = std::make_shared<TQEncodePrimitive>(
       default_stream(Device::gpu), v_bits, k_bits, k_signed);
 
-  return array::make_arrays(
+  auto outputs = array::make_arrays(
       {key_cache.shape(), value_cache.shape(),
        key_scale_cache.shape(), value_scale_cache.shape(),
        key_zero_cache.shape()},
@@ -1755,6 +1782,9 @@ std::vector<array> tq_encode_primitive_fn(
        key_cache, value_cache,
        key_scale_cache, value_scale_cache, key_zero_cache,
        slot_mapping, v_centroids});
+  return std::make_tuple(
+      std::move(outputs[0]), std::move(outputs[1]), std::move(outputs[2]),
+      std::move(outputs[3]), std::move(outputs[4]));
 }
 
 // ---------------------------------------------------------------------------
@@ -1864,15 +1894,16 @@ class ReshapeAndCachePrimitive : public Primitive {
   }
 };
 
-std::vector<array> reshape_and_cache_primitive_fn(
+std::tuple<array, array> reshape_and_cache_primitive_fn(
     const array& key, const array& value,
     const array& key_cache, const array& value_cache,
     const array& slot_mapping) {
   auto prim = std::make_shared<ReshapeAndCachePrimitive>(
       default_stream(Device::gpu));
-  return array::make_arrays(
+  auto outputs = array::make_arrays(
       {key_cache.shape(), value_cache.shape()},
       {key_cache.dtype(), value_cache.dtype()},
       prim,
       {key, value, key_cache, value_cache, slot_mapping});
+  return std::make_tuple(std::move(outputs[0]), std::move(outputs[1]));
 }

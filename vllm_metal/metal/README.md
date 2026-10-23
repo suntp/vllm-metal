@@ -19,11 +19,12 @@ The source builders concatenate shaders in the order below, stripping local
 
 ### 1. C++ `_paged_ops` extension: `__init__.py` and `build.py`
 
-By default, `get_ops()` loads the prebuilt nanobind extension and three
+By default, `get_ops()` loads the prebuilt nanobind extension and
 required `.metallib` libraries, plus optional NAX support. With
-`VLLM_METAL_BUILD_FROM_SOURCE=1`, it builds the extension and compiles the
-shader sources in-process through MLX. Packaging uses the same source
-builders to precompile the `.metallib` files via `python -m vllm_metal.metal.build`.
+`VLLM_METAL_BUILD_FROM_SOURCE=1`, it rebuilds changed artifacts with
+`mlx.extension.MetalExtension`, then loads the generated `.metallib` files.
+Packaging uses the same build via `python -m vllm_metal.metal.build`.
+Source builds require the `build` extra and the Xcode Metal toolchain.
 
 | Library | Source builder | Concatenated sources (in order) |
 |---------|----------------|----------------------------------|
@@ -62,3 +63,18 @@ MLX, via `_read_v2_metal_source`:
 | `gdn_conv1d_silu_prefill.metal` | Lazy GDN prefill: causal conv1d + SiLU. |
 | `gdn_recurrent_decode.metal` | Lazy GDN decode: recurrent state update. |
 | `gdn_recurrent_prefill.metal` | Lazy GDN prefill: recurrent state updates over packed sequences. |
+
+### D512 NAX prefill
+
+The split pipeline divides D512's output columns across two threadgroups,
+each accumulating 256 columns. Both read the full 512-column Q/K vectors
+and repeat QK and online softmax, then write disjoint output slices. This
+halves live output accumulators without scratch buffers or a reduction pass.
+Complete KV tiles in full Q blocks omit bounds checks; partial Q blocks and
+partial KV tiles retain the guarded loads and masks.
+
+The existing host tile-work hint enables this path with at least four full
+Q blocks and eight times as much full-block as partial-block KV-tile work.
+Short or partial-dominated launches, callers without sequence metadata, and
+the MPS launcher retain the original D512 loop. Other head sizes keep their
+existing kernels and selection rules.

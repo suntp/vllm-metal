@@ -52,11 +52,14 @@ unsupported; leave `--video-pruning-rate` unset.
 | Qwen3-VL | 🔵 | | native multimodal paged generation | image and video input | `mlx-community/Qwen3-VL-4B-Instruct-4bit` |
 | Qwen3.5 (dense) | 🔵 | | native multimodal paged generation | image and video input; FP8 checkpoints stay text-only | `mlx-community/Qwen3.5-4B-MLX-4bit` |
 | PaddleOCR-VL | 🔵 | | native multimodal paged generation | image input, no video | `PaddlePaddle/PaddleOCR-VL-1.6` |
-| Gemma 4 | 🔵 | | mlx_lm text backbone + mlx-vlm vision sidecar, paged generation | image input, no video/audio, bidirectional attention inside image blocks on sliding-window layers | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4` |
+| Gemma 4 | 🔵 | | mlx_lm text backbone + mlx-vlm encoder sidecar, paged generation | image input; audio input on E2B/E4B; no video; bidirectional attention inside image blocks on sliding-window layers | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4`, `mlx-community/gemma-4-e2b-it-4bit` (audio) |
 
 Gemma 4 keeps its text path exactly as on the text-only table (mlx_lm model,
 selective logits, intermediate forward); only `vision_tower` and `embed_vision`
-are loaded from the checkpoint through mlx-vlm. The sidecar activates in
+are loaded from the checkpoint through mlx-vlm, plus `audio_tower` and
+`embed_audio` on checkpoints whose config has an `audio_config` (E2B and E4B).
+Those checkpoints accept audio input; audio soft tokens attend causally, as in
+HF. The sidecar activates in
 `VLLM_METAL_MULTIMODAL_MODE=auto` when the checkpoint resolves to a local
 safetensors directory with `vision_tower.*` weights, the HF `Gemma4Processor`
 builds (the checkpoint's `processor_config.json` needs a `video_processor`
@@ -151,6 +154,7 @@ block-FP8 checkpoint is not supported.
 | Ling-3.0 Tiny | 🔵 | | Hybrid MLA + KDA (paged latent + recurrent state) | 🔵 | `inclusionAI/Ling-3.0-tiny` (BF16 or converted MXFP8) |
 | GLM-4.5 | Not verified | | MLA (paged latent cache, MLX SDPA — no Metal kernel) | Not verified | — |
 | MiniCPM3-4B | ✅ | | MLA (paged latent cache) | ✅ | `mlx-community/MiniCPM3-4B-4bit` |
+| MiniCPM4 | ✅ | | GQA (paged) | ✅ | `openbmb/MiniCPM4-0.5B-mlx` (needs `--trust-remote-code`) |
 | GLM-4.7-Flash | 🔵 | | GQA (paged) | ✅ | `mlx-community/GLM-4.7-Flash-4bit` |
 | DeepSeek-R1-Distill-Qwen | ✅ | | GQA (paged) | ✅ | `mlx-community/DeepSeek-R1-Distill-Qwen-7B-3bit` |
 | Phi-4-mini | ✅ | | GQA packed qkv (paged) | ✅ | `microsoft/Phi-4-mini-instruct` |
@@ -175,15 +179,12 @@ sliding-window attention (SWA) is not fully optimized.
 ## Diffusion Language Models
 
 Block-diffusion LMs generate a whole canvas of tokens per block through
-iterative denoising instead of left-to-right decoding. vLLM schedules the
-canvas as draft tokens (`--diffusion-config '{"canvas_length": N}'`); the
-Metal runner runs prefill and commit steps causally, and denoising steps
-bidirectionally over the canvas on the paged KV cache (see
-`vllm_metal/v1/diffusion.py`).
+iterative denoising. DiffusionGemma also supports sample logprobs and
+[structured decisions](structured_decisions.md) for yes/no, choice, and score questions.
 
 | Model | MLX | PyTorch MPS | Runner | Scope | Example checkpoint |
 | --- | --- | --- | --- | --- | --- |
-| DiffusionGemma | 🔵 | | mlx-vlm model, paged block diffusion | text input only, synchronous scheduling, no logprobs or LoRA | `mlx-community/diffusiongemma-26B-A4B-it-4bit` |
+| DiffusionGemma | 🔵 | | mlx-vlm model, paged block diffusion | text input only, synchronous scheduling, no prompt logprobs or LoRA | `mlx-community/diffusiongemma-26B-A4B-it-4bit` |
 
 ```bash
 vllm serve mlx-community/diffusiongemma-26B-A4B-it-4bit \
@@ -192,6 +193,6 @@ vllm serve mlx-community/diffusiongemma-26B-A4B-it-4bit \
 
 The canvas sampler follows the checkpoint's `generation_config.json`
 (temperature schedule, entropy-bound acceptance, convergence thresholds);
-top-k, top-p and penalties are ignored with a warning. Async scheduling is
-turned off automatically, since each step's canvas must reach the scheduler
-before the next one is scheduled.
+top-k and top-p are unsupported, and penalties are ignored with a warning.
+Async scheduling is turned off automatically, since each step's canvas must
+reach the scheduler before the next one is scheduled.

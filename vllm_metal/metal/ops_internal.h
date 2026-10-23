@@ -9,6 +9,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "metal_device.h"
@@ -133,13 +134,14 @@ bool gqa_decode_geometry_supported(int num_heads, int num_kv_heads,
                                    int head_size, int block_size);
 std::string gqa_decode_kernel_name(
     const std::string& dtype, int head_size, int block_size, int partition_size);
+std::string gqa_decode_tq_kernel_name(
+    const std::string& dtype, const std::string& k_cache_dtype, int head_size,
+    int block_size, int partition_size);
 int gqa_decode_plan_for_lengths(
     int num_heads, int num_kv_heads, int head_size,
     const GqaDecodeLengthPlan& plan, int gpu_cores, int block_size,
     const std::string& gpu_arch = "", int max_seq_len = 0);
-void init_v2_library(const std::string& v2_src);
 void init_library_path(const std::string& name, const std::string& path);
-void init_nax_library(const std::string& nax_src);
 void init_nax_library_path(const std::string& path);
 std::string dtype_to_metal(Dtype dt);
 array paged_attention_primitive_fn(
@@ -163,22 +165,20 @@ array paged_attention_primitive_fn(
     int gqa_test_partition = 0,
     const std::optional<GqaDecodeLengthPlan>& gqa_length_plan = std::nullopt,
     int nax_split_hint = -1, int nax_prefill_split_hint = -1);
-std::vector<array> tq_encode_primitive_fn(
+std::tuple<array, array, array, array, array> tq_encode_primitive_fn(
     const array& key, const array& value,
     const array& key_cache, const array& value_cache,
     const array& key_scale_cache, const array& value_scale_cache,
     const array& key_zero_cache,
     const array& slot_mapping, const array& v_centroids,
     int v_bits, int k_bits, bool k_signed);
-std::vector<array> reshape_and_cache_primitive_fn(
+std::tuple<array, array> reshape_and_cache_primitive_fn(
     const array& key, const array& value,
     const array& key_cache, const array& value_cache,
     const array& slot_mapping);
-void init_gdn_library(const std::string& src);
 array gdn_state_scatter_primitive_fn(
     const array& pool, const array& src, const array& dst_ids,
     bool zero = false, bool paged = false);
-void init_mla_library(const std::string& src);
 array mla_paged_attention_primitive_fn(
     const array& q_nope,
     const array& q_pe,
@@ -189,7 +189,7 @@ array mla_paged_attention_primitive_fn(
     int block_size,
     float scale,
     int heads_per_tg);
-std::vector<array> gdn_linear_attention_primitive_fn(
+std::tuple<array, array> gdn_linear_attention_primitive_fn(
     const array& q, const array& k, const array& v,
     const array& g, const array& beta, const array& state_pool,
     const array& cu_seqlens, const array& slot_mapping,
