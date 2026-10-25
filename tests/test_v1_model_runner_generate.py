@@ -4544,6 +4544,11 @@ class TestSchedulerContractSequences:
     finishes. Sampling-time bookkeeping (token appends, seq-lens, output
     assembly) is covered by the sampling suites; between steps these
     tests only apply the state updates the sampler owns, marked as such.
+    Assertions are scheduler-contract invariants (scheduled slices,
+    restore positions, result modes, slot lifecycle) except two
+    current-behavior pins in the preemption test, marked inline, that
+    are expected to change when the contract flip treats preemption as
+    completion.
     """
 
     def _make_runner(self) -> mr.MetalModelRunner:
@@ -4717,11 +4722,14 @@ class TestSchedulerContractSequences:
         # Step 1: the scheduler preempts the request; nothing else is scheduled.
         runner.execute_model(self._scheduler_output(preempted_req_ids={"r"}))
 
-        # Preemption releases the runtime slot; the stale state stays until
-        # the readmission replaces it.
-        assert "r" in runner._request_states
+        # Slot release and no-forward hold under any contract; the stale
+        # state below is the current-behavior pin.
         assert runtime.request_slots == {}
         assert calls == []  # a preemption-only step runs no forward
+        # Current behavior, not target contract: the stale state stays until
+        # the readmission replaces it; expected to change when the contract
+        # flip treats preemption as completion.
+        assert "r" in runner._request_states
 
         # Step 2 (MRv2 shape): the request returns as a NEW request whose
         # prefill_token_ids carry the full history, prompt included.
@@ -4746,7 +4754,10 @@ class TestSchedulerContractSequences:
         state = runner._request_states["r"]
         assert state.token_ids == [1, 2, 3, 4, 7]
         assert state.prompt_len == 4
-        assert state.generator is generator  # RNG stream survives preemption
+        # Current behavior, not target contract: the RNG object carries over
+        # from the pre-preemption state; expected to change when the contract
+        # flip treats preemption as completion.
+        assert state.generator is generator
         entry = calls[-1].prefill_entries[0]
         assert entry.prefill.token_ids == [7]  # only the uncomputed suffix
         assert entry.prefill.start_pos == 4
@@ -4792,8 +4803,9 @@ class TestSchedulerContractSequences:
         self._capture_forward(runner, calls)
         runtime = runner._paged_attention_runtime
 
-        # A is mid-decode; B just finished prefill sampling (its state is what
-        # the sampler leaves: full prompt plus the first sampled token).
+        # B is mid-flight (its state is what the sampler leaves after prefill:
+        # full prompt plus the first sampled token); A finishes this step
+        # while B keeps decoding.
         runner._request_states["A"] = mr.RequestState(
             token_ids=[1, 2, 8],
             prompt_len=2,
