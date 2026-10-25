@@ -4532,3 +4532,295 @@ class TestPreemptedReadmission:
         state = runner._request_states["r"]
         assert state.token_ids == [1, 2, 3, 4, 5, 6]
         assert state.prompt_len == 4
+
+
+class TestSchedulerContractSequences:
+    """Drive ``execute_model`` with real ``SchedulerOutput`` step sequences.
+
+    The model forward is replaced by a recorder, so what these tests pin
+    is the scheduler→runner contract at the execute boundary: chunked
+    prefill accumulation, MRv2-shape preemption readmission, prefix-hit
+    admission alongside a live decode, and slot release when a request
+    finishes. Sampling-time bookkeeping (token appends, seq-lens, output
+    assembly) is covered by the sampling suites; between steps these
+    tests only apply the state updates the sampler owns, marked as such.
+    """
+
+    def _make_runner(self) -> mr.MetalModelRunner:
+        cache = make_state_cache(
+            num_layers=1,
+            max_seqs=2,
+            conv_kernel_dim=2,
+            conv_dim=4,
+            num_v_heads=1,
+            value_head_dim=4,
+            key_head_dim=32,
+            dtype=mx.float32,
+        )
+        runner = make_stub_runner(
+            _paged_attention_runtime=HybridRuntimeStub(cache),
+            _paged_block_size=4,
+        )
+        runner.use_async_scheduling = False
+        return runner
+
+    def _capture_forward(
+        self, runner: mr.MetalModelRunner, calls: list[SimpleNamespace]
+    ) -> None:
+        def record(batch, prefill_pack, decode_reqs, scheduler_output):
+            del prefill_pack, scheduler_output
+            calls.append(
+                SimpleNamespace(
+                    prefill_entries=list(batch.paged_prefill_entries),
+                    decode_reqs=[req_id for req_id, _ in decode_reqs],
+                )
+            )
+
+        runner._start_paged_forward = record
+
+    def _new_req(
+        self,
+        req_id: str,
+        prompt_token_ids: list[int],
+        *,
+        block_ids=(10, 11),
+        num_computed_tokens: int = 0,
+    ) -> NewRequestData:
+        return NewRequestData(
+            req_id=req_id,
+            prompt_token_ids=prompt_token_ids,
+            mm_features=[],
+            sampling_params=SamplingParams(),
+            pooling_params=None,
+            block_ids=(block_ids,),
+            num_computed_tokens=num_computed_tokens,
+            lora_request=None,
+        )
+
+    def _scheduler_output(
+        self,
+        *,
+        new_reqs: list[NewRequestData] | None = None,
+        num_scheduled_tokens: dict[str, int] | None = None,
+        cached_reqs: CachedRequestData | None = None,
+        finished_req_ids: set[str] | None = None,
+        preempted_req_ids: set[str] | None = None,
+    ) -> SchedulerOutput:
+        num_scheduled = num_scheduled_tokens or {}
+        return SchedulerOutput(
+            scheduled_new_reqs=new_reqs or [],
+            scheduled_cached_reqs=cached_reqs or CachedRequestData.make_empty(),
+            num_scheduled_tokens=num_scheduled,
+            total_num_scheduled_tokens=sum(num_scheduled.values()),
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=finished_req_ids or set(),
+            free_encoder_mm_hashes=[],
+            preempted_req_ids=preempted_req_ids or set(),
+            has_structured_output_requests=False,
+        )
+
+    def _decode_cached(
+        self, req_id: str, *, num_computed: int, num_output_tokens: int = 1
+    ) -> CachedRequestData:
+        # A live decode has already emitted tokens, so the scheduler reports
+        # num_output_tokens >= 1 (is_context_phase must be False).
+        return CachedRequestData(
+            req_ids=[req_id],
+            resumed_req_ids=set(),
+            new_token_ids=[],
+            all_token_ids={},
+            new_block_ids=[None],
+            num_computed_tokens=[num_computed],
+            num_output_tokens=[num_output_tokens],
+        )
+
+    def test_chunked_prefill_accumulates_across_steps(self) -> None:
+        runner = self._make_runner()
+        calls: list[SimpleNamespace] = []
+        self._capture_forward(runner, calls)
+        prompt = [1, 2, 3, 4, 5, 6]
+
+        runner.execute_model(
+            self._scheduler_output(
+                new_reqs=[self._new_req("r", prompt)],
+                num_scheduled_tokens={"r": 2},
+            )
+        )
+        state = runner._request_states["r"]
+        assert state.token_ids == prompt  # full prompt tracked from chunk 1
+        assert state.prompt_len == 6
+        assert state.generated_tokens == 0
+        entry = calls[-1].prefill_entries[0]
+        assert entry.prefill.token_ids == prompt[:2]  # only the scheduled slice
+        assert entry.prefill.start_pos == 0
+        assert entry.result_mode == "intermediate"
+
+        runner.execute_model(
+            self._scheduler_output(
+                num_scheduled_tokens={"r": 2},
+                cached_reqs=CachedRequestData(
+                    req_ids=["r"],
+                    resumed_req_ids=set(),
+                    new_token_ids=[],
+                    all_token_ids={},
+                    new_block_ids=[([12],)],
+                    num_computed_tokens=[2],
+                    num_output_tokens=[0],
+                ),
+            )
+        )
+        state = runner._request_states["r"]
+        assert state.token_ids == prompt
+        assert state.block_ids == [[10, 11, 12]]
+        entry = calls[-1].prefill_entries[0]
+        assert entry.prefill.token_ids == prompt[2:4]
+        assert entry.prefill.start_pos == 2
+        assert entry.result_mode == "intermediate"
+
+        runner.execute_model(
+            self._scheduler_output(
+                num_scheduled_tokens={"r": 2},
+                cached_reqs=CachedRequestData(
+                    req_ids=["r"],
+                    resumed_req_ids=set(),
+                    new_token_ids=[],
+                    all_token_ids={},
+                    new_block_ids=[None],
+                    num_computed_tokens=[4],
+                    num_output_tokens=[0],
+                ),
+            )
+        )
+        entry = calls[-1].prefill_entries[0]
+        assert entry.prefill.token_ids == prompt[4:]
+        assert entry.prefill.start_pos == 4
+        assert entry.result_mode == "cached_final"
+
+    def test_preempted_request_readmits_with_full_history(self) -> None:
+        runner = self._make_runner()
+        calls: list[SimpleNamespace] = []
+        self._capture_forward(runner, calls)
+        generator = torch.Generator().manual_seed(0)
+        runner._request_states["r"] = mr.RequestState(
+            token_ids=[1, 2, 3, 4, 7],
+            prompt_len=4,
+            sampling_params=SamplingParams(),
+            generator=generator,
+            generated_tokens=1,
+            block_ids=[[10, 11]],
+        )
+        runtime = runner._paged_attention_runtime
+        runtime.assign_step_slots(["r"])
+
+        # Step 1: the scheduler preempts the request; nothing else is scheduled.
+        runner.execute_model(self._scheduler_output(preempted_req_ids={"r"}))
+
+        # Preemption releases the runtime slot; the stale state stays until
+        # the readmission replaces it.
+        assert "r" in runner._request_states
+        assert runtime.request_slots == {}
+        assert calls == []  # a preemption-only step runs no forward
+
+        # Step 2 (MRv2 shape): the request returns as a NEW request whose
+        # prefill_token_ids carry the full history, prompt included.
+        runner.execute_model(
+            self._scheduler_output(
+                new_reqs=[
+                    NewRequestData(
+                        req_id="r",
+                        prompt_token_ids=[1, 2, 3, 4],
+                        mm_features=[],
+                        sampling_params=SamplingParams(),
+                        pooling_params=None,
+                        block_ids=([10, 11],),
+                        num_computed_tokens=4,
+                        lora_request=None,
+                        prefill_token_ids=[1, 2, 3, 4, 7],
+                    )
+                ],
+                num_scheduled_tokens={"r": 1},
+            )
+        )
+        state = runner._request_states["r"]
+        assert state.token_ids == [1, 2, 3, 4, 7]
+        assert state.prompt_len == 4
+        assert state.generator is generator  # RNG stream survives preemption
+        entry = calls[-1].prefill_entries[0]
+        assert entry.prefill.token_ids == [7]  # only the uncomputed suffix
+        assert entry.prefill.start_pos == 4
+        assert entry.result_mode == "cached_final"
+
+    def test_prefix_hit_admission_alongside_live_decode(self) -> None:
+        runner = self._make_runner()
+        calls: list[SimpleNamespace] = []
+        self._capture_forward(runner, calls)
+
+        # Request A is mid-decode (one sampled token); request B shares its
+        # 2-token prefix and is admitted with a prefix hit (num_computed=2).
+        runner._request_states["A"] = mr.RequestState(
+            token_ids=[1, 2, 8],
+            prompt_len=2,
+            sampling_params=SamplingParams(),
+            generated_tokens=1,  # sampler-owned: A already emitted token 8
+            block_ids=[[10, 11]],
+        )
+        runner._paged_request_seq_lens["A"] = 3
+        runtime = runner._paged_attention_runtime
+        runtime.assign_step_slots(["A"])
+
+        runner.execute_model(
+            self._scheduler_output(
+                new_reqs=[self._new_req("B", [1, 2, 3, 4], num_computed_tokens=2)],
+                num_scheduled_tokens={"A": 1, "B": 2},
+                cached_reqs=self._decode_cached("A", num_computed=3),
+            )
+        )
+
+        assert calls[-1].decode_reqs == ["A"]
+        entry = calls[-1].prefill_entries[0]
+        assert entry.prefill.token_ids == [3, 4]
+        assert entry.prefill.start_pos == 2  # restore position, not zero
+        assert entry.result_mode == "new_final"
+        # A final admission's RequestState is born at sampling time, not here.
+        assert "B" not in runner._request_states
+
+    def test_finished_request_evicts_and_releases_its_slot(self) -> None:
+        runner = self._make_runner()
+        calls: list[SimpleNamespace] = []
+        self._capture_forward(runner, calls)
+        runtime = runner._paged_attention_runtime
+
+        # A is mid-decode; B just finished prefill sampling (its state is what
+        # the sampler leaves: full prompt plus the first sampled token).
+        runner._request_states["A"] = mr.RequestState(
+            token_ids=[1, 2, 8],
+            prompt_len=2,
+            sampling_params=SamplingParams(),
+            generated_tokens=1,
+            block_ids=[[10, 11]],
+        )
+        runner._paged_request_seq_lens["A"] = 3
+        runner._request_states["B"] = mr.RequestState(
+            token_ids=[1, 2, 3, 4, 7],
+            prompt_len=4,
+            sampling_params=SamplingParams(),
+            generated_tokens=1,
+            block_ids=[[10, 11, 12]],
+        )
+        runner._paged_request_seq_lens["B"] = 4
+        runtime.assign_step_slots(["A", "B"])
+
+        runner.execute_model(
+            self._scheduler_output(
+                num_scheduled_tokens={"B": 1},
+                cached_reqs=self._decode_cached("B", num_computed=4),
+                finished_req_ids={"A"},
+            )
+        )
+
+        assert "A" not in runner._request_states
+        assert runner._request_states["B"].token_ids == [1, 2, 3, 4, 7]
+        assert calls[-1].decode_reqs == ["B"]
+        assert list(runtime.request_slots) == ["B"]
