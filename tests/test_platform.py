@@ -270,12 +270,22 @@ class TestMetalPlatform:
         assert exc_info.value.parameter == control
 
     @pytest.mark.parametrize(
-        ("backend", "diffusion"), [("mlx", False), ("mlx", True), ("mps", False)]
+        ("backend", "diffusion", "use_v2"),
+        [
+            ("mlx", False, "0"),
+            ("mlx", False, "1"),
+            ("mlx", True, "1"),
+            ("mps", False, "1"),
+        ],
     )
     def test_validate_request_rejects_prompt_logprob_token_ids(
-        self, monkeypatch: pytest.MonkeyPatch, backend: str, diffusion: bool
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        backend: str,
+        diffusion: bool,
+        use_v2: str,
     ) -> None:
-        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", use_v2)
         monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
         monkeypatch.setattr(MetalPlatform, "_serves_diffusion", diffusion)
 
@@ -687,12 +697,43 @@ class TestMetalPlatform:
             assert config.scheduler_config.async_scheduling is False
             assert "Metal requires synchronous scheduling" in caplog.text
 
-    @pytest.mark.parametrize("backend", ["mlx", "mps"])
-    @pytest.mark.parametrize("flag", ["enable_trace_replay", "return_sampling_mask"])
-    def test_v2_rejects_unsupported_replay(
-        self, monkeypatch: pytest.MonkeyPatch, backend: str, flag: str
+    @pytest.mark.parametrize("async_scheduling", [None, True, False])
+    def test_v2_pipeline_parallelism_requires_synchronous_scheduling(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        async_scheduling: bool | None,
     ) -> None:
         monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+        monkeypatch.setenv("VLLM_METAL_BACKEND", "mlx")
+        monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", False)
+
+        config = VllmConfig(
+            parallel_config=ParallelConfig(
+                pipeline_parallel_size=2,
+                distributed_executor_backend="mp",
+            ),
+            scheduler_config=SchedulerConfig(
+                max_model_len=2048,
+                is_encoder_decoder=False,
+                async_scheduling=async_scheduling,
+            ),
+        )
+
+        assert config.use_v2_model_runner
+        assert config.scheduler_config.async_scheduling is False
+        assert ("Metal requires synchronous scheduling" in caplog.text) == (
+            async_scheduling is not False
+        )
+
+    @pytest.mark.parametrize(
+        ("backend", "use_v2"), [("mlx", "0"), ("mlx", "1"), ("mps", "1")]
+    )
+    @pytest.mark.parametrize("flag", ["enable_trace_replay", "return_sampling_mask"])
+    def test_metal_rejects_unsupported_replay(
+        self, monkeypatch: pytest.MonkeyPatch, backend: str, use_v2: str, flag: str
+    ) -> None:
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", use_v2)
         monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
         config = self._platform_config(model_config=SimpleNamespace(**{flag: True}))
 
@@ -702,7 +743,7 @@ class TestMetalPlatform:
     @pytest.mark.parametrize(
         ("backend", "use_v2"), [("mlx", "0"), ("mlx", "1"), ("mps", "1")]
     )
-    def test_v2_rejects_watermarking_even_when_forced_by_config(
+    def test_metal_rejects_watermarking_even_when_forced_by_config(
         self, monkeypatch: pytest.MonkeyPatch, backend: str, use_v2: str
     ) -> None:
         monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", use_v2)
@@ -714,11 +755,13 @@ class TestMetalPlatform:
         ):
             VllmConfig(watermark_config=WatermarkConfig(key=0))
 
-    @pytest.mark.parametrize("backend", ["mlx", "mps"])
-    def test_v2_rejects_prefill_context_parallelism(
-        self, monkeypatch: pytest.MonkeyPatch, backend: str
+    @pytest.mark.parametrize(
+        ("backend", "use_v2"), [("mlx", "0"), ("mlx", "1"), ("mps", "1")]
+    )
+    def test_metal_rejects_prefill_context_parallelism(
+        self, monkeypatch: pytest.MonkeyPatch, backend: str, use_v2: str
     ) -> None:
-        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", use_v2)
         monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
         monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", False)
 
@@ -750,6 +793,38 @@ class TestMetalPlatform:
             match="Model Runner V2 on Metal does not support: speculative method 'suffix'",
         ):
             config._validate_v2_model_runner()
+
+    def test_mrv2_validation_patch_delegates_on_non_metal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = self._platform_config()
+        calls = []
+
+        def original(config):
+            calls.append(config)
+
+        monkeypatch.setattr(VllmConfig, "_validate_v2_model_runner", original)
+        monkeypatch.setattr("vllm.platforms.current_platform", object())
+
+        platform_module._patch_metal_mrv2_validation()
+        config._validate_v2_model_runner()
+
+        assert calls == [config]
+
+    def test_mrv2_validation_patch_is_idempotent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def original(config):
+            pass
+
+        monkeypatch.setattr(VllmConfig, "_validate_v2_model_runner", original)
+        platform_module._patch_metal_mrv2_validation()
+        patched = VllmConfig._validate_v2_model_runner
+
+        platform_module._patch_metal_mrv2_validation()
+
+        assert VllmConfig._validate_v2_model_runner is patched
+        assert patched.__wrapped__ is original
 
     def test_check_and_update_config_rejects_routed_experts(self) -> None:
         """vLLM leaves AuxOutput validation to out-of-tree platforms."""
