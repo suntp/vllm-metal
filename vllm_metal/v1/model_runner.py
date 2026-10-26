@@ -1992,6 +1992,10 @@ class MetalModelRunner:
         next_key = (
             self._next_native_sample_key
             if self._native_sample_key is not None
+            and self.vllm_config.speculative_config is None
+            and self._drafter is None
+            and grammar_output is None
+            and not scheduler_output.has_structured_output_requests
             else None
         )
         decode_token_ids: list[list[int]] = [[] for _ in decode_reqs]

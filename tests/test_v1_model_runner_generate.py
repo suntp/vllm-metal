@@ -1378,6 +1378,95 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         assert output.sampled_token_ids == [[7, 9], [4]]
         assert sampled_rows == [[[0.0] * 4 + [10.0] + [0.0] * 11]]
 
+    @pytest.mark.parametrize(
+        "blocker",
+        [
+            "eligible",
+            "eligible_mixed",
+            "speculative_config",
+            "drafter",
+            "grammar_output",
+            "structured_output",
+        ],
+    )
+    def test_sync_native_sampling_respects_runner_exclusions(self, blocker) -> None:
+        """Runner exclusions must preserve the native key for an eligible request."""
+        runner = self._make_runner()
+        runner._native_sample_key = mx.random.key(0)
+        initial_key = runner._native_sample_key.tolist()
+        expected_key = mx.random.split(runner._native_sample_key)[0]
+        runner._sampler = Mock(spec=Sampler)
+        runner._sampler.forward.side_effect = Sampler().forward
+        state = self._make_state([1, 6], temperature=0.7)
+        segment = mr.PagedDecodeSegment(
+            req_id="r0",
+            input_token_ids=(6,),
+            start_row=0,
+            num_query_tokens=1,
+            draft_token_ids=(),
+            cache_start_pos=1,
+            block_ids=((0,),),
+        )
+        scheduler_output = self._make_scheduler_output(
+            {"r0": 1}, {}, num_spec_tokens_to_schedule=0
+        )
+        scheduler_output.has_structured_output_requests = blocker == "structured_output"
+        grammar_output = None
+        if blocker == "speculative_config":
+            runner.vllm_config.speculative_config = SimpleNamespace(method="ngram")
+        elif blocker == "drafter":
+            runner._drafter = Mock()
+            runner._drafter.propose.return_value = None
+        elif blocker == "grammar_output":
+            grammar_output = self._make_grammar_output(["r0"], 4)
+        self._install_paged_state(
+            runner,
+            [("r0", state)],
+            (segment,),
+            self._make_logits([4]),
+            scheduler_output,
+        )
+        if blocker == "eligible_mixed":
+            state.sampling_params.top_k = 1
+            prefill = mr.PrefillRequest(
+                req_id="p0",
+                token_ids=[5],
+                sampling_params=SamplingParams(temperature=0.7, top_k=1),
+                block_ids=[[1]],
+                generator=None,
+                prompt_len=1,
+                start_pos=0,
+                full_prompt_token_ids=None,
+            )
+            scheduler_output.num_scheduled_tokens["p0"] = 1
+            scheduler_output.total_num_scheduled_tokens += 1
+            paged_state = runner._execute_model_state
+            output_idx = paged_state.batch.add_output("p0", [])
+            paged_state.batch.paged_prefill_entries = [
+                mr._PendingPrefillEntry(output_idx, prefill, "new_final")
+            ]
+            runner._execute_model_state = paged_state._replace(
+                prefill_reqs=[prefill],
+                logits=self._make_logits([4, 7]),
+                cu_seqlens=[0, 1, 2],
+                logits_cu_seqlens=[0, 1, 2],
+            )
+            expected_key = mx.random.split(expected_key)[0]
+
+        runner._sample_paged_batch(grammar_output)
+
+        assert len(state.token_ids) == 3
+        assert 0 <= state.token_ids[-1] < 16
+        if blocker in ("eligible", "eligible_mixed"):
+            runner._sampler.forward.assert_not_called()
+            assert runner._native_sample_key.tolist() == expected_key.tolist()
+        else:
+            runner._sampler.forward.assert_called_once()
+            assert runner._native_sample_key.tolist() == initial_key
+        if blocker == "eligible_mixed":
+            assert state.token_ids == [1, 6, 4]
+            assert runner._request_states["p0"].token_ids == [5, 7]
+
     def test_structured_output_plain_spec_decode_request_is_allowed(self) -> None:
         runner = self._make_runner()
         structured_state = self._make_state([1, 6])

@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import torch
 from vllm.outputs import RequestOutput
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.output_processor import OutputProcessor
@@ -424,6 +424,40 @@ class TestV1SamplingBatch:
         assert result.logprobs is None
         assert next_key.call_count == (0 if all_greedy else 1)
         sampler.forward.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"prompt_logprobs": 0},
+            {"prompt_logprobs": 1},
+            {"structured_outputs": StructuredOutputsParams(choice=["yes", "no"])},
+        ],
+    )
+    def test_native_random_rejects_logprobs_and_structured_outputs(
+        self, overrides
+    ) -> None:
+        assert not SamplingBatch.params_allow_native_random(
+            [SamplingParams(temperature=0.8, **overrides)]
+        )
+
+    def test_live_key_with_explicit_generator_uses_torch(self) -> None:
+        logits = mx.array([[0.0, 1.0, 4.0, 2.0]], dtype=mx.float32)
+        batch = SamplingBatch(
+            [SamplingParams(temperature=0.8)],
+            [[1]],
+            [[]],
+            vocab_size=4,
+            generators={0: torch.Generator().manual_seed(7)},
+        )
+        next_key = Mock(return_value=mx.random.key(0))
+        sampler = Mock(spec=Sampler)
+        sampler.forward.side_effect = Sampler().forward
+
+        result = sample_from_logits(logits, batch, sampler, next_key=next_key)
+
+        assert 0 <= result.token_ids[0] < 4
+        sampler.forward.assert_called_once()
+        next_key.assert_not_called()
 
     def test_prefill_requests_share_one_sampler_batch(self, monkeypatch) -> None:
         logits = mx.arange(24, dtype=mx.float16).reshape(1, 6, 4)
