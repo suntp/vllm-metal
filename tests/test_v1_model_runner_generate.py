@@ -10,6 +10,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 import torch
+from vllm.config import VllmConfig
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import (
@@ -4680,19 +4681,25 @@ class TestPreemptedReadmission:
         )
 
     def _scheduler_output(
-        self, new_req: NewRequestData, num_scheduled_tokens: int
+        self,
+        new_req: NewRequestData | None,
+        num_scheduled_tokens: int,
+        *,
+        preempted_req_ids: set[str] | None = None,
     ) -> SchedulerOutput:
         return SchedulerOutput(
-            scheduled_new_reqs=[new_req],
+            scheduled_new_reqs=[new_req] if new_req else [],
             scheduled_cached_reqs=CachedRequestData.make_empty(),
-            num_scheduled_tokens={new_req.req_id: num_scheduled_tokens},
+            num_scheduled_tokens=(
+                {new_req.req_id: num_scheduled_tokens} if new_req else {}
+            ),
             total_num_scheduled_tokens=num_scheduled_tokens,
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
             num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
-            preempted_req_ids=set(),
+            preempted_req_ids=preempted_req_ids or set(),
             has_structured_output_requests=False,
         )
 
@@ -4718,13 +4725,24 @@ class TestPreemptedReadmission:
         )
         return runner
 
-    def test_readmission_continues_from_prefill_tokens(self) -> None:
+    def test_readmission_continues_from_prefill_tokens(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
         generator = torch.Generator().manual_seed(0)
         runner = self._preempted_runner(generator)
+        runner.vllm_config = VllmConfig()
+        assert runner.vllm_config.use_v2_model_runner
+        runner._paged_attention_runtime = Mock(spec=SDPAPagedAttentionRuntime)
+        forward = Mock()
+        monkeypatch.setattr(runner, "_start_paged_forward", forward)
         new_req = self._new_req([1, 2, 3, 4, 5, 6], num_computed_tokens=5)
 
-        runner._reconcile_request_lifecycle(set(), preempted_req_ids={"r"})
-        entry = self._admit(runner, new_req, 1)
+        runner.execute_model(self._scheduler_output(None, 0, preempted_req_ids={"r"}))
+        forward.assert_not_called()
+        runner.execute_model(self._scheduler_output(new_req, 1))
+        forward.assert_called_once()
+        entry = forward.call_args.args[0].paged_prefill_entries[0]
 
         state = runner._request_states["r"]
         assert entry.prefill.token_ids == [6]
