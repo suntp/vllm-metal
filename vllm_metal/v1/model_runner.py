@@ -1989,6 +1989,11 @@ class MetalModelRunner:
 
         # ---- sample tokens ----
         vocab_size = self._vocab_size
+        next_key = (
+            self._next_native_sample_key
+            if self._native_sample_key is not None
+            else None
+        )
         decode_token_ids: list[list[int]] = [[] for _ in decode_reqs]
         decode_logprobs_rows: list[LogprobsLists | None] = [None for _ in decode_reqs]
         if has_scheduled_drafts:
@@ -2046,7 +2051,7 @@ class MetalModelRunner:
                     generators=generators,
                 )
                 plain_result = sample_from_logits(
-                    plain_logits, plain_batch, self._sampler
+                    plain_logits, plain_batch, self._sampler, next_key=next_key
                 )
                 for plain_index, (decode_index, _, _) in enumerate(plain_items):
                     decode_token_ids[decode_index] = [
@@ -2064,6 +2069,7 @@ class MetalModelRunner:
                 num_decode_tokens,
                 self._sampler,
                 vocab_size=vocab_size,
+                next_key=next_key,
             )
             decode_token_ids = [[token_id] for token_id in decode_result.token_ids]
             decode_logprobs = decode_result.logprobs
@@ -2074,6 +2080,7 @@ class MetalModelRunner:
             num_decode_segments,
             self._sampler,
             vocab_size=vocab_size,
+            next_key=next_key,
         )
 
         # ---- update decode state ----

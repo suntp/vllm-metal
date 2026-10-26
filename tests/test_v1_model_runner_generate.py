@@ -1364,7 +1364,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         )
         sampled_rows = []
 
-        def fake_sample_from_logits(logits_2d, batch, sampler):
+        def fake_sample_from_logits(logits_2d, batch, sampler, *, next_key=None):
             del sampler
             sampled_rows.append(logits_2d.tolist())
             assert [sp.temperature for sp in batch.sampling_params_list] == [0.7]

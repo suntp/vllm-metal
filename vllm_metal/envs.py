@@ -168,13 +168,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # elementwise glue. Bitwise-identical on the quantized serving path;
     # set to "1" to enable, the default keeps the eager per-op dispatch.
     "VLLM_METAL_COMPILED_MLP": _bool("VLLM_METAL_COMPILED_MLP", False),
-    # MLX-native non-greedy sampling for the decode pipeline (opt-in): the
-    # pipeline's deferred sampler learns a temperature/top-k/top-p graph, so
-    # eligible non-greedy pure-decode steps defer like greedy ones instead
-    # of dropping to the synchronous torch path. Requests with seeds,
-    # penalties, logprobs, or token constraints keep the torch path
-    # unchanged. Set to "1" to enable; intended to flip default-on once the
-    # path has serve mileage, with this var remaining as the kill switch.
+    # Opt-in MLX-native temperature/top-k/top-p/min-p sampling for all eligible
+    # paged batches, including prefill first tokens, mixed prefill/decode steps,
+    # and deferred decode. Seeds, penalties, logprobs, and token constraints
+    # keep the torch path. Set to "1" to enable; "0" is the default/kill switch.
     "VLLM_METAL_NATIVE_SAMPLING": _bool("VLLM_METAL_NATIVE_SAMPLING", False),
     # Experimental MLA Metal decode kernel (RFC #360). Off by default —
     # the MLA wrapper uses the MLX SDPA per-request slow path unless
