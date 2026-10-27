@@ -158,15 +158,15 @@ def test_ngram_spec_divergent_hybrid_preemption_structure_v2(
     assert arm["use_v2"]
     assert arm["async_scheduling"] is False
     assert arm["readmitted"], "No request was readmitted"
-    records = arm["verify"]
-    assert any(span > 1 and resumed for _, span, _, resumed in records), (
+    resumed_records = [record for record in arm["verify"] if record[3]]
+    assert any(span > 1 for _, span, _, _ in resumed_records), (
         "No drafts were verified after readmission"
     )
-    assert any(committed == span > 1 for _, span, committed, _ in records), (
-        "No draft span was fully accepted"
+    assert any(committed == span > 1 for _, span, committed, _ in resumed_records), (
+        "No draft span was fully accepted after readmission"
     )
-    assert any(committed < span for _, span, committed, _ in records), (
-        "No draft span was partially accepted"
+    assert any(committed < span for _, span, committed, _ in resumed_records), (
+        "No draft span was partially accepted after readmission"
     )
     assert len(arm["tokens"]) == 8
     for i, tokens in enumerate(arm["tokens"]):
@@ -191,8 +191,8 @@ def test_ngram_spec_repeated_is_lossless_across_hybrid_preemption_v2(
         assert arm["readmitted"], f"{label}: no request was readmitted"
         assert len(arm["tokens"]) == 8, label
         arms.append(arm)
-    assert any(resumed for _, _, _, resumed in arms[1]["verify"]), (
-        "No verification happened after readmission"
+    assert any(span > 1 and resumed for _, span, _, resumed in arms[1]["verify"]), (
+        "No drafts were verified after readmission"
     )
     for i, (plain, spec) in enumerate(
         zip(arms[0]["tokens"], arms[1]["tokens"], strict=True)
