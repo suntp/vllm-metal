@@ -1621,15 +1621,19 @@ class TestMetalPlatform:
             ),
         )
 
+    @pytest.mark.parametrize("use_v2", ["0", "1"])
     def test_check_and_update_config_disables_async_scheduling_for_spec_decode(
         self,
+        monkeypatch: pytest.MonkeyPatch,
+        use_v2: str,
     ) -> None:
-        """Async scheduling downgrades to synchronous when SD is configured.
+        """SD uses synchronous scheduling with both V1 and V2 model runners.
 
         vLLM 0.28.0 auto-enables async scheduling for draft-model SD
         (vllm#48341) before the platform hook runs; Metal proposers hand
         drafts back synchronously via take_draft_token_ids().
         """
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", use_v2)
         vllm_config = self._platform_config(
             speculative_config=SimpleNamespace(
                 method="draft_model",
