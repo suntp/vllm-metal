@@ -794,6 +794,61 @@ class TestMetalPlatform:
         ):
             config._validate_v2_model_runner()
 
+    @pytest.mark.parametrize(
+        ("validator_name", "features_name"),
+        [
+            ("_validate_v2_model_runner", "_get_v2_model_runner_unsupported_features"),
+            ("_validate_model_runner", "_get_model_runner_unsupported_features"),
+        ],
+    )
+    def test_mrv2_validation_patch_supports_method_names(
+        self, monkeypatch: pytest.MonkeyPatch, validator_name: str, features_name: str
+    ) -> None:
+        for name in (
+            "_validate_v2_model_runner",
+            "_get_v2_model_runner_unsupported_features",
+            "_validate_model_runner",
+            "_get_model_runner_unsupported_features",
+        ):
+            monkeypatch.delattr(VllmConfig, name, raising=False)
+        unsupported = ["x"]
+        monkeypatch.setattr(
+            VllmConfig, validator_name, lambda config: None, raising=False
+        )
+        monkeypatch.setattr(
+            VllmConfig, features_name, lambda config: unsupported, raising=False
+        )
+        monkeypatch.setattr("vllm.platforms.current_platform", MetalPlatform())
+        config = object.__new__(VllmConfig)
+
+        platform_module._patch_metal_mrv2_validation()
+        patched = getattr(VllmConfig, validator_name)
+
+        assert patched._metal_mrv2
+        assert not hasattr(
+            VllmConfig,
+            "_validate_model_runner"
+            if validator_name == "_validate_v2_model_runner"
+            else "_validate_v2_model_runner",
+        )
+        with pytest.raises(ValueError, match="x"):
+            patched(config)
+        unsupported.clear()
+        assert patched(config) is None
+
+    def test_mrv2_validation_patch_requires_validator(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for name in ("_validate_v2_model_runner", "_validate_model_runner"):
+            monkeypatch.delattr(VllmConfig, name, raising=False)
+
+        with pytest.raises(
+            RuntimeError,
+            match="_validate_v2_model_runner.*_validate_model_runner.*"
+            "vllm-metal needs updating for this vLLM version",
+        ):
+            platform_module._patch_metal_mrv2_validation()
+
     def test_mrv2_validation_patch_delegates_on_non_metal(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

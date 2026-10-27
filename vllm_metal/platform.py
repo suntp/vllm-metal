@@ -51,7 +51,20 @@ _METAL_DENSE_KV_CACHE_DTYPE_NAMES: dict[torch.dtype, str] = {
 def _patch_metal_mrv2_validation() -> None:
     from vllm.config import VllmConfig
 
-    original = VllmConfig._validate_v2_model_runner
+    # vllm#63373 renames the validator and its feature list together.
+    names = {
+        "_validate_v2_model_runner": "_get_v2_model_runner_unsupported_features",
+        "_validate_model_runner": "_get_model_runner_unsupported_features",
+    }
+    validator_name = next((n for n in names if hasattr(VllmConfig, n)), None)
+    if validator_name is None:
+        raise RuntimeError(
+            "Expected VllmConfig._validate_v2_model_runner or "
+            "VllmConfig._validate_model_runner; vllm-metal needs updating "
+            "for this vLLM version."
+        )
+    original = getattr(VllmConfig, validator_name)
+    features_name = names[validator_name]
     if getattr(original, "_metal_mrv2", False):
         return
 
@@ -62,14 +75,14 @@ def _patch_metal_mrv2_validation() -> None:
         if not isinstance(current_platform, MetalPlatform):
             return original(config)
         # Metal backends replace Triton operations, but retain feature checks.
-        unsupported = config._get_v2_model_runner_unsupported_features()
+        unsupported = getattr(config, features_name)()
         if unsupported:
             raise ValueError(
                 f"Model Runner V2 on Metal does not support: {', '.join(unsupported)}"
             )
 
     validate._metal_mrv2 = True
-    VllmConfig._validate_v2_model_runner = validate
+    setattr(VllmConfig, validator_name, validate)
 
 
 def _pick_mb_buffer_default(
