@@ -10,16 +10,39 @@ intermediate prefills) and the array marshalling into the upstream kernel.
 
 from __future__ import annotations
 
+import random
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 from vllm.sampling_params import SamplingParams
+from vllm.v1.spec_decode import ngram_proposer as upstream_ngram
+from vllm.v1.spec_decode.ngram_proposer import NgramProposer as VllmNgramProposer
 
 from vllm_metal.v1 import ngram_proposer as ngram_mod
 from vllm_metal.v1.ngram_proposer import NgramProposer
 from vllm_metal.v1.proposer import ProposeContext
 from vllm_metal.v1.spec_decode import PagedDecodeSegment, SpeculativeDecodeController
+
+
+def _vllm_config(
+    prompt_lookup_min: int,
+    prompt_lookup_max: int,
+    num_speculative_tokens: int,
+    max_model_len: int,
+    max_num_seqs: int,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            prompt_lookup_min=prompt_lookup_min,
+            prompt_lookup_max=prompt_lookup_max,
+            num_speculative_tokens=num_speculative_tokens,
+        ),
+        model_config=SimpleNamespace(max_model_len=max_model_len),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1),
+    )
 
 
 def _proposer(
@@ -28,19 +51,16 @@ def _proposer(
     prompt_lookup_max: int = 3,
     num_speculative_tokens: int = 3,
     max_model_len: int = 512,
+    max_num_seqs: int = 4,
 ) -> NgramProposer:
-    vllm_config = SimpleNamespace(
-        speculative_config=SimpleNamespace(
-            prompt_lookup_min=prompt_lookup_min,
-            prompt_lookup_max=prompt_lookup_max,
-            num_speculative_tokens=num_speculative_tokens,
-        ),
-        model_config=SimpleNamespace(max_model_len=max_model_len),
-        scheduler_config=SimpleNamespace(max_num_seqs=4),
-        parallel_config=SimpleNamespace(tensor_parallel_size=1),
-    )
     return NgramProposer(
-        vllm_config=vllm_config,
+        vllm_config=_vllm_config(
+            prompt_lookup_min,
+            prompt_lookup_max,
+            num_speculative_tokens,
+            max_model_len,
+            max_num_seqs,
+        ),
         controller=SpeculativeDecodeController(),
     )
 
@@ -61,6 +81,7 @@ def _context(
     decode_token_ids: list[list[int]] | None = None,
     decode_segments: list[PagedDecodeSegment] | None = None,
     prefill_reqs: list[SimpleNamespace] | None = None,
+    prefill_token_ids: list[int] | None = None,
     prefill_result_modes: list[str] | None = None,
     request_states: dict[str, SimpleNamespace] | None = None,
     num_speculative_tokens: int = 3,
@@ -81,7 +102,9 @@ def _context(
         decode_segments=decode_segments or [],
         decode_token_ids=decode_token_ids,
         prefill_reqs=prefill_reqs,
-        prefill_token_ids=[0] * len(prefill_reqs),
+        prefill_token_ids=(
+            [0] * len(prefill_reqs) if prefill_token_ids is None else prefill_token_ids
+        ),
         prefill_result_modes=prefill_result_modes,
         request_states=request_states,
         cu_seqlens=[],
@@ -558,6 +581,7 @@ class TestNgramMissThrottle:
         assert proposer.propose(disabled_ctx) is None  # K=0, nothing drafted
         assert "r0" not in proposer._cooldown  # cleanup must still happen
         assert "r0" not in proposer._miss_streak
+        assert "r0" not in proposer._row_of
 
         # A later, enabled step must evaluate the new request fresh.
         enabled_ctx = _context(decode_reqs=[("r0", new_state)])
@@ -623,6 +647,439 @@ class TestNgramMissThrottle:
 
         # The pending draft from the verified step must survive untouched.
         assert proposer._pending["r0"] == (3, (99,))
+
+    def test_release_frees_rows_but_preserves_throttle_and_pending(self) -> None:
+        proposer = _proposer(max_num_seqs=2)
+        ctx = _context(decode_reqs=[("miss", _request_state([7, 8, 9]))])
+        for _ in range(ngram_mod._MAX_CONSECUTIVE_MISSES):
+            proposer.propose(ctx)
+        matched = _request_state([1, 2, 3, 1, 2, 3, 1, 2])
+        proposer.propose(_context(decode_reqs=[("match", matched)]))
+        before = (
+            dict(proposer._miss_streak),
+            dict(proposer._cooldown),
+            dict(proposer._pending),
+        )
+        assert all(before)
+
+        # Reconciliation can release an ID at both preemption and resume.
+        for _ in range(2):
+            proposer.release_requests({"miss", "match", "unknown"})
+        assert (proposer._miss_streak, proposer._cooldown, proposer._pending) == before
+        assert not proposer._row_of
+        assert sorted(proposer._free_rows) == [0, 1]
+        assert all(source is None for source in proposer._row_source)
+
+        with patch.object(proposer._ngram, "propose") as mock_propose:
+            assert proposer.propose(ctx) is None
+        mock_propose.assert_not_called()  # Resume must keep the cooldown.
+
+
+def _full_copy_drafts(
+    kernel: VllmNgramProposer,
+    k: int,
+    histories: dict[str, list[int]],
+    max_model_len: int,
+) -> dict[str, list[int]]:
+    """The pre-incremental wrapper: zero a fresh buffer, copy every drafting
+    request's whole history into row i, and call upstream with every row
+    active."""
+    req_ids = list(histories)
+    token_ids_cpu = np.zeros((len(req_ids), max_model_len), dtype=np.int32)
+    for i, req_id in enumerate(req_ids):
+        token_ids_cpu[i, : len(histories[req_id])] = histories[req_id]
+    num_tokens_no_spec = np.array(
+        [len(histories[req_id]) for req_id in req_ids], dtype=np.int32
+    )
+    drafts = kernel.propose(k, [[0]] * len(req_ids), num_tokens_no_spec, token_ids_cpu)
+    return {req_id: d for req_id, d in zip(req_ids, drafts, strict=True) if d}
+
+
+def _v1_kernel_drafts(
+    histories: dict[str, list[int]],
+    *,
+    min_n: int,
+    max_n: int,
+    k: int,
+    max_model_len: int,
+) -> dict[str, list[int]]:
+    """Upstream V1's single-request kernel on each history, one at a time."""
+    out: dict[str, list[int]] = {}
+    for req_id, history in histories.items():
+        if len(history) >= max_model_len:
+            continue
+        draft = upstream_ngram._find_longest_matched_ngram_and_propose_tokens(
+            origin_tokens=np.array(history, dtype=np.int32),
+            min_ngram=min_n,
+            max_ngram=max_n,
+            max_model_len=max_model_len,
+            k=k,
+        )
+        if len(draft):
+            out[req_id] = draft.tolist()
+    return out
+
+
+def _proposed(drafts) -> dict[str, list[int]]:
+    if drafts is None:
+        return {}
+    return dict(zip(drafts.req_ids, drafts.draft_token_ids, strict=True))
+
+
+class TestNgramIncrementalHistory:
+    """Each request keeps a persistent row of token_ids_cpu that is appended
+    to, not rewritten, every step. Drafts must stay token-identical to the
+    old whole-history copy and to upstream's V1 kernel through everything
+    that can invalidate a row: preemption with V2 readmission or V1 resume,
+    finish and row reuse, multi-token acceptance, and paused requests."""
+
+    @pytest.fixture(autouse=True)
+    def _no_throttle(self, monkeypatch) -> None:
+        # Compare every proposal, not just the ones the miss throttle lets
+        # through; throttling has its own tests above.
+        monkeypatch.setattr(ngram_mod, "_MAX_CONSECUTIVE_MISSES", 10**9)
+
+    # Cross both k values with release modes; each case must cover every event.
+    @pytest.mark.parametrize("seed,k", [(0, 3), (1, 5)])
+    @pytest.mark.parametrize("release_on_invalidate", [True, False])
+    def test_randomized_steps_match_full_copy_and_v1_kernel(
+        self, k: int, release_on_invalidate: bool, seed: int
+    ) -> None:
+        min_n, max_n, max_model_len, max_num_seqs = 2, 3, 96, 6
+        rng = random.Random(seed)
+        proposer = _proposer(
+            prompt_lookup_min=min_n,
+            prompt_lookup_max=max_n,
+            num_speculative_tokens=k,
+            max_model_len=max_model_len,
+            max_num_seqs=max_num_seqs,
+        )
+        reference = upstream_ngram.NgramProposer(
+            _vllm_config(min_n, max_n, k, max_model_len, max_num_seqs)
+        )
+        vocab = 6  # small, so histories repeat and drafts are common
+        running: dict[str, SimpleNamespace] = {}
+        preempted: dict[str, SimpleNamespace] = {}
+        last_drafts: dict[str, list[int]] = {}
+        next_id = 0
+        free_ids: list[str] = []
+        num_compared = 0
+        events: set[str] = set()
+
+        def invalidate(req_ids: set[str]) -> None:
+            if release_on_invalidate and req_ids:
+                proposer.release_requests(req_ids)
+
+        for _ in range(120):
+            finished: set[str] = set()
+            # Arrivals; finished ids are sometimes handed straight back out.
+            while (
+                len(running) + len(preempted) < 2 * max_num_seqs and rng.random() < 0.7
+            ):
+                if free_ids and rng.random() < 0.5:
+                    req_id = free_ids.pop(rng.randrange(len(free_ids)))
+                    events.add("reuse")
+                else:
+                    req_id, next_id = f"r{next_id}", next_id + 1
+                prompt = [rng.randrange(vocab) for _ in range(rng.randint(1, 40))]
+                running[req_id] = _request_state(prompt)
+            # Commit this step's tokens: an accepted draft prefix plus one
+            # verifier token (rejected draft tokens are never committed),
+            # or a plain decode token.
+            for req_id, state in running.items():
+                draft = last_drafts.get(req_id, [])
+                accepted = draft[: rng.randint(0, len(draft))] if draft else []
+                if draft:
+                    events.add("accept" if accepted else "reject")
+                    if len(accepted) > 1:
+                        events.add("multi_accept")
+                    if accepted and len(accepted) < len(draft):
+                        events.add("partial_accept")
+                new = [*accepted, rng.randrange(vocab)]
+                room = max_model_len - len(state.token_ids)
+                state.token_ids.extend(new[: max(room, 0)])
+            # Lifecycle events.
+            for req_id in list(running):
+                state = running[req_id]
+                roll = rng.random()
+                if roll < 0.05 or len(state.token_ids) >= max_model_len:
+                    del running[req_id]
+                    finished.add(req_id)
+                    free_ids.append(req_id)
+                    events.add("finish")  # Exercise _prune_finished itself.
+                elif roll < 0.12:
+                    preempted[req_id] = running.pop(req_id)
+                    invalidate({req_id})
+                    events.add("preempt")
+                elif roll < 0.16 and len(state.token_ids) > 1:
+                    del state.token_ids[-rng.randint(1, len(state.token_ids) - 1) :]
+                    events.add("shrink")
+                elif roll < 0.20:
+                    state.token_ids = [rng.randrange(vocab) for _ in state.token_ids]
+                    events.add("rewrite")
+            for req_id in list(preempted):
+                if rng.random() < 0.3:
+                    old = preempted.pop(req_id)
+                    if rng.random() < 0.5:
+                        # V2: a fresh RequestState built from the prefill ids.
+                        state = _request_state(list(old.token_ids))
+                        events.add("readmit")
+                    else:
+                        # V1 resume: same state, list replaced by the
+                        # scheduler's copy, possibly without an in-flight
+                        # token the runner had already appended.
+                        state = old
+                        drop = rng.randint(0, min(1, len(old.token_ids) - 1))
+                        state.token_ids = list(
+                            old.token_ids[: len(old.token_ids) - drop]
+                        )
+                        events.add("resume")
+                    running[req_id] = state
+                    invalidate({req_id})
+            # Some running requests sit this step out (paused/unscheduled).
+            scheduled = [
+                (req_id, state)
+                for req_id, state in running.items()
+                if rng.random() < 0.85
+            ]
+            rng.shuffle(scheduled)
+            scheduled = scheduled[:max_num_seqs]
+            if len(scheduled) < len(running):
+                events.add("pause")
+            num_tokens = rng.randint(1, k)
+            ctx = _context(
+                decode_reqs=scheduled,
+                request_states=dict(running),
+                num_speculative_tokens=num_tokens,
+                finished_req_ids=finished,
+            )
+
+            histories = {req_id: list(state.token_ids) for req_id, state in scheduled}
+            resident = set(proposer._row_of) - finished
+            got = _proposed(proposer.propose(ctx))
+            # These owners cannot all fit, even after pruning finished ids.
+            if len(resident | histories.keys()) > max_num_seqs:
+                assert resident - proposer._row_of.keys()
+                events.add("capacity")
+            want = _full_copy_drafts(reference, num_tokens, histories, max_model_len)
+            v1 = _v1_kernel_drafts(
+                histories,
+                min_n=min_n,
+                max_n=max_n,
+                k=num_tokens,
+                max_model_len=max_model_len,
+            )
+            assert got == want == v1
+            assert list(got) == list(want)
+            assert len(proposer._row_of) + len(proposer._free_rows) == max_num_seqs
+            assert len(set(proposer._row_of.values())) == len(proposer._row_of)
+            assert set(proposer._row_of.values()).isdisjoint(proposer._free_rows)
+            for req_id, state in scheduled:
+                assert state.token_ids == histories[req_id]
+                row = proposer._row_of[req_id]
+                assert proposer._row_len[row] == len(state.token_ids)
+                assert (
+                    proposer._token_ids_cpu[row, : len(state.token_ids)].tolist()
+                    == state.token_ids
+                )
+            num_compared += len(histories)
+            last_drafts = got
+
+        assert num_compared > 200
+        assert events == {
+            "reuse",
+            "accept",
+            "reject",
+            "finish",
+            "preempt",
+            "shrink",
+            "rewrite",
+            "readmit",
+            "resume",
+            "pause",
+            "multi_accept",
+            "partial_accept",
+            "capacity",
+        }
+
+    def test_only_new_tokens_are_copied(self) -> None:
+        proposer = _proposer()
+        state = _request_state([1, 2, 3, 1, 2, 3, 1, 2])
+        proposer.propose(_context(decode_reqs=[("r0", state)]))
+        row = proposer._row_of["r0"]
+        # Poison an already-synced position that is not the last one: an
+        # incremental append must leave it alone.
+        proposer._token_ids_cpu[row, 0] = 777
+        proposer._token_ids_cpu[row, 10:] = 888
+        state.token_ids.extend([3, 1])
+        proposer.propose(_context(decode_reqs=[("r0", state)]))
+        assert proposer._token_ids_cpu[row, 0] == 777
+        assert proposer._token_ids_cpu[row, 8:10].tolist() == [3, 1]
+        assert proposer._row_len[row] == 10
+        assert np.all(proposer._token_ids_cpu[row, 10:] == 888)
+
+    def test_single_request_mock_after_batch_uses_one_row_view(self) -> None:
+        proposer = _proposer()
+        states = [(f"r{i}", _request_state([i, 1, 2, i, 1, 2, i, 1])) for i in range(3)]
+        proposer.propose(_context(decode_reqs=states))
+        with patch.object(
+            proposer._ngram, "propose", return_value=[[99]]
+        ) as mock_propose:
+            drafts = proposer.propose(_context(decode_reqs=states[-1:]))
+        assert _proposed(drafts) == {"r2": [99]}
+        k, sampled, lengths, tokens = mock_propose.call_args.args
+        assert k == 3 and sampled == [[0]] and lengths.tolist() == [8]
+        assert tokens.shape == (1, 512)
+        assert np.shares_memory(tokens, proposer._token_ids_cpu)
+        assert tokens[0, :8].tolist() == states[-1][1].token_ids
+
+    def test_reordered_sparse_batch_skips_inactive_rows(self) -> None:
+        proposer = _proposer()
+        states = [(f"r{i}", _request_state([i, 1, 2, i, 1, 2, i, 1])) for i in range(4)]
+        proposer.propose(_context(decode_reqs=states))
+        scheduled = [states[3], states[1]]
+        with patch.object(
+            proposer._ngram, "propose", wraps=proposer._ngram.propose
+        ) as mock_propose:
+            drafts = proposer.propose(_context(decode_reqs=scheduled))
+        assert drafts is not None
+        assert drafts.req_ids == ["r3", "r1"]
+        assert drafts.draft_token_ids == [[2, 3, 1], [2, 1, 1]]
+        _, sampled, lengths, tokens = mock_propose.call_args.args
+        assert sampled == [[0], [], [0]]
+        assert lengths.tolist() == [8, 0, 8]
+        assert np.shares_memory(tokens, proposer._token_ids_cpu)
+
+    @pytest.mark.parametrize("mode", ["decode_stop_before_bonus", "prefill_eos"])
+    def test_terminal_tokens_skip_resident_rows(self, mode: str) -> None:
+        proposer = _proposer()
+        states = [(f"r{i}", _request_state([1, 2, 3, 1, 2, 3, 1, 2])) for i in range(3)]
+        terminal = states[1][1]
+        terminal.sampling_params = SamplingParams(temperature=0, stop_token_ids=[7])
+        terminal.sampling_params.update_from_generation_config({}, eos_token_id=9)
+        assert set(_proposed(proposer.propose(_context(decode_reqs=states)))) == {
+            "r0",
+            "r1",
+            "r2",
+        }
+
+        if mode == "decode_stop_before_bonus":
+            terminal.token_ids.extend([7, 2])
+            ctx = _context(decode_reqs=states, decode_token_ids=[[2], [7, 2], [2]])
+        else:
+            # Eligibility uses the current prefill token, even before history updates.
+            ctx = _context(
+                decode_reqs=[states[0], states[2]],
+                prefill_reqs=[SimpleNamespace(req_id="r1")],
+                prefill_token_ids=[9],
+                request_states=dict(states),
+            )
+
+        assert _proposed(proposer.propose(ctx)) == {"r0": [3, 1, 2], "r2": [3, 1, 2]}
+
+    @pytest.mark.parametrize("change", ["replace_list", "shrink", "rewrite"])
+    def test_invalidated_history_resyncs(self, change: str) -> None:
+        proposer = _proposer()
+        state = _request_state([1, 2, 3, 1, 2, 3, 1, 2])
+        assert _proposed(proposer.propose(_context(decode_reqs=[("r0", state)]))) == {
+            "r0": [3, 1, 2]
+        }
+        # Same boundary token: checking only the last token misses the rewrite.
+        replacement = [4, 2, 6, 4, 2, 6, 4, 2]
+        if change == "replace_list":
+            # V1 resume and V2 readmission both change token-list identity.
+            state.token_ids = replacement
+        elif change == "shrink":
+            state.token_ids[:] = replacement[:5]
+        else:
+            # In-place rewrites require the runner's lifecycle invalidation;
+            # ordinary committed histories only grow by append/extend.
+            proposer.release_requests({"r0"})
+            state.token_ids[:] = replacement
+        drafts = proposer.propose(_context(decode_reqs=[("r0", state)]))
+        histories = {"r0": state.token_ids}
+        expected = _full_copy_drafts(proposer._ngram, 3, histories, 512)
+        assert expected == _v1_kernel_drafts(
+            histories, min_n=2, max_n=3, k=3, max_model_len=512
+        )
+        assert expected and _proposed(drafts) == expected
+        row = proposer._row_of["r0"]
+        assert (
+            proposer._token_ids_cpu[row, : len(state.token_ids)].tolist()
+            == state.token_ids
+        )
+
+    def test_rewritten_last_token_resyncs(self) -> None:
+        proposer = _proposer()
+        state = _request_state([2, 3, 1, 2, 3, 1, 2, 9])
+        assert proposer.propose(_context(decode_reqs=[("r0", state)])) is None
+        # Same list object, same length, last committed token rewritten.
+        state.token_ids[-1] = 3
+        drafts = _proposed(proposer.propose(_context(decode_reqs=[("r0", state)])))
+        expected = _v1_kernel_drafts(
+            {"r0": state.token_ids}, min_n=2, max_n=3, k=3, max_model_len=512
+        )
+        assert expected and drafts == expected
+
+    @pytest.mark.parametrize("new_id", ["r0", "r1"])
+    def test_finished_row_is_reused_without_stale_tail(self, new_id: str) -> None:
+        proposer = _proposer()
+        long_state = _request_state([9, 8, 9, 8, 9, 8, 9, 8, 7, 7, 7, 7])
+        proposer.propose(_context(decode_reqs=[("r0", long_state)]))
+        row = proposer._row_of["r0"]
+        # r0 finishes; a new request takes its row with a shorter history.
+        short_state = _request_state([1, 2, 1, 2])
+        drafts = proposer.propose(
+            _context(decode_reqs=[(new_id, short_state)], finished_req_ids={"r0"})
+        )
+        assert proposer._row_of == {new_id: row}
+        expected = _v1_kernel_drafts(
+            {new_id: short_state.token_ids}, min_n=2, max_n=3, k=3, max_model_len=512
+        )
+        assert expected and _proposed(drafts) == expected
+
+    def test_rows_reclaimed_when_live_requests_exceed_capacity(self) -> None:
+        proposer = _proposer(max_num_seqs=2)
+        states = {f"r{i}": _request_state([i, 1, 2, i, 1, 2, i, 1]) for i in range(3)}
+        # Three live requests, never more than two drafting in one step.
+        for pair in (("r0", "r1"), ("r2", "r0"), ("r1", "r2"), ("r0", "r1")):
+            retained = {r: proposer._row_of[r] for r in pair if r in proposer._row_of}
+            ctx = _context(decode_reqs=[(r, states[r]) for r in pair])
+            assert _proposed(proposer.propose(ctx)) == {
+                r: [2, int(r[1]), 1] for r in pair
+            }
+            # A newcomer must not evict an owner later in drafting order.
+            assert all(proposer._row_of[r] == row for r, row in retained.items())
+        assert len(proposer._row_of) == 2
+
+    def test_over_capacity_batch_fails_before_reassigning_rows(self) -> None:
+        proposer = _proposer(max_num_seqs=1)
+        state = _request_state([1, 2, 3, 1, 2, 3, 1, 2])
+        proposer.propose(_context(decode_reqs=[("r0", state)]))
+        with pytest.raises(
+            RuntimeError, match="more drafting requests than max_num_seqs=1"
+        ):
+            proposer.propose(_context(decode_reqs=[("r1", state), ("r2", state)]))
+        assert proposer._row_of == {"r0": 0}
+        assert _proposed(proposer.propose(_context(decode_reqs=[("r0", state)]))) == {
+            "r0": [3, 1, 2]
+        }
+
+    @pytest.mark.parametrize("length", [7, 8, 9])
+    def test_history_near_max_model_len_is_bounded(self, length: int) -> None:
+        proposer = _proposer(max_model_len=8)
+        state = _request_state(([1, 2, 3] * 4)[:length])
+        drafts = proposer.propose(_context(decode_reqs=[("r0", state)]))
+        expected = _v1_kernel_drafts(
+            {"r0": state.token_ids}, min_n=2, max_n=3, k=3, max_model_len=8
+        )
+        assert _proposed(drafts) == expected
+        assert proposer._row_len[proposer._row_of["r0"]] == min(length, 8)
+        # Shrinking below the limit must invalidate a previously capped row.
+        state.token_ids[:] = [1, 2, 1, 2]
+        assert _proposed(proposer.propose(_context(decode_reqs=[("r0", state)]))) == {
+            "r0": [1, 2]
+        }
 
 
 if __name__ == "__main__":
