@@ -119,7 +119,7 @@ if TYPE_CHECKING:
     VLLM_METAL_GDN_LAZY_KERNELS: bool = True
     VLLM_METAL_DECODE_PIPELINE: bool = True
     VLLM_METAL_COMPILED_MLP: bool = False
-    VLLM_METAL_NATIVE_SAMPLING: bool = False
+    VLLM_METAL_NATIVE_SAMPLING: bool = True
     VLLM_METAL_MLA_KERNEL: bool = False
     VLLM_METAL_DISABLE_NAX: bool = False
     VLLM_METAL_DISABLE_GQA_DECODE: bool = False
@@ -168,12 +168,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # elementwise glue. Bitwise-identical on the quantized serving path;
     # set to "1" to enable, the default keeps the eager per-op dispatch.
     "VLLM_METAL_COMPILED_MLP": _bool("VLLM_METAL_COMPILED_MLP", False),
-    # Opt-in MLX-native random sampling; greedy behavior is unchanged.
+    # MLX-native random sampling (default on); greedy behavior is unchanged.
     # Seeds/explicit generators, penalties, sample or prompt logprobs,
     # allowed-token IDs, bad words, structured outputs, or any speculative
-    # decoding config keep random sampling on torch. Set to "1" to enable;
-    # "0" is the default/kill switch.
-    "VLLM_METAL_NATIVE_SAMPLING": _bool("VLLM_METAL_NATIVE_SAMPLING", False),
+    # decoding config keep random sampling on torch. Set to "0" as the kill
+    # switch to sample every non-greedy step with the torch sampler.
+    "VLLM_METAL_NATIVE_SAMPLING": _bool("VLLM_METAL_NATIVE_SAMPLING", True),
     # Experimental MLA Metal decode kernel (RFC #360). Off by default —
     # the MLA wrapper uses the MLX SDPA per-request slow path unless
     # this opt-in is set. Set to "1" to route absorbed-MLA decode
