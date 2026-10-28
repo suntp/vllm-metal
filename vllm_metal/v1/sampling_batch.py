@@ -202,7 +202,7 @@ class SamplingBatch:
         Requests must use plain temperature/top-k/top-p/min-p sampling; the
         mask is built per row, so rows may mix greedy (temperature 0) with
         random sampling and differ in top-k/top-p/min-p. Requests with seeds,
-        sample or prompt logprobs, or structured outputs stay on the torch path.
+        sample logprobs, or structured outputs stay on the torch path.
         """
         if not sampling_params_list:
             return False
@@ -212,7 +212,6 @@ class SamplingBatch:
             and sp.presence_penalty == 0.0
             and sp.repetition_penalty == 1.0
             and sp.num_logprobs is None
-            and sp.prompt_logprobs is None
             and sp.structured_outputs is None
             and not sp.allowed_token_ids
             and not sp.bad_words_token_ids

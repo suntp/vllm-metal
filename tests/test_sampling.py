@@ -425,19 +425,20 @@ class TestV1SamplingBatch:
         assert next_key.call_count == (0 if all_greedy else 1)
         sampler.forward.assert_not_called()
 
-    @pytest.mark.parametrize(
-        "overrides",
-        [
-            {"prompt_logprobs": 0},
-            {"prompt_logprobs": 1},
-            {"structured_outputs": StructuredOutputsParams(choice=["yes", "no"])},
-        ],
-    )
-    def test_native_random_rejects_logprobs_and_structured_outputs(
-        self, overrides
-    ) -> None:
+    @pytest.mark.parametrize("prompt_logprobs", [0, 1])
+    def test_native_random_allows_prompt_logprobs(self, prompt_logprobs) -> None:
+        assert SamplingBatch.params_allow_native_random(
+            [SamplingParams(temperature=0.8, prompt_logprobs=prompt_logprobs)]
+        )
+
+    def test_native_random_rejects_structured_outputs(self) -> None:
         assert not SamplingBatch.params_allow_native_random(
-            [SamplingParams(temperature=0.8, **overrides)]
+            [
+                SamplingParams(
+                    temperature=0.8,
+                    structured_outputs=StructuredOutputsParams(choice=["yes", "no"]),
+                )
+            ]
         )
 
     def test_live_key_with_explicit_generator_uses_torch(self) -> None:

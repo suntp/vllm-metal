@@ -1379,6 +1379,23 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         assert output.sampled_token_ids == [[7, 9], [4]]
         assert sampled_rows == [[[0.0] * 4 + [10.0] + [0.0] * 11]]
 
+    def test_prompt_logprobs_decode_stays_native(self, monkeypatch) -> None:
+        monkeypatch.setenv("VLLM_METAL_DECODE_PIPELINE", "1")
+        runner = self._make_runner()
+        runner._native_sample_key = mx.random.key(0)
+        runner._paged_attention_runtime = object()
+        state = self._make_state([1, 6])
+        state.sampling_params = SamplingParams(temperature=0.7, prompt_logprobs=0)
+        runner._request_states["r0"] = state
+        scheduler_output = self._make_scheduler_output(
+            {"r0": 1}, {}, num_spec_tokens_to_schedule=0
+        )
+        scheduler_output.scheduled_cached_reqs.req_ids = ["r0"]
+
+        decision = runner._evaluate_pipeline_gate(scheduler_output)
+
+        assert decision.eligible
+
     @pytest.mark.parametrize(
         "blocker",
         [

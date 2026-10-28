@@ -135,8 +135,8 @@ class SamplingShape:
 
         Either native mode (greedy argmax or eligible random sampling with
         ``VLLM_METAL_NATIVE_SAMPLING``) keeps the step deferrable.  Prompt
-        logprob collection finishes during prefill, but the request flag
-        still excludes the row from native random decoding.
+        logprobs are gathered on the completing prefill step before decode
+        rows enter ``decode_req_ids``, so they never reach this gate.
         """
         if not (self.native_greedy or self.native_random):
             return "non-native sampling"
