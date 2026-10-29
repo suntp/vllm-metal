@@ -183,6 +183,36 @@ class TestNgramProposePropose:
 
         assert proposer.propose(ctx) is None
 
+    def test_cooldown_resume_syncs_all_appended_history(self) -> None:
+        """Tokens committed during cooldown must reach the next real lookup."""
+        proposer = _proposer()
+        state = _request_state([1, 2, 3, 4, 5])
+        for token in range(10, 10 + ngram_mod._MAX_CONSECUTIVE_MISSES):
+            state.token_ids.append(token)
+            assert proposer.propose(_context(decode_reqs=[("r0", state)])) is None
+        assert proposer._cooldown["r0"] == ngram_mod._COOLDOWN_STEPS
+        row = proposer._row_of["r0"]
+        synced = int(proposer._row_len[row])
+
+        for _ in range(ngram_mod._COOLDOWN_STEPS):
+            state.token_ids.extend([1, 2])
+            assert proposer.propose(_context(decode_reqs=[("r0", state)])) is None
+            assert proposer._row_len[row] == synced
+
+        state.token_ids.extend([3, 4])
+        ctx = _context(decode_reqs=[("r0", state)])
+        drafts = _proposed(proposer.propose(ctx))
+        fresh = _proposer()
+        assert drafts == _proposed(fresh.propose(ctx))
+        assert drafts == {"r0": [5, 10, 11]}
+        length = len(state.token_ids)
+        assert proposer._row_len[row] == length
+        assert (
+            proposer._token_ids_cpu[row, :length].tolist()
+            == fresh._token_ids_cpu[fresh._row_of["r0"], :length].tolist()
+            == state.token_ids
+        )
+
     @pytest.mark.parametrize("positional_cap,max_tokens", [(1, None), (1, 5), (3, 3)])
     def test_draft_caps_take_the_tighter_bound(
         self, positional_cap, max_tokens

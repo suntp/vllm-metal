@@ -18,10 +18,10 @@ step's accepted/sampled tokens by the time the runner builds the context).
 Like upstream V1's persistent ``InputBatch.token_ids_cpu``, each resident
 request owns a fixed row of the preallocated ``token_ids_cpu`` buffer, and each
 step copies only the tokens committed since that row was last synced, instead
-of an O(batch x history) host copy every step. A row is rebuilt from scratch
-whenever it may no longer mirror the request (new request, preempt/resume, V2
-readmission, or a rewritten history list) and is handed back by
-``release_requests`` and on finish.
+of an O(batch x history) host copy every step. A row is rebuilt after release,
+list replacement, shrink, or a changed last-synced token. In-place prefix
+rewrites that preserve the list, length, and boundary require callers to use
+``release_requests`` first. Rows are also released on finish.
 
 The wrapper also keeps a consecutive-miss streak per request, so a request
 with no exploitable repetition (free-form prose, for instance) stops paying
