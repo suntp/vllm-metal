@@ -73,6 +73,145 @@ class TestSpecVerifyPredicate:
 
 
 class TestAcceptanceFixup:
+    @pytest.mark.parametrize("kept", [(3, 1, 3), (1, 1, 3), (4, 2, 3)])
+    def test_mixed_chunks_match_full_batch_rescan(self, kept, monkeypatch) -> None:
+        """Partial verify fixups preserve other forward states across prefill chunks."""
+        _require_metal()
+        mx.random.seed(0)
+        lazy = GDNLazyKernels(enabled=True)
+        cache = make_state_cache(
+            num_layers=1,
+            max_seqs=7,
+            conv_kernel_dim=4,
+            conv_dim=64,
+            num_v_heads=4,
+            value_head_dim=8,
+            key_head_dim=32,
+        )
+        reference = make_state_cache(
+            num_layers=1,
+            max_seqs=7,
+            conv_kernel_dim=4,
+            conv_dim=64,
+            num_v_heads=4,
+            value_head_dim=8,
+            key_head_dim=32,
+        )
+        cache.conv_states[0] = mx.random.normal(cache.conv_states[0].shape).astype(
+            mx.float16
+        )
+        cache.recurrent_states[0] = mx.random.normal(cache.recurrent_states[0].shape)
+        slots = [5, 2, 6, 0, 3, 1]
+        cu = [0, 1, 5, 7, 8, 11, 18]  # plain, verify, verify, plain, verify, prefill
+        committed = [1, kept[0], kept[1], 1, kept[2], 7]
+        for _ in range(2):
+            reference.conv_states[0] = cache.conv_states[0]
+            reference.recurrent_states[0] = cache.recurrent_states[0]
+            arrays = _inputs(cu[-1])
+            mixed = mx.random.normal((1, cu[-1], 64))
+            _scan(lazy, cache, slots, cu, *arrays)
+
+            def tails(lengths, mixed=mixed):
+                return mx.stack(
+                    [
+                        mx.concatenate(
+                            [cache.conv_states[0][slot], mixed[0, start : start + n]]
+                        )[-3:]
+                        for slot, start, n in zip(slots, cu[:-1], lengths, strict=True)
+                    ]
+                ).astype(mx.float16)
+
+            cache.set_pending_conv_state(0, slots, tails(np.diff(cu)))
+            forward_recurrent = cache.pending_recurrent_states[0]
+            forward_conv = cache.pending_conv_states[0]
+            # Original algorithm: rescan every request's committed prefix.
+            rows = [
+                r
+                for start, n in zip(cu[:-1], committed, strict=True)
+                for r in range(start, start + n)
+            ]
+            _scan(
+                lazy,
+                reference,
+                slots,
+                np.cumsum([0, *committed]).tolist(),
+                *[a[:, rows] for a in arrays],
+            )
+            expected_conv = tails(committed)
+
+            cache.spec_verify_stash = GDNSpecVerifyStep()
+            stash_spec_verify_layer(
+                cache.spec_verify_stash,
+                cache_idx=0,
+                slot_ids=slots,
+                cu_seqlens=cu,
+                num_decode_requests=5,
+                compute_dtype=None,
+                decode_threadgroup_dv=4,
+                q=arrays[0],
+                k=arrays[1],
+                v=arrays[2],
+                g=arrays[3],
+                beta=arrays[4],
+                mixed_qkv=mixed,
+            )
+            layer = cache.spec_verify_stash.layers[0]
+            assert layer.request_indices == [1, 2, 4]
+            assert layer.cu_seqlens == [0, 4, 6, 9]
+            for actual, original in zip(
+                (layer.q, layer.k, layer.v, layer.g, layer.beta, layer.mixed_qkv),
+                (*arrays, mixed),
+                strict=True,
+            ):
+                np.testing.assert_array_equal(
+                    np.array(actual),
+                    np.array(original[:, [1, 2, 3, 4, 5, 6, 8, 9, 10]]),
+                )
+            mx.eval(*cache.updated_state_arrays())
+            calls = []
+
+            def record_scan(original, calls=calls):
+                def scan(request):
+                    calls.append((request.slot_ids, request.q.shape[1]))
+                    return original(request)
+
+                return scan
+
+            with monkeypatch.context() as patch:
+                for name in ("try_recurrent_prefill", "try_recurrent_decode"):
+                    patch.setattr(lazy, name, record_scan(getattr(lazy, name)))
+                rescanned = apply_spec_decode_acceptance(cache, lazy, committed[:5])
+            assert calls == ([([2, 6], kept[0] + kept[1])] if rescanned else [])
+            assert rescanned == (kept != (4, 2, 3))
+            np.testing.assert_allclose(
+                np.array(cache.pending_recurrent_states[0]),
+                np.array(reference.pending_recurrent_states[0]),
+                atol=1e-4,
+            )
+            np.testing.assert_array_equal(
+                np.array(cache.pending_conv_states[0]), np.array(expected_conv)
+            )
+            unchanged = [i for i, n in enumerate(committed) if n == cu[i + 1] - cu[i]]
+            for actual, original in (
+                (cache.pending_recurrent_states[0], forward_recurrent),
+                (cache.pending_conv_states[0], forward_conv),
+            ):
+                np.testing.assert_array_equal(
+                    np.array(actual[unchanged]), np.array(original[unchanged])
+                )
+            if not rescanned:
+                assert cache.pending_recurrent_states[0] is forward_recurrent
+                assert cache.pending_conv_states[0] is forward_conv
+            # Start the next chunk from the corrected states without native scatter.
+            cache.recurrent_states[0] = mx.array(cache.recurrent_states[0])
+            cache.recurrent_states[0][mx.array(slots)] = cache.pending_recurrent_states[
+                0
+            ]
+            cache.conv_states[0] = mx.array(cache.conv_states[0])
+            cache.conv_states[0][mx.array(slots)] = cache.pending_conv_states[0]
+            cache.discard_pending_states()
+            reference.discard_pending_states()
+
     def test_partial_accept_rescans_to_accepted_depth(self) -> None:
         _require_metal()
         mx.random.seed(0)
@@ -137,7 +276,7 @@ class TestAcceptanceFixup:
             cache_idx=0,
             slot_ids=slot_ids,
             cu_seqlens=cu,
-            span_lengths=(span, span),
+            num_decode_requests=2,
             compute_dtype=None,
             decode_threadgroup_dv=4,
             q=q,
@@ -187,7 +326,7 @@ class TestAcceptanceFixup:
             cache_idx=0,
             slot_ids=slot_ids,
             cu_seqlens=cu,
-            span_lengths=(span,),
+            num_decode_requests=1,
             compute_dtype=None,
             decode_threadgroup_dv=4,
             q=q,
@@ -231,7 +370,7 @@ class TestAcceptanceFixup:
             cache_idx=0,
             slot_ids=slot_ids,
             cu_seqlens=cu,
-            span_lengths=(span,),
+            num_decode_requests=1,
             compute_dtype=None,
             decode_threadgroup_dv=4,
             q=q,
@@ -267,7 +406,6 @@ class TestAcceptanceFixup:
             key_head_dim=32,
         )
         slot_ids = [0, 1]
-        spans = (4, 2)
         cu = [0, 4, 6]
         q, k, v, g, beta = _inputs(6)
         mixed_qkv = mx.random.normal((1, 6, 64))
@@ -307,7 +445,7 @@ class TestAcceptanceFixup:
             cache_idx=0,
             slot_ids=slot_ids,
             cu_seqlens=cu,
-            span_lengths=spans,
+            num_decode_requests=2,
             compute_dtype=None,
             decode_threadgroup_dv=4,
             q=q,
@@ -383,7 +521,7 @@ class TestAcceptanceFixup:
             cache_idx=0,
             slot_ids=slot_ids,
             cu_seqlens=cu,
-            span_lengths=(span, span),
+            num_decode_requests=2,
             compute_dtype=None,
             decode_threadgroup_dv=4,
             q=q,
