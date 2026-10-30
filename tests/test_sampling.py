@@ -376,13 +376,15 @@ class TestSamplerDevicePolicy:
                 seen_devices.append(logits_torch.device)
                 return super().forward(logits_torch, sampling_metadata)
 
-        next_key = Mock(return_value=mx.random.key(0)) if overrides else None
-        result = sample_from_logits(logits, batch, SpySampler(), next_key=next_key)
+        next_native_rng_key = Mock(return_value=mx.random.key(0)) if overrides else None
+        result = sample_from_logits(
+            logits, batch, SpySampler(), next_native_rng_key=next_native_rng_key
+        )
 
         assert [d.type for d in seen_devices] == ["cpu"]
         assert 0 <= result.token_ids[0] < 4
-        if next_key is not None:
-            next_key.assert_not_called()
+        if next_native_rng_key is not None:
+            next_native_rng_key.assert_not_called()
 
 
 class TestV1SamplingBatch:
@@ -409,11 +411,13 @@ class TestV1SamplingBatch:
             [[], []],
             vocab_size=4,
         )
-        next_key = Mock(return_value=mx.random.key(0))
+        next_native_rng_key = Mock(return_value=mx.random.key(0))
         sampler = Mock(spec=Sampler)
         sampler.forward.side_effect = AssertionError("Native sampling must skip torch")
 
-        result = sample_from_logits(logits, batch, sampler, next_key=next_key)
+        result = sample_from_logits(
+            logits, batch, sampler, next_native_rng_key=next_native_rng_key
+        )
 
         assert len(result.token_ids) == 2
         for row, temperature in enumerate(temperatures):
@@ -422,7 +426,7 @@ class TestV1SamplingBatch:
             else:
                 assert result.token_ids[row] in {1, 2}
         assert result.logprobs is None
-        assert next_key.call_count == (0 if all_greedy else 1)
+        assert next_native_rng_key.call_count == (0 if all_greedy else 1)
         sampler.forward.assert_not_called()
 
     @pytest.mark.parametrize("prompt_logprobs", [0, 1])
@@ -450,15 +454,17 @@ class TestV1SamplingBatch:
             vocab_size=4,
             generators={0: torch.Generator().manual_seed(7)},
         )
-        next_key = Mock(return_value=mx.random.key(0))
+        next_native_rng_key = Mock(return_value=mx.random.key(0))
         sampler = Mock(spec=Sampler)
         sampler.forward.side_effect = Sampler().forward
 
-        result = sample_from_logits(logits, batch, sampler, next_key=next_key)
+        result = sample_from_logits(
+            logits, batch, sampler, next_native_rng_key=next_native_rng_key
+        )
 
         assert 0 <= result.token_ids[0] < 4
         sampler.forward.assert_called_once()
-        next_key.assert_not_called()
+        next_native_rng_key.assert_not_called()
 
     def test_prefill_requests_share_one_sampler_batch(self, monkeypatch) -> None:
         logits = mx.arange(24, dtype=mx.float16).reshape(1, 6, 4)
@@ -535,7 +541,7 @@ class TestV1SamplingBatch:
                 None,
             ),
         ]
-        next_key = Mock(return_value=mx.random.key(0))
+        next_native_rng_key = Mock(return_value=mx.random.key(0))
         sampler = Mock(spec=Sampler)
         sampler.forward.side_effect = AssertionError("Native sampling must skip torch")
 
@@ -546,11 +552,11 @@ class TestV1SamplingBatch:
             num_decode=0,
             sampler=sampler,
             vocab_size=4,
-            next_key=next_key,
+            next_native_rng_key=next_native_rng_key,
         )
 
         assert result == sampling_batch._SamplingResult([0, 3 if has_final else 0])
-        assert next_key.call_count == int(has_final)
+        assert next_native_rng_key.call_count == int(has_final)
         sampler.forward.assert_not_called()
 
     @pytest.mark.parametrize("selective_logits", [False, True])
@@ -778,11 +784,11 @@ class TestV1SamplingBatch:
         keys = iter([mx.random.key(seed) for seed in range(64)])
         sampled = {
             int(
-                SamplingBatch.native_decode_tokens(
+                SamplingBatch.native_sample_tokens(
                     logits,
                     params,
                     vocab_size=len(probs),
-                    next_key=lambda: next(keys),
+                    next_native_rng_key=lambda: next(keys),
                 ).item()
             )
             for _ in range(64)
