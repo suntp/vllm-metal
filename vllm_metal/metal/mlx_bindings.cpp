@@ -26,6 +26,7 @@ static bool set_paged_dispatch_diagnostics(bool enabled) {
   g_last_gqa_partition.store(0, std::memory_order_relaxed);
   g_last_gqa_requests.store(0, std::memory_order_relaxed);
   g_last_nax_split.store(-1, std::memory_order_relaxed);
+  g_last_nax_heads_per_tg.store(0, std::memory_order_relaxed);
   return previous;
 }
 static int gqa_decode_plan_for_shape(int num_heads, int num_kv_heads,
@@ -478,6 +479,14 @@ NB_MODULE(_paged_ops, m) {
         "Outputs are identical either way. For head_size 512, an effective "
         "hint of 1 selects two 256-column output slices; 0 or -1 keeps the "
         "original loop.");
+
+  m.def(
+      "last_nax_heads_per_threadgroup",
+      []() { return g_last_nax_heads_per_tg.load(std::memory_order_relaxed); },
+      "Heads per threadgroup of the most recent recorded NAX launch, after "
+      "pipeline-capacity fallback: 1 upstream, 3 or 6 grouped, 0 for another "
+      "family or when diagnostics are cleared/disabled. Process-wide test "
+      "diagnostic; inspect only after evaluation completes, not a request trace.");
 
   m.def(
       "last_nax_split_pipeline",

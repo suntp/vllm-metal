@@ -55,6 +55,7 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 
+from vllm_metal.attention.block_tables import build_block_tables
 from vllm_metal.metal import get_ops
 
 # (query tokens, context tokens) per sequence. One-token rows exercise decode
@@ -108,6 +109,8 @@ class Case:
     poison_padding: bool = False
     q_heads: int = Q_HEADS
     kv_heads: int = KV_HEADS
+    cache_page: int = 0
+    expected_widths: tuple[int, int] | None = None
 
     def __str__(self) -> str:
         return (
@@ -197,7 +200,7 @@ def _grouped_cases() -> list[Case]:
             mx.bfloat16,
             256,
             16,
-            f"grouped-q{q}-p{prefix}",
+            f"gqa6-geometry-q{q}-p{prefix}",
             seqs=((q, prefix),),
             poison_padding=True,
             q_heads=h,
@@ -217,6 +220,20 @@ def _grouped_cases() -> list[Case]:
             (96, 16, 1281, 8192),
         ]
     ]
+    cases.append(
+        Case(
+            mx.bfloat16,
+            256,
+            16,
+            "grouped-required-h3-h6",
+            seqs=((1328, 31360),),
+            poison_padding=True,
+            q_heads=24,
+            kv_heads=4,
+            cache_page=784,
+            expected_widths=(3, 6),
+        )
+    )
     for dtype, d, page, window, softcap, sinks in [
         (mx.float16, 256, 16, -1, 0.0, False),
         (mx.bfloat16, 128, 16, -1, 0.0, False),
@@ -246,7 +263,7 @@ def _grouped_cases() -> list[Case]:
 
 def _build_case(case: Case):
     mx.random.seed(3)
-    block_size, head_size = case.block_size, case.head_size
+    block_size, head_size = case.cache_page or case.block_size, case.head_size
     totals = [q + c for q, c in case.seqs]
     blocks_per = [(t + block_size - 1) // block_size for t in totals]
     num_blocks = sum(blocks_per) + 1  # block 0 is padding
@@ -283,6 +300,9 @@ def _build_case(case: Case):
     block_tables = mx.array(
         [row + [0] * (max_blocks - len(row)) for row in rows], dtype=mx.int32
     )
+    if case.cache_page:
+        block_tables, kernel_page = build_block_tables(rows, case.cache_page)
+        assert kernel_page == case.block_size
     seq_lens = mx.array(totals, dtype=mx.int32)
     cu_seqlens = mx.array(
         [0, *mx.cumsum(mx.array([q for q, _ in case.seqs], dtype=mx.int32)).tolist()],
@@ -345,13 +365,24 @@ def _compare(case: Case, nax: mx.array, tiled: mx.array) -> tuple[bool, str]:
 
 def _forced_hints(case: Case) -> bool:
     return (
-        case.regime.startswith(("boundary", "grouped"))
+        case.regime.startswith(("boundary", "grouped", "gqa6"))
         or case.head_size == 512
         or (case.block_size == 16 and case.head_size >= 128)
     )
 
 
 def _check(ops, case: Case) -> tuple[bool, str]:
+    # This is route correctness under fixed host planning, not GPU timing.
+    if case.expected_widths is not None:
+        ops._override_detected_gpu_core_count_for_test(40)
+    try:
+        return _check_case(ops, case)
+    finally:
+        if case.expected_widths is not None:
+            ops._override_detected_gpu_core_count_for_test(-1)
+
+
+def _check_case(ops, case: Case) -> tuple[bool, str]:
     built = _build_case(case)
     tiled, tiled_dispatch, _ = _run(ops, case, built, enabled=False)
     if tiled_dispatch != "tiled_prefill":
@@ -364,16 +395,20 @@ def _check(ops, case: Case) -> tuple[bool, str]:
         grouped = nax_dispatch == "nax_gqa6_prefill"
         if grouped and os.environ.get("VLLM_METAL_NAX_GQA_PREFILL", "1") != "1":
             return False, "Grouped route ran with the feature disabled"
-        expected_grouped = (
-            os.environ.get("VLLM_METAL_NAX_GQA_PREFILL", "1") == "1"
-            and case.regime.startswith("grouped-q1328-")
-            and ops.detected_gpu_core_count() in (10, 20, 40)
-        )
+        width = ops.last_nax_heads_per_threadgroup()
+        if case.expected_widths is not None:
+            assert hint is not None
+            expected = (
+                case.expected_widths[hint]
+                if os.environ.get("VLLM_METAL_NAX_GQA_PREFILL", "1") == "1"
+                else 1
+            )
+            if width != expected:
+                return False, f"hint={hint}: executed h{width}, expected h{expected}"
         can_group = (
-            case.regime.startswith("grouped-") and case.regime != "grouped-fallback"
+            case.regime.startswith(("grouped-", "gqa6-"))
+            and case.regime != "grouped-fallback"
         )
-        if expected_grouped and hint == 0 and not grouped:
-            return False, "Expected the qualified grouped route at Q1328"
         if nax_dispatch != "nax_prefill" and not (can_group and grouped):
             return False, f"hint={hint}: unexpected dispatch NAX={nax_dispatch}"
         if hint is not None and not grouped:
@@ -382,7 +417,7 @@ def _check(ops, case: Case) -> tuple[bool, str]:
                 return False, f"hint={hint}: ran pipeline {pipeline}, want {expected}"
         mx.eval(nax, tiled)
         ok, detail = _compare(case, nax, tiled)
-        details.append(f"{nax_dispatch}/{pipeline}: {detail}")
+        details.append(f"{nax_dispatch}/h{width}/{pipeline}: {detail}")
         if not ok:
             return False, "; ".join(details)
     return True, "; ".join(details)
