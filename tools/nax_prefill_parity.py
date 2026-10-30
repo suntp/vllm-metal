@@ -7,6 +7,10 @@ silently skips itself is worse than no check. Run it on an M5 before touching
 ``pagedattention_nax.metal`` or the NAX dispatch::
 
     python tools/nax_prefill_parity.py
+    VLLM_METAL_NAX_GQA_PREFILL=0 python tools/nax_prefill_parity.py
+
+The default run includes GQA6 head groups and tails. Run the second command
+in a fresh process for the upstream control; the feature flag is read at load.
 
 Covers every compiled specialization -- {float16, bfloat16} x head_size
 {64, 96, 128, 256, 512} x block_size {8, 16, 32} -- in both masking regimes:
@@ -45,6 +49,7 @@ two-slice ``_v256`` kernel.
 from __future__ import annotations
 
 import math
+import os
 import sys
 from dataclasses import dataclass
 
@@ -101,11 +106,14 @@ class Case:
     use_sinks: bool = False
     seqs: tuple[tuple[int, int], ...] = SEQS
     poison_padding: bool = False
+    q_heads: int = Q_HEADS
+    kv_heads: int = KV_HEADS
 
     def __str__(self) -> str:
         return (
             f"{str(self.dtype).removeprefix('mlx.core.'):9s} "
-            f"hs={self.head_size:<3d} bs={self.block_size:<2d} {self.regime}"
+            f"h={self.q_heads}/{self.kv_heads} hs={self.head_size:<3d} "
+            f"bs={self.block_size:<2d} {self.regime}"
         )
 
 
@@ -182,6 +190,60 @@ def _boundary_cases() -> list[Case]:
     return cases
 
 
+def _grouped_cases() -> list[Case]:
+    """GQA6 group widths, tails, translated pages and feature fallbacks."""
+    cases = [
+        Case(
+            mx.bfloat16,
+            256,
+            16,
+            f"grouped-q{q}-p{prefix}",
+            seqs=((q, prefix),),
+            poison_padding=True,
+            q_heads=h,
+            kv_heads=k,
+        )
+        for h, k, q, prefix in [
+            (24, 4, 16, 8193),
+            (24, 4, 63, 31360),
+            (24, 4, 64, 31360),
+            (24, 4, 65, 31360),
+            (24, 4, 128, 31681),
+            (24, 4, 144, 31361),
+            (24, 4, 1328, 31360),
+            (24, 4, 2048, 0),
+            (12, 2, 240, 31360),
+            (48, 8, 1280, 8193),
+            (96, 16, 1281, 8192),
+        ]
+    ]
+    for dtype, d, page, window, softcap, sinks in [
+        (mx.float16, 256, 16, -1, 0.0, False),
+        (mx.bfloat16, 128, 16, -1, 0.0, False),
+        (mx.bfloat16, 512, 16, -1, 0.0, False),
+        (mx.bfloat16, 256, 32, -1, 0.0, False),
+        (mx.bfloat16, 256, 16, 31, 0.0, False),
+        (mx.bfloat16, 256, 16, -1, SOFTCAP, False),
+        (mx.bfloat16, 256, 16, -1, 0.0, True),
+    ]:
+        cases.append(
+            Case(
+                dtype,
+                d,
+                page,
+                "grouped-fallback",
+                softcap,
+                window,
+                sinks,
+                ((144, 31361),),
+                True,
+                24,
+                4,
+            )
+        )
+    return cases
+
+
 def _build_case(case: Case):
     mx.random.seed(3)
     block_size, head_size = case.block_size, case.head_size
@@ -189,11 +251,11 @@ def _build_case(case: Case):
     blocks_per = [(t + block_size - 1) // block_size for t in totals]
     num_blocks = sum(blocks_per) + 1  # block 0 is padding
 
-    shape = (num_blocks, block_size, KV_HEADS, head_size)
+    shape = (num_blocks, block_size, case.kv_heads, head_size)
     key_cache = mx.random.normal(shape).astype(case.dtype)
     value_cache = mx.random.normal(shape).astype(case.dtype)
     query = (
-        mx.random.normal((sum(q for q, _ in case.seqs), Q_HEADS, head_size)) * 0.5
+        mx.random.normal((sum(q for q, _ in case.seqs), case.q_heads, head_size)) * 0.5
     ).astype(case.dtype)
 
     # Non-contiguous physical pages exercise the block-table gather.
@@ -214,6 +276,9 @@ def _build_case(case: Case):
         padding = mx.array(float("nan"), dtype=case.dtype)
         key_cache = mx.where(valid, key_cache, padding)
         value_cache = mx.where(valid, value_cache, padding)
+    if case.q_heads // case.kv_heads == 6:
+        kv = mx.stack((key_cache, value_cache), axis=3)
+        key_cache, value_cache = kv[:, :, :, 0, :], kv[:, :, :, 1, :]
     max_blocks = max(blocks_per)
     block_tables = mx.array(
         [row + [0] * (max_blocks - len(row)) for row in rows], dtype=mx.int32
@@ -224,7 +289,7 @@ def _build_case(case: Case):
         dtype=mx.int32,
     )
     sinks = (
-        (mx.random.normal((Q_HEADS,)) * 0.5).astype(mx.float32)
+        (mx.random.normal((case.q_heads,)) * 0.5).astype(mx.float32)
         if case.use_sinks
         else None
     )
@@ -243,7 +308,7 @@ def _run(
         query,
         key_cache,
         value_cache,
-        KV_HEADS,
+        case.kv_heads,
         case.head_size**-0.5,
         case.softcap,
         block_tables,
@@ -280,7 +345,7 @@ def _compare(case: Case, nax: mx.array, tiled: mx.array) -> tuple[bool, str]:
 
 def _forced_hints(case: Case) -> bool:
     return (
-        case.regime.startswith("boundary")
+        case.regime.startswith(("boundary", "grouped"))
         or case.head_size == 512
         or (case.block_size == 16 and case.head_size >= 128)
     )
@@ -296,15 +361,28 @@ def _check(ops, case: Case) -> tuple[bool, str]:
         nax, nax_dispatch, pipeline = _run(
             ops, case, built, enabled=True, split_hint=hint
         )
-        if nax_dispatch != "nax_prefill":
+        grouped = nax_dispatch == "nax_gqa6_prefill"
+        if grouped and os.environ.get("VLLM_METAL_NAX_GQA_PREFILL", "1") != "1":
+            return False, "Grouped route ran with the feature disabled"
+        expected_grouped = (
+            os.environ.get("VLLM_METAL_NAX_GQA_PREFILL", "1") == "1"
+            and case.regime.startswith("grouped-q1328-")
+            and ops.detected_gpu_core_count() in (10, 20, 40)
+        )
+        can_group = (
+            case.regime.startswith("grouped-") and case.regime != "grouped-fallback"
+        )
+        if expected_grouped and hint == 0 and not grouped:
+            return False, "Expected the qualified grouped route at Q1328"
+        if nax_dispatch != "nax_prefill" and not (can_group and grouped):
             return False, f"hint={hint}: unexpected dispatch NAX={nax_dispatch}"
-        if hint is not None:
+        if hint is not None and not grouped:
             expected = hint
             if pipeline != expected:
                 return False, f"hint={hint}: ran pipeline {pipeline}, want {expected}"
         mx.eval(nax, tiled)
         ok, detail = _compare(case, nax, tiled)
-        details.append(f"{'split' if pipeline == 1 else 'loop'}: {detail}")
+        details.append(f"{nax_dispatch}/{pipeline}: {detail}")
         if not ok:
             return False, "; ".join(details)
     return True, "; ".join(details)
@@ -319,7 +397,7 @@ def main() -> int:
         )
         return 2
 
-    cases = _cases() + _boundary_cases()
+    cases = _cases() + _boundary_cases() + _grouped_cases()
     failures = []
     previous_diagnostics = ops._set_paged_dispatch_diagnostics(True)
     try:
