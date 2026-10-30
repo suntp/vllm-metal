@@ -160,6 +160,19 @@ def apply_spec_decode_acceptance(
         state_cache.spec_verify_stash = None
 
 
+def _merge_state_rows(
+    state: mx.array,
+    state_slots: list[int],
+    updates: mx.array,
+    update_slots: list[int],
+) -> mx.array:
+    """Replace selected rows without changing the saved forward state."""
+    rows = mx.array([state_slots.index(slot) for slot in update_slots], mx.int32)
+    merged = mx.array(state)
+    merged[rows] = updates
+    return merged
+
+
 def _rescan_layer_to_accepted(
     state_cache: PagedStateCache,
     lazy: GDNLazyKernels,
@@ -245,9 +258,12 @@ def _rescan_layer_to_accepted(
 
     if recurrent is not None:
         assert recurrent_slots is not None
-        rows = mx.array([recurrent_slots.index(slot) for slot in slot_ids], mx.int32)
-        recurrent = mx.array(recurrent)
-        recurrent[rows] = state_cache.pending_recurrent_states[layer_stash.cache_idx]
+        recurrent = _merge_state_rows(
+            recurrent,
+            recurrent_slots,
+            state_cache.pending_recurrent_states[layer_stash.cache_idx],
+            slot_ids,
+        )
         state_cache.clear_pending_recurrent_state(layer_stash.cache_idx)
         state_cache.set_pending_recurrent_state(
             layer_stash.cache_idx, recurrent_slots, recurrent
@@ -267,10 +283,7 @@ def _rescan_layer_to_accepted(
     updated_conv = mx.stack(tails, axis=0).astype(conv_state.dtype)
     if conv is not None:
         assert conv_slots is not None
-        rows = mx.array([conv_slots.index(slot) for slot in slot_ids], mx.int32)
-        updated_conv_rows = updated_conv
-        updated_conv = mx.array(conv)
-        updated_conv[rows] = updated_conv_rows
+        updated_conv = _merge_state_rows(conv, conv_slots, updated_conv, slot_ids)
         slot_ids = conv_slots
     state_cache.set_pending_conv_state(layer_stash.cache_idx, slot_ids, updated_conv)
     mx.eval(
