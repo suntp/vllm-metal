@@ -1,42 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""N-gram (prompt-lookup) speculative decoding proposer for the Metal paged path.
+"""N-gram drafting through vLLM's CPU matcher, with no model or KV cache.
 
-An :class:`NgramProposer` drafts by matching the longest suffix n-gram of each
-request's committed token history against an earlier occurrence and copying the
-tokens that followed it (vLLM ``method="ngram"``). Unlike
-:class:`vllm_metal.v1.draft_model_proposer.DraftModelProposer` it loads no model
-and keeps no KV cache: the matching is the pure-Python + Numba KMP kernel that
-vLLM ships in :mod:`vllm.v1.spec_decode.ngram_proposer`, which this class wraps.
+Each resident request keeps a history row. Steps append committed tokens;
+release or list replacement causes a rebuild. The runner releases rows on
+preemption and resume. Streaming input can replace history without a release.
 
-The wrapper translates the per-step :class:`ProposeContext` into the runtime
-draft count and array arguments that upstream's stateless ``propose`` expects
-(``num_speculative_tokens``, ``sampled_token_ids``, ``num_tokens_no_spec``,
-``token_ids_cpu``) and hands the result back as :class:`DraftTokenIds`. The
-committed history lives in ``state.token_ids`` (already updated with this
-step's accepted/sampled tokens by the time the runner builds the context).
-
-Like upstream V1's persistent ``InputBatch.token_ids_cpu``, each resident
-request owns a fixed row of the preallocated ``token_ids_cpu`` buffer, and each
-step copies only the tokens committed since that row was last synced, instead
-of an O(batch x history) host copy every step. A row is rebuilt after release,
-list replacement, shrink, or a changed last-synced token. In-place prefix
-rewrites that preserve the list, length, and boundary require callers to use
-``release_requests`` first. Rows are also released on finish.
-
-The wrapper also keeps a consecutive-miss streak per request, so a request
-with no exploitable repetition (free-form prose, for instance) stops paying
-the match kernel's per-step scan cost after a few misses in a row, with
-periodic retries in case the content turns repetitive later. See
-``_record_miss``/``_on_cooldown``.
-
-A lookup match is not itself evidence the request benefits: the target may
-reject every proposed token. ``_resolve_pending`` checks a step's proposal
-against the *next* step's committed history (which already reflects what the
-target actually accepted) to score it as a real hit or a miss, rather than
-trusting the lookup kernel's own optimism.
-
-The verify half is unchanged: drafts are handed back via ``take_draft_token_ids``
-and verified next step by ``SpeculativeDecodeController.verify_greedy``.
+Repeated lookup misses or rejected drafts trigger a short cooldown. Acceptance
+is read from the next step's committed history. Drafts use the shared verifier.
 """
 
 from __future__ import annotations
@@ -115,21 +85,11 @@ class NgramProposer(NoOwnKVProposer):
         assert spec.prompt_lookup_min is not None
         self._prompt_lookup_min = spec.prompt_lookup_min
 
-        # Pre-allocate the int32 token-id buffer once: one row per request
-        # that can be scheduled at the same time, each long enough for the
-        # longest committed history. Upstream only reads
-        # ``token_ids_cpu[i, :num_tokens_no_spec[i]]``, so a row's tail past
-        # its synced length is never read and never needs clearing.
+        # Upstream reads only each row's committed prefix, so tails need no reset.
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         max_model_len = vllm_config.model_config.max_model_len
         self._max_model_len = max_model_len
         self._token_ids_cpu = np.zeros((max_num_seqs, max_model_len), dtype=np.int32)
-        # Row ownership. ``_row_source[row]`` is the exact ``state.token_ids``
-        # list the row mirrors; ``_row_len[row]`` is how many of its leading
-        # tokens are already in the buffer (capped at max_model_len). The
-        # runner replaces the list object on V1 resume and builds a new
-        # RequestState on V2 readmission, so an identity mismatch alone
-        # forces a full resync even if release_requests was skipped.
         self._row_of: dict[str, int] = {}
         self._row_source: list[list[int] | None] = [None] * max_num_seqs
         self._row_len = np.zeros(max_num_seqs, dtype=np.int32)
@@ -170,13 +130,7 @@ class NgramProposer(NoOwnKVProposer):
         return False
 
     def release_requests(self, req_ids: set[str]) -> None:
-        # Called for evicted, preempted and resumed requests. Their history
-        # row is a bounded resource and its contents may no longer match
-        # what the request resumes with, so hand it back; the next draft
-        # rebuilds it from the request's current history. The miss-streak
-        # throttle is per-request bookkeeping, not a bounded resource: a
-        # preempted request keeps its counters across resume, and they are
-        # dropped when its id finishes.
+        # Free history rows; throttle state survives preemption until finish.
         for req_id in req_ids:
             self._release_row(req_id)
 
@@ -213,12 +167,6 @@ class NgramProposer(NoOwnKVProposer):
         if not drafting:
             return None
 
-        if len(drafting) > len(self._row_source):
-            raise RuntimeError(
-                "n-gram proposer: more drafting requests than "
-                f"max_num_seqs={len(self._row_source)} history rows"
-            )
-
         # Protect all drafting owners before allocating: a new request may
         # precede an existing owner in drafting order.
         in_use = {
@@ -228,13 +176,7 @@ class NgramProposer(NoOwnKVProposer):
             self._sync_row(req_id, state.token_ids, in_use)
             for req_id, state in drafting
         ]
-        # Hand upstream a view spanning the active rows, without gathering
-        # (and copying) their histories. In particular, a single drafting
-        # request always gets a one-row view and a one-element result.
-        # Upstream marks a row "active" by a non-empty sampled-ids entry and
-        # reads only token_ids_cpu[i, :num_tokens_no_spec[i]], so rows in the
-        # span owned by requests not drafting this step (or free) are skipped
-        # and return [].
+        # Pass a view, not a copy. Empty sampled IDs make upstream skip row gaps.
         first_row, last_row = min(rows), max(rows) + 1
         relative_rows = [row - first_row for row in rows]
         num_rows = last_row - first_row
@@ -290,29 +232,12 @@ class NgramProposer(NoOwnKVProposer):
     # -- per-request history rows --------------------------------------------
 
     def _sync_row(self, req_id: str, token_ids: list[int], in_use: set[int]) -> int:
-        """Return ``req_id``'s row with ``token_ids`` mirrored into it.
-
-        Resume/readmission replaces the list or releases the row. Otherwise
-        committed history grows only by append/extend: speculative decoding
-        disables pipeline placeholder backfill and never commits rejected
-        drafts. Also resync on shrink or a changed boundary token; arbitrary
-        in-place prefix rewrites must invalidate the row via release_requests.
-        """
+        """Append committed tokens, rebuilding if a streaming turn replaces history."""
         row = self._row_of.get(req_id)
         if row is None:
             row = self._acquire_row(req_id, in_use)
-            synced = 0
-        elif self._row_source[row] is not token_ids:
-            synced = 0
-        else:
-            synced = int(self._row_len[row])
-            if synced and (
-                len(token_ids) < synced
-                or self._token_ids_cpu[row, synced - 1] != token_ids[synced - 1]
-            ):
-                synced = 0
-        # Upstream never drafts for a history already at max_model_len, so
-        # the buffer needs at most that many tokens.
+        synced = int(self._row_len[row]) if self._row_source[row] is token_ids else 0
+        # Upstream skips histories at the model limit, including verify overshoot.
         num_tokens = min(len(token_ids), self._max_model_len)
         if num_tokens > synced:
             self._token_ids_cpu[row, synced:num_tokens] = token_ids[synced:num_tokens]
@@ -323,18 +248,8 @@ class NgramProposer(NoOwnKVProposer):
 
     def _acquire_row(self, req_id: str, in_use: set[int]) -> int:
         if not self._free_rows:
-            # Every row is owned. Rows are released on finish, preempt and
-            # resume, so this means more live requests than max_num_seqs;
-            # reclaim one that is not drafting this step -- its owner gets a
-            # full resync if it drafts again.
-            victim = next(
-                (rid for rid, r in self._row_of.items() if r not in in_use), None
-            )
-            if victim is None:
-                raise RuntimeError(
-                    "n-gram proposer: more drafting requests than "
-                    f"max_num_seqs={len(self._row_source)} history rows"
-                )
+            # The scheduler bounds drafting rows, so an idle owner exists.
+            victim = next(rid for rid, row in self._row_of.items() if row not in in_use)
             self._release_row(victim)
         row = heapq.heappop(self._free_rows)
         self._row_of[req_id] = row
