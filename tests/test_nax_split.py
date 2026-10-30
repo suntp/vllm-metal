@@ -293,6 +293,7 @@ def test_native_prefill_hint_only_applies_after_decode_separation(
         "mixed_nax_prefill_decode" if separated else "nax_prefill"
     )
     assert ops.last_nax_split_pipeline() == int(separated)
+    assert ops.last_nax_heads_per_threadgroup() == 1
     if separated:
         assert mx.array_equal(actual[:1], decode).item()
         assert mx.array_equal(actual[1:], whole[1:]).item()
@@ -301,6 +302,7 @@ def test_native_prefill_hint_only_applies_after_decode_separation(
             fallback = _mixed_call(inputs, **defaults)
             assert ops.last_paged_dispatch() == "mixed_nax_prefill_decode"
             assert ops.last_nax_split_pipeline() == 0
+            assert ops.last_nax_heads_per_threadgroup() == 1
             assert mx.array_equal(fallback, actual).item()
     else:
         assert mx.array_equal(actual, whole).item()

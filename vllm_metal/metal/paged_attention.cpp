@@ -26,7 +26,9 @@ inline void record_paged_dispatch(PagedDispatch family, int gqa_partition = 0,
     g_last_nax_split.store(-1, std::memory_order_relaxed);
   g_last_gqa_partition.store(gqa_partition, std::memory_order_relaxed);
   g_last_gqa_requests.store(gqa_requests, std::memory_order_relaxed);
-  g_last_nax_heads_per_tg.store(nax_heads_per_tg, std::memory_order_relaxed);
+  // The mixed wrapper records its family after NAX records the executed width.
+  if (family != PagedDispatch::MixedNaxPrefillDecode)
+    g_last_nax_heads_per_tg.store(nax_heads_per_tg, std::memory_order_relaxed);
 }
 
 // Split a mixed batch's decode rows only when they carry at least this much
