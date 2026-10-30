@@ -98,69 +98,152 @@ inline NaxPrefillWork nax_prefill_work(int q, int prefix, int heads, int kv_head
           double(visits + end) / (full + (tail != 0)), double(end),
           (bq == 64 ? heads : kv_heads) * (full + (tail != 0)), full};
 }
-struct NaxGqaScore { bool eligible; bool admit; double value; int heads_per_tg; };
-inline NaxGqaScore nax_gqa_work_score(int q, int prefix, int heads, int kv_heads, int page,
-                   int cores, bool upstream_split) {
+
+struct NaxGqaScore {
+  bool eligible;
+  bool admit;
+  double value;
+  int heads_per_tg;
+};
+
+inline double nax_gqa_split_score(
+    const NaxPrefillWork& baseline, const NaxPrefillWork& grouped,
+    int heads_per_group, double head_growth, double padding_savings,
+    double critical_savings) {
+  constexpr double kPaddingBenefit = 13;
+  constexpr double kCriticalPathBenefit = 8;
+  constexpr double kFullTileBenefit = 2.5;
+  constexpr double kGuardedQueryBenefit = 15;
+  constexpr double kStreamCost = 10;
+  constexpr double kExtraStateCost = 3.5;
+  constexpr double kGuardedQueryCost = 16;
+
+  const double extra_heads = std::max(0., head_growth);
+  const double benefit = kPaddingBenefit * padding_savings
+      + kCriticalPathBenefit * critical_savings + kFullTileBenefit * grouped.fast
+      + kGuardedQueryBenefit * (baseline.guarded_q - grouped.guarded_q);
+  const double cost = (kStreamCost / heads_per_group
+      + kExtraStateCost * extra_heads * extra_heads) * grouped.issued
+      + kGuardedQueryCost * grouped.guarded_q;
+  return (benefit - cost) / baseline.issued;
+}
+
+inline double nax_gqa_guarded_score(
+    const NaxPrefillWork& baseline, const NaxPrefillWork& grouped,
+    int heads, int gpu_cores, double head_growth,
+    double critical_savings, double memory_work_fraction) {
+  constexpr double kPartialQueryBenefit = 4;
+  constexpr double kCriticalPathBenefit = .875;
+  constexpr double kReuseBenefit = 3.5;
+  constexpr double kGuardedTileBenefit = 4;
+  constexpr double kGridCost = 10.5;
+  constexpr double kExtraGridCost = 32;
+  constexpr double kStreamCost = 3;
+  constexpr double kExtraStreamCost = 3.5;
+  constexpr double kCoreCost = 11.5;
+  constexpr double kKvEdgeCost = 2;
+  constexpr double kExtraStateCost = .75;
+  constexpr double kGuardedQueryCost = 5;
+
+  const double extra_heads = std::max(0., head_growth);
+  const double partial_savings = (baseline.guarded_q - grouped.guarded_q)
+      * std::min(1., double(gpu_cores)
+          / std::max(int64_t(1), heads * baseline.full_blocks));
+  const double reuse = head_growth
+      * std::min(1., double(gpu_cores) / baseline.groups) * grouped.issued;
+  const double lost_grid_work = std::max(int64_t(0),
+      std::min(int64_t(gpu_cores), baseline.groups)
+      - std::min(int64_t(gpu_cores), grouped.groups)) * grouped.stream;
+  const double benefit = kPartialQueryBenefit * partial_savings
+      + kCriticalPathBenefit * critical_savings + kReuseBenefit * reuse
+      + kGuardedTileBenefit * (baseline.guarded - baseline.guarded_q);
+  double cost = (kGridCost + kExtraGridCost * extra_heads * extra_heads
+      * std::min(1., std::max(0., double(baseline.groups) / gpu_cores - 1)))
+      * lost_grid_work;
+  cost += (kStreamCost + kExtraStreamCost * extra_heads
+      * (1 - memory_work_fraction)) * grouped.issued
+      + kCoreCost * gpu_cores + kKvEdgeCost * grouped.kv_edge;
+  cost += kExtraStateCost * extra_heads * extra_heads * grouped.issued
+      * std::min(1., double(grouped.groups) / gpu_cores)
+      + kGuardedQueryCost * grouped.guarded_q;
+  return (benefit - cost) / baseline.issued;
+}
+
+inline NaxGqaScore nax_gqa_work_score(
+    int q, int prefix, int heads, int kv_heads, int page,
+    int cores, bool upstream_split) {
+  constexpr int kGroupedQueryTile = 16;
+  constexpr int kSupportedRatio = 6;
+  constexpr int kSupportedPageSize = 16;
+  constexpr int kNarrowHeadLimit = 4;
+  constexpr int kGuardedWideCores = 10;
+  constexpr int kGuardedWideGroupsPerCore = 18;
+  constexpr double kGuardedWideWorkPerCore = 16384;
+  constexpr int kWideGroupsPerCore = 48;
+  constexpr double kSaturatedWorkPerCore = 65536;
+  constexpr int kDenseGroupsPerCore = 32;
+  constexpr double kDenseFullFraction = .95;
+  constexpr double kAdmissionMargin = .5;
+  constexpr double kTailReserveWeight = 8;
+
   if (q <= 1 || prefix < 0 || heads <= 0 || kv_heads <= 0 ||
       heads % kv_heads || cores <= 0) return {false, false, 0, 0};
   const int ratio = heads / kv_heads;
-  if (ratio != 6 || page != 16)
+  if (ratio != kSupportedRatio || page != kSupportedPageSize)
     return {false, false, 0, 0};
-  const auto u = nax_prefill_work(q, prefix, heads, kv_heads, 64, upstream_split);
-  const auto full = nax_prefill_work(q, prefix, heads, kv_heads, 16, true);
-  const double full_work = full.fast;
+  const auto baseline = nax_prefill_work(
+      q, prefix, heads, kv_heads, kNaxBQ, upstream_split);
+  const auto full_group = nax_prefill_work(
+      q, prefix, heads, kv_heads, kGroupedQueryTile, true);
+  const double full_work = full_group.fast;
   const bool measured_stride = (kv_heads & (kv_heads - 1)) == 0;
-  // The guarded wide-group allowance is calibrated at ten cores. Scaling
-  // it by groups/core alone regresses the larger tested devices.
+  // The wider guarded layout regressed on larger GPUs; keep its 10-core gate.
   const bool guarded_wide = measured_stride &&
-      cores == 10 && !upstream_split &&
-      int64_t(heads) * (q / 16) >= int64_t(18) * cores &&
-      full_work >= 16384. * cores;
-  double memory_work_fraction = std::min(1., full_work / (65536. * cores));
+      cores == kGuardedWideCores && !upstream_split &&
+      int64_t(heads) * (q / kGroupedQueryTile) >=
+          int64_t(kGuardedWideGroupsPerCore) * cores &&
+      full_work >= kGuardedWideWorkPerCore * cores;
+  double memory_work_fraction =
+      std::min(1., full_work / (kSaturatedWorkPerCore * cores));
   if (guarded_wide) memory_work_fraction = 1.;
-  const int limit = int64_t(heads) * (q / 16) >= int64_t(48) * cores ||
-      full_work >= 65536. * cores || guarded_wide ? 6 : 4;
-  // Complete-work density is separate from guarded-query tail savings.
-  // A small Q or KV tail is allowed; the whole call need not be aligned.
+  const int head_limit =
+      int64_t(heads) * (q / kGroupedQueryTile) >=
+          int64_t(kWideGroupsPerCore) * cores ||
+      full_work >= kSaturatedWorkPerCore * cores || guarded_wide
+          ? kSupportedRatio : kNarrowHeadLimit;
   const bool dense_full = measured_stride && upstream_split &&
-      int64_t(kv_heads) * (q / 16) >= int64_t(32) * cores &&
-      full.fast >= .95 * full.issued;
-  const double tail_depth = q % 16 ? (int64_t(prefix) + q + 31) / 32 : 0;
-  const double threshold = .5 + 8. * cores * (ratio / 2) * tail_depth / u.issued;
+      int64_t(kv_heads) * (q / kGroupedQueryTile) >=
+          int64_t(kDenseGroupsPerCore) * cores &&
+      full_group.fast >= kDenseFullFraction * full_group.issued;
+  const double tail_depth =
+      q % kGroupedQueryTile ? (int64_t(prefix) + q + 31) / 32 : 0;
+  const double threshold = kAdmissionMargin
+      + kTailReserveWeight * cores * (ratio / 2) * tail_depth / baseline.issued;
   NaxGqaScore best{true, false, -1e300, 0};
-  for (const int h : {ratio / 2, ratio}) {
-    if (h > limit || (h > 4 && int64_t(heads / h) * (q / 16) < cores))
+  for (const int heads_per_group : {ratio / 2, ratio}) {
+    if (heads_per_group > head_limit ||
+        (heads_per_group > kNarrowHeadLimit &&
+         int64_t(heads / heads_per_group) * (q / kGroupedQueryTile) < cores))
       continue;
-    const auto g = nax_prefill_work(q, prefix, heads, heads / h, 16, true);
-    const double extra = std::max(0., double(h) / 4 - 1);
-    const double padding = u.issued - u.active - g.issued + g.active;
-    const double critical = std::min(int64_t(cores), int64_t(heads))
-        * ((q % 64 + 15) / 16) * u.tail_stream
-        - std::min(int64_t(cores), u.groups) * h * g.tail_stream;
-    double benefit, cost;
-    if (upstream_split) {
-      benefit = 13 * padding + 8 * critical + 2.5 * g.fast
-          + 15 * (u.guarded_q - g.guarded_q);
-      cost = (10. / h + 3.5 * extra * extra) * g.issued + 16 * g.guarded_q;
-    } else {
-      const double partial = (u.guarded_q - g.guarded_q) * std::min(
-          1., double(cores) / std::max(int64_t(1), heads * u.full_blocks));
-      const double reuse = (double(h) / 4 - 1)
-          * std::min(1., double(cores) / u.groups) * g.issued;
-      const double grid = std::max(int64_t(0),
-          std::min(int64_t(cores), u.groups)
-          - std::min(int64_t(cores), g.groups)) * g.stream;
-      benefit = 4 * partial + .875 * critical + 3.5 * reuse
-          + 4 * (u.guarded - u.guarded_q);
-      cost = (10.5 + 32 * extra * extra * std::min(
-          1., std::max(0., double(u.groups) / cores - 1))) * grid;
-      cost += (3 + 3.5 * extra * (1 - memory_work_fraction)) * g.issued + 11.5 * cores + 2 * g.kv_edge;
-      cost += .75 * extra * extra * g.issued
-          * std::min(1., double(g.groups) / cores) + 5 * g.guarded_q;
-    }
-    const double value = (benefit - cost) / u.issued;
-    if (dense_full && h == 6) return {true, true, value, h};
-    if (value > best.value) best = {true, value > threshold, value, h};
+    const auto grouped = nax_prefill_work(
+        q, prefix, heads, heads / heads_per_group, kGroupedQueryTile, true);
+    const double head_growth = double(heads_per_group) / kNarrowHeadLimit - 1;
+    const double padding_savings =
+        baseline.issued - baseline.active - grouped.issued + grouped.active;
+    const double critical_savings = std::min(int64_t(cores), int64_t(heads))
+        * ((q % kNaxBQ + kGroupedQueryTile - 1) / kGroupedQueryTile)
+        * baseline.tail_stream
+        - std::min(int64_t(cores), baseline.groups)
+        * heads_per_group * grouped.tail_stream;
+    const double value = upstream_split
+        ? nax_gqa_split_score(baseline, grouped, heads_per_group, head_growth,
+                             padding_savings, critical_savings)
+        : nax_gqa_guarded_score(baseline, grouped, heads, cores, head_growth,
+                               critical_savings, memory_work_fraction);
+    if (dense_full && heads_per_group == kSupportedRatio)
+      return {true, true, value, heads_per_group};
+    if (value > best.value)
+      best = {true, value > threshold, value, heads_per_group};
   }
   return best;
 }
