@@ -297,7 +297,7 @@ class TestMLAKernelBlockSizes:
 
 
 @pytest.fixture(scope="module")
-def nax_config_runner(tmp_path_factory):
+def nax_policy_binary(tmp_path_factory):
     """Call the actual host admission and name helpers without loading a GPU."""
     compiler = shutil.which("c++")
     if compiler is None:
@@ -306,10 +306,22 @@ def nax_config_runner(tmp_path_factory):
     source = directory / "check.cpp"
     source.write_text(
         '#include "paged_attention_kernels.h"\n'
-        "#include <cstdlib>\n#include <iostream>\n"
+        "#include <cstdlib>\n#include <iostream>\n#include <iomanip>\n"
         "int main(int argc, char** argv) {\n"
-        "  if (argc != 15) return 2;\n"
         "  using namespace vllm_metal::kernels;\n"
+        '  if (argc == 2 && std::string(argv[1]) == "work") {\n'
+        "    int q, prefix, heads, kv, bq, split;\n"
+        "    std::cout << std::setprecision(17);\n"
+        "    while (std::cin >> q >> prefix >> heads >> kv >> bq >> split) {\n"
+        "      auto w = nax_prefill_work(q, prefix, heads, kv, bq, split);\n"
+        "      std::cout << w.issued << ' ' << w.active << ' ' << w.guarded\n"
+        "        << ' ' << w.guarded_q << ' ' << w.kv_edge << ' ' << w.fast\n"
+        "        << ' ' << w.stream << ' ' << w.tail_stream << ' ' << w.groups\n"
+        "        << ' ' << w.full_blocks << '\\n';\n"
+        "    }\n"
+        "    return 0;\n"
+        "  }\n"
+        "  if (argc != 15) return 2;\n"
         "  auto cfg = select_nax_config(\n"
         "      std::atoi(argv[1]), std::atoi(argv[2]), std::atoi(argv[3]),\n"
         "      std::atoi(argv[4]), std::atoi(argv[5]), std::atoi(argv[6]),\n"
@@ -330,7 +342,11 @@ def nax_config_runner(tmp_path_factory):
         text=True,
     )
     assert result.returncode == 0, result.stderr
+    return binary
 
+
+@pytest.fixture(scope="module")
+def nax_config_runner(nax_policy_binary):
     def run(
         *,
         heads=24,
@@ -365,12 +381,76 @@ def nax_config_runner(tmp_path_factory):
             cores,
         )
         result = subprocess.run(
-            [str(binary), *map(str, args)], check=True, capture_output=True, text=True
+            [str(nax_policy_binary), *map(str, args)],
+            check=True,
+            capture_output=True,
+            text=True,
         )
         bq, group, threads, name = result.stdout.split()
         return (int(bq), int(group), int(threads)), name
 
     return run
+
+
+def _nax_work_loop(q, prefix, heads, kv_heads, bq, split):
+    """Count causal KV visits per Q block, without the closed-form sums."""
+    visits = active = fast = edges = tail = full = blocks = 0
+    for start in range(0, q, bq):
+        valid_q = min(bq, q - start)
+        tiles = len(range(0, prefix + start + valid_q, 32))
+        visits += tiles
+        active += len(range(0, valid_q, 16)) * tiles
+        blocks += 1
+        if valid_q == bq:
+            full += 1
+            edge = int(tiles * 32 > prefix + q)
+            edges += edge
+            if split:
+                fast += tiles - edge
+        else:
+            tail = tiles
+    scale = heads * (bq // 16)
+    return (
+        scale * visits,
+        heads * active,
+        scale * (visits - fast),
+        scale * tail,
+        scale * edges,
+        scale * fast,
+        visits / blocks,
+        tail,
+        (heads if bq == 64 else kv_heads) * blocks,
+        full,
+    )
+
+
+def test_nax_work_counts_match_independent_causal_loop(nax_policy_binary):
+    """Protect every prefix/Q residue and longer full/tail/edge combinations."""
+    lengths = [(q, prefix) for prefix in range(32) for q in range(1, 65)]
+    lengths += [
+        (q, prefix)
+        for prefix in (31, 32, 33, 31360, 65535, 65536, 65537)
+        for q in (127, 128, 129, 1327, 1328, 1329, 32767, 32768, 32769)
+    ]
+    cases = [
+        (q, prefix, heads, kv, bq, split)
+        for q, prefix in lengths
+        for heads, kv in ((24, 4), (54, 9))
+        for bq in (16, 64)
+        for split in (0, 1)
+    ]
+    result = subprocess.run(
+        [str(nax_policy_binary), "work"],
+        input="\n".join(" ".join(map(str, case)) for case in cases) + "\n",
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    rows = result.stdout.splitlines()
+    assert len(rows) == len(cases)
+    for case, row in zip(cases, rows, strict=True):
+        actual = tuple(map(float, row.split()))
+        assert actual == _nax_work_loop(*case), case
 
 
 @pytest.mark.parametrize(

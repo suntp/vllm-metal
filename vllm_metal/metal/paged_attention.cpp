@@ -16,8 +16,9 @@ std::atomic<bool> g_dispatch_diagnostics_enabled{false};
 // NAX prefill pipeline of the most recent recorded NAX launch: 1 split,
 // 0 original loop, -1 none (non-NAX dispatch or diagnostics off).
 std::atomic<int> g_last_nax_split{-1};
+std::atomic<int> g_last_nax_heads_per_tg{0};
 inline void record_paged_dispatch(PagedDispatch family, int gqa_partition = 0,
-                                  int gqa_requests = 0) {
+                                  int gqa_requests = 0, int nax_heads_per_tg = 0) {
   if (!g_dispatch_diagnostics_enabled.load(std::memory_order_relaxed)) return;
   g_last_dispatch.store(family, std::memory_order_relaxed);
   if (family != PagedDispatch::NaxPrefill &&
@@ -25,6 +26,7 @@ inline void record_paged_dispatch(PagedDispatch family, int gqa_partition = 0,
     g_last_nax_split.store(-1, std::memory_order_relaxed);
   g_last_gqa_partition.store(gqa_partition, std::memory_order_relaxed);
   g_last_gqa_requests.store(gqa_requests, std::memory_order_relaxed);
+  g_last_nax_heads_per_tg.store(nax_heads_per_tg, std::memory_order_relaxed);
 }
 
 // Split a mixed batch's decode rows only when they carry at least this much
@@ -394,9 +396,10 @@ static void dispatch_paged_attention_nax(
     kernel = load_kernel();
   }
   if (cfg.HEADS_PER_TG > 1) {
-    record_paged_dispatch(PagedDispatch::NaxGqa6Prefill);
+    record_paged_dispatch(PagedDispatch::NaxGqa6Prefill, 0, 0, cfg.HEADS_PER_TG);
   } else if (g_dispatch_diagnostics_enabled.load(std::memory_order_relaxed)) {
     g_last_nax_split.store(plan.split_full ? 1 : 0, std::memory_order_relaxed);
+    g_last_nax_heads_per_tg.store(cfg.HEADS_PER_TG, std::memory_order_relaxed);
   }
 
   auto& enc = metal::get_command_encoder(s);
