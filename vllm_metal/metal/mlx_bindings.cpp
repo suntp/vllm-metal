@@ -492,7 +492,7 @@ NB_MODULE(_paged_ops, m) {
         static constexpr const char* names[] = {
             "", "gqa_decode", "per_token_ps0", "per_token_ps512", "window_ps0",
             "window_ps512", "nax_prefill", "tiled_prefill", "mixed_prefill_decode",
-            "mixed_nax_prefill_decode"};
+            "mixed_nax_prefill_decode", "nax_gqa6_prefill"};
         static_assert(std::size(names) == static_cast<size_t>(PagedDispatch::Count),
                       "PagedDispatch and its diagnostic names must stay in sync");
         return names[static_cast<size_t>(
@@ -501,7 +501,8 @@ NB_MODULE(_paged_ops, m) {
       "Dispatch family chosen by the most recent recorded paged_attention_primitive "
       "eval (\"gqa_decode\", \"per_token_ps0\", \"per_token_ps512\", "
       "\"window_ps0\", \"window_ps512\", \"nax_prefill\", "
-      "\"tiled_prefill\", \"mixed_prefill_decode\", \"mixed_nax_prefill_decode\"). "
+      "\"tiled_prefill\", \"mixed_prefill_decode\", \"mixed_nax_prefill_decode\", "
+      "\"nax_gqa6_prefill\"). "
       "Diagnostic surface for routing tests; empty "
       "when diagnostics are disabled, cleared or before the first recorded eval.");
 
