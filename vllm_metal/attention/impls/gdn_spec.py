@@ -84,15 +84,22 @@ def stash_spec_verify_layer(
     compact_cu = [0]
     for length in lengths:
         compact_cu.append(compact_cu[-1] + length)
-    rows = mx.array(
-        [
-            row
-            for i in request_indices
-            for row in range(cu_seqlens[i], cu_seqlens[i + 1])
-        ],
-        dtype=mx.int32,
-    )
-    # Gather into owned buffers: a slice could retain the full packed allocation.
+    # Reuse inputs for full-batch verification; otherwise gather into owned
+    # buffers so a subset does not retain the full packed allocation.
+    rows = None
+    if compact_cu[-1] != q.shape[1]:
+        rows = mx.array(
+            [
+                row
+                for i in request_indices
+                for row in range(cu_seqlens[i], cu_seqlens[i + 1])
+            ],
+            dtype=mx.int32,
+        )
+
+    def _stash_rows(x: mx.array) -> mx.array:
+        return x if rows is None else mx.take(x, rows, axis=1)
+
     stash.layers.append(
         GDNSpecVerifyStash(
             cache_idx=cache_idx,
@@ -102,12 +109,12 @@ def stash_spec_verify_layer(
             span_lengths=lengths,
             compute_dtype=compute_dtype,
             decode_threadgroup_dv=decode_threadgroup_dv,
-            q=mx.take(q, rows, axis=1),
-            k=mx.take(k, rows, axis=1),
-            v=mx.take(v, rows, axis=1),
-            g=mx.take(g, rows, axis=1),
-            beta=mx.take(beta, rows, axis=1),
-            mixed_qkv=mx.take(mixed_qkv, rows, axis=1),
+            q=_stash_rows(q),
+            k=_stash_rows(k),
+            v=_stash_rows(v),
+            g=_stash_rows(g),
+            beta=_stash_rows(beta),
+            mixed_qkv=_stash_rows(mixed_qkv),
         )
     )
 

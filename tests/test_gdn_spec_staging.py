@@ -125,6 +125,36 @@ class TestVerifyStash:
                 np.array(actual), np.array(original[:, expected_rows])
             )
 
+    def test_full_verify_batch_aliases_inputs(self) -> None:
+        arrays = _inputs(6)
+        mixed = mx.random.normal((1, 6, 64))
+        stash = GDNSpecVerifyStep()
+        stash_spec_verify_layer(
+            stash,
+            cache_idx=0,
+            slot_ids=[3, 1],
+            cu_seqlens=[0, 3, 6],
+            num_decode_requests=2,
+            compute_dtype=None,
+            decode_threadgroup_dv=4,
+            q=arrays[0],
+            k=arrays[1],
+            v=arrays[2],
+            g=arrays[3],
+            beta=arrays[4],
+            mixed_qkv=mixed,
+        )
+        layer = stash.layers[0]
+        stashed = (layer.q, layer.k, layer.v, layer.g, layer.beta, layer.mixed_qkv)
+        for actual, original in zip(stashed, (*arrays, mixed), strict=True):
+            assert actual is original
+
+        cache = _state_cache()
+        cache.spec_verify_stash = stash
+        updated = cache.updated_state_arrays()
+        for actual in stashed:
+            assert any(actual is array for array in updated)
+
 
 class TestAcceptanceFixup:
     @pytest.mark.parametrize(
