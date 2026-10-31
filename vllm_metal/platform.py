@@ -4,7 +4,6 @@
 import logging
 import os
 import platform as py_platform
-from functools import wraps
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import psutil
@@ -46,43 +45,6 @@ _METAL_DENSE_KV_CACHE_DTYPES: dict[str, torch.dtype] = {
 _METAL_DENSE_KV_CACHE_DTYPE_NAMES: dict[torch.dtype, str] = {
     dtype: name for name, dtype in _METAL_DENSE_KV_CACHE_DTYPES.items()
 }
-
-
-def _patch_metal_mrv2_validation() -> None:
-    from vllm.config import VllmConfig
-
-    # vllm#63373 renames the validator and its feature list together.
-    names = {
-        "_validate_v2_model_runner": "_get_v2_model_runner_unsupported_features",
-        "_validate_model_runner": "_get_model_runner_unsupported_features",
-    }
-    validator_name = next((n for n in names if hasattr(VllmConfig, n)), None)
-    if validator_name is None:
-        raise RuntimeError(
-            "Expected VllmConfig._validate_v2_model_runner or "
-            "VllmConfig._validate_model_runner; vllm-metal needs updating "
-            "for this vLLM version."
-        )
-    original = getattr(VllmConfig, validator_name)
-    features_name = names[validator_name]
-    if getattr(original, "_metal_mrv2", False):
-        return
-
-    @wraps(original)
-    def validate(config):
-        from vllm.platforms import current_platform
-
-        if not isinstance(current_platform, MetalPlatform):
-            return original(config)
-        # Metal backends replace Triton operations, but retain feature checks.
-        unsupported = getattr(config, features_name)()
-        if unsupported:
-            raise ValueError(
-                f"Model Runner V2 on Metal does not support: {', '.join(unsupported)}"
-            )
-
-    validate._metal_mrv2 = True
-    setattr(VllmConfig, validator_name, validate)
 
 
 def _pick_mb_buffer_default(
@@ -583,7 +545,11 @@ class MetalPlatform(Platform):
 
         # vLLM 0.32 calls this hook before runner validation, with VllmConfig
         # fully imported; importing it during platform discovery is circular.
-        _patch_metal_mrv2_validation()
+        from vllm_metal.patches.model_runner_validation import (
+            patch_metal_model_runner_validation,
+        )
+
+        patch_metal_model_runner_validation()
 
         # vLLM leaves AuxOutput validation to out-of-tree platforms, and
         # MetalModelRunner produces no auxiliary outputs.

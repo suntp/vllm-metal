@@ -41,6 +41,9 @@ import vllm_metal.config as vm_config
 import vllm_metal.platform as platform_module
 from tests.stub_runner import make_gemma4_mixed_attention_runner
 from vllm_metal.config import reset_config
+from vllm_metal.patches.model_runner_validation import (
+    patch_metal_model_runner_validation,
+)
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
 from vllm_metal.v1.model_adapter import DefaultModelAdapter
@@ -672,12 +675,8 @@ class TestMetalPlatform:
         with pytest.raises(NotImplementedError, match="single process"):
             MetalPlatform.check_and_update_config(vllm_config)
 
-    @pytest.mark.parametrize("pipeline_parallel_size", [1, 2])
     def test_check_and_update_config_allows_explicit_v2_model_runner(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
-        pipeline_parallel_size: int,
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The platform hook runs before upstream's Triton validation."""
         monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
@@ -686,16 +685,12 @@ class TestMetalPlatform:
 
         config = VllmConfig(
             parallel_config=ParallelConfig(
-                pipeline_parallel_size=pipeline_parallel_size,
                 distributed_executor_backend="mp",
             )
         )
 
         assert config.use_v2_model_runner
         assert config.parallel_config.worker_cls == "vllm_metal.v1.worker.MetalWorker"
-        if pipeline_parallel_size > 1:
-            assert config.scheduler_config.async_scheduling is False
-            assert "Metal requires synchronous scheduling" in caplog.text
 
     @pytest.mark.parametrize("async_scheduling", [None, True, False])
     def test_v2_pipeline_parallelism_requires_synchronous_scheduling(
@@ -821,7 +816,7 @@ class TestMetalPlatform:
         monkeypatch.setattr("vllm.platforms.current_platform", MetalPlatform())
         config = object.__new__(VllmConfig)
 
-        platform_module._patch_metal_mrv2_validation()
+        patch_metal_model_runner_validation()
         patched = getattr(VllmConfig, validator_name)
 
         assert patched._metal_mrv2
@@ -847,7 +842,7 @@ class TestMetalPlatform:
             match="_validate_v2_model_runner.*_validate_model_runner.*"
             "vllm-metal needs updating for this vLLM version",
         ):
-            platform_module._patch_metal_mrv2_validation()
+            patch_metal_model_runner_validation()
 
     def test_mrv2_validation_patch_delegates_on_non_metal(
         self, monkeypatch: pytest.MonkeyPatch
@@ -861,7 +856,7 @@ class TestMetalPlatform:
         monkeypatch.setattr(VllmConfig, "_validate_v2_model_runner", original)
         monkeypatch.setattr("vllm.platforms.current_platform", object())
 
-        platform_module._patch_metal_mrv2_validation()
+        patch_metal_model_runner_validation()
         config._validate_v2_model_runner()
 
         assert calls == [config]
@@ -873,10 +868,10 @@ class TestMetalPlatform:
             pass
 
         monkeypatch.setattr(VllmConfig, "_validate_v2_model_runner", original)
-        platform_module._patch_metal_mrv2_validation()
+        patch_metal_model_runner_validation()
         patched = VllmConfig._validate_v2_model_runner
 
-        platform_module._patch_metal_mrv2_validation()
+        patch_metal_model_runner_validation()
 
         assert VllmConfig._validate_v2_model_runner is patched
         assert patched.__wrapped__ is original
