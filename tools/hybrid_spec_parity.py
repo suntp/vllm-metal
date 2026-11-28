@@ -162,7 +162,7 @@ def run_child(
 
     mr_mod.MetalModelRunner._handle_new_requests = hnr_spy
     orig_propose = ng_mod.NgramProposer.propose
-    orig_lookup = ng_mod.VllmNgramProposer.propose
+    orig_lookup = ng_mod.NgramMatcher.propose
     orig_mtp_propose = mtp_mod.QwenMTPProposer.propose
     raw_drafts: list[list[int]] = []
     cap_events: list[dict] = []
@@ -213,7 +213,7 @@ def run_child(
                 )
         return out
 
-    ng_mod.VllmNgramProposer.propose = lookup_spy
+    ng_mod.NgramMatcher.propose = lookup_spy
     ng_mod.NgramProposer.propose = propose_spy
     mtp_mod.QwenMTPProposer.propose = mtp_propose_spy
     try:
@@ -290,7 +290,7 @@ def run_child(
         sd_mod.SpeculativeDecodeController.verify_greedy = orig
         mr_mod.MetalModelRunner._handle_new_requests = orig_hnr
         ng_mod.NgramProposer.propose = orig_propose
-        ng_mod.VllmNgramProposer.propose = orig_lookup
+        ng_mod.NgramMatcher.propose = orig_lookup
         mtp_mod.QwenMTPProposer.propose = orig_mtp_propose
 
     queue.put(

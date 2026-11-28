@@ -122,6 +122,10 @@ def _build_rope_source() -> str:
     return _read_v2_metal_source("rope.metal")
 
 
+def _build_sampling_source() -> str:
+    return _read_v2_metal_source("sampling.metal")
+
+
 def _build_normalization_source() -> str:
     return _read_v2_metal_source("normalization.metal")
 
@@ -252,8 +256,9 @@ def _load_native_module() -> ModuleType:
         if stale:
             raise RuntimeError(
                 f"Prebuilt Metal artifacts are stale vs the current sources "
-                f"({', '.join(p.name for p in stale)}): a kernel source was "
-                f"edited without rebuilding. Set VLLM_METAL_BUILD_FROM_SOURCE=1 "
+                f"({', '.join(p.name for p in stale)}): something they were built "
+                f"from has changed (e.g. a kernel edit, a branch switch or pull, "
+                f"or an MLX/nanobind upgrade). Set VLLM_METAL_BUILD_FROM_SOURCE=1 "
                 f"to build from source, or run `python -m vllm_metal.metal.build` "
                 f"to refresh the prebuilt artifacts."
             )

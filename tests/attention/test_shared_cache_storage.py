@@ -23,7 +23,7 @@ from vllm_metal.attention.impls.linear import GDNPagedAttentionWrapper, _GDNForw
 from vllm_metal.metal import get_ops
 
 
-def make_storage(num_blocks=4):
+def make_storage(num_blocks=4, *, with_state=True):
     attention = FullAttentionSpec(
         block_size=16, num_kv_heads=1, head_size=32, dtype=torch.float16
     )
@@ -35,10 +35,9 @@ def make_storage(num_blocks=4):
         mamba_cache_mode="align",
     )
     page = attention.page_size_bytes
-    groups = [
-        KVCacheGroupSpec(layer_names=["a0", "a1"], kv_cache_spec=attention),
-        KVCacheGroupSpec(layer_names=["s0", "s1"], kv_cache_spec=state),
-    ]
+    groups = [KVCacheGroupSpec(layer_names=["a0", "a1"], kv_cache_spec=attention)]
+    if with_state:
+        groups.append(KVCacheGroupSpec(layer_names=["s0", "s1"], kv_cache_spec=state))
     config = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_groups=groups,
@@ -245,31 +244,79 @@ def test_budget_above_buffer_limit_uses_shared_regions(monkeypatch):
     assert storage.state_views(["s0", "s1"])[0][0].shape[0] == planned.num_blocks
 
 
-def test_release_frees_backing_and_reallocate_rebinds_existing_views():
-    storage = make_storage(num_blocks=64)
-    views = storage.views([storage.tensors["a0"]])
+def test_release_frees_the_backing_and_existing_views_see_reallocated_memory():
+    storage = make_storage(num_blocks=64, with_state=False)
+    tensor = storage.tensors["a0"]
+    views = storage.views([tensor])
     offsets = storage.region_offsets
-    before = mx.get_active_memory()
 
     storage.release()
-
-    assert storage.released
-    assert before - mx.get_active_memory() >= storage.nbytes
-
+    asleep = (storage.released, tensor.untyped_storage().nbytes())
     storage.reallocate()
-    storage.tensors["a0"].fill_(3)
+    tensor.fill_(3)
 
+    assert asleep == (True, 0)
     assert storage.region_offsets == offsets
     np.testing.assert_array_equal(np.array(views[0]), 3)
 
 
-def test_count_initialized_runtime_refuses_sleep_release():
+def test_reallocate_zeroes_pages_when_vllm_needs_kv_cache_zeroing():
+    storage = make_storage(num_blocks=64)
+    tensor = storage.tensors["a0"]
+    views = storage.views([tensor])
+    tensor.fill_(7)
+
+    storage.release()
+    storage.reallocate()
+
+    np.testing.assert_array_equal(np.array(views[0]), 0)
+
+
+def test_unbound_runtime_refuses_sleep_release():
     from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 
-    runtime = SDPAPagedAttentionRuntime(
-        num_layers=1, num_kv_heads=1, head_dim=64, block_size=16, dtype=mx.float32
-    )
-    runtime.initialize(4)
+    runtime = SDPAPagedAttentionRuntime(block_size=16, dtype=mx.float32)
 
-    with pytest.raises(NotImplementedError, match="Sleep mode does not support"):
+    with pytest.raises(RuntimeError, match="Shared KV storage"):
         runtime.release_kv_memory()
+
+
+def test_state_gathers_read_slots_past_32_bit_offsets():
+    """State component views stride inside a wider packed per-block page, so a
+    slot's element offset is ``slot x page stride``. MLX gathers such views
+    with 32-bit offsets and slots past the limit came back as garbage (#1112),
+    as #1081 found for KV rows. The backing is uncommitted, as
+    ``KVCacheStorage`` allocates it, so only the written slots are resident.
+    """
+    from vllm_metal.attention.caches.state_cache import StateSlotArraysCache
+    from vllm_metal.attention.caches.storage import CacheViews
+    from vllm_metal.tensor_bridge import torch_to_mlx
+
+    page = 1 << 20
+    conv_row, rec_row = (2, 16), (1, 4, 8)
+    num_slots = (1 << 31) // page + 2  # the last slot starts past INT32_MAX
+    raw = torch.empty((num_slots, page), dtype=torch.uint8)
+    conv_t = raw.as_strided((num_slots, *conv_row), (page, conv_row[1], 1))
+    rec_t = raw.as_strided((num_slots, *rec_row), (page, 32, 8, 1), storage_offset=64)
+    storage = SimpleNamespace(region_offsets=[0], buffers=[torch_to_mlx(raw)])
+    cache = PagedStateCache(
+        [CacheViews(storage, [conv_t]), CacheViews(storage, [rec_t])]
+    )
+
+    low, high = 3, num_slots - 1
+    for slot, value in ((low, 5), (high, 9)):
+        raw[slot, :32] = value
+        raw[slot, 64:96] = value + 1
+
+    ids = mx.array([low, high], dtype=mx.int32)
+    arrays = StateSlotArraysCache(cache, 0, ids)
+    for component, rows in ((0, (5, 9)), (1, (6, 10))):
+        expected = np.stack(
+            [np.full(arrays[component].shape[1:], v, np.uint8) for v in rows]
+        )
+        np.testing.assert_array_equal(np.array(arrays[component]), expected)
+
+    # Slot copies read their sources through the same gather.
+    cache.copy_slots([high], [1], [0])
+    mx.eval(*storage.buffers)
+    assert (raw[1, :32] == 9).all() and (raw[1, 64:96] == 10).all()

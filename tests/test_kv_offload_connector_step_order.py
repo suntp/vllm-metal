@@ -38,7 +38,6 @@ def _scheduler_output(req_ids: list[str]) -> SchedulerOutput:
         total_num_scheduled_tokens=len(req_ids),
         scheduled_spec_decode_tokens={},
         scheduled_encoder_inputs={},
-        num_common_prefix_blocks=[],
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
         num_invalid_spec_tokens=None,
@@ -288,13 +287,20 @@ def test_pipelined_step_without_connector_carries_no_connector_output(
 def _sdpa_runtime():
     from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 
-    return SDPAPagedAttentionRuntime(
-        num_layers=1, num_kv_heads=1, head_dim=4, block_size=4, dtype=mx.float32
-    )
+    return SDPAPagedAttentionRuntime(block_size=4, dtype=mx.float32)
 
 
-def test_register_hands_the_runtime_storage_to_the_connector(spy_group):
-    runtime = _sdpa_runtime()
+def _mla_runtime():
+    from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
+
+    return MLAPagedAttentionRuntime()
+
+
+@pytest.mark.parametrize("runtime_factory", [_sdpa_runtime, _mla_runtime])
+def test_register_hands_the_runtime_storage_to_the_connector(
+    spy_group, runtime_factory
+):
+    runtime = runtime_factory()
     storage = object()
     runtime._storage = storage
     runner = make_stub_runner(model=SimpleNamespace())
@@ -310,9 +316,10 @@ def test_register_hands_the_runtime_storage_to_the_connector(spy_group):
     "runtime_factory",
     [
         pytest.param(lambda: None, id="no-runtime"),
-        pytest.param(SimpleNamespace, id="non-sdpa-runtime"),
+        pytest.param(SimpleNamespace, id="other-runtime"),
         # Count-initialized (draft-model) caches never bind storage.
         pytest.param(_sdpa_runtime, id="sdpa-without-storage"),
+        pytest.param(_mla_runtime, id="mla-without-storage"),
     ],
 )
 def test_register_rejects_runtimes_without_storage(monkeypatch, runtime_factory):

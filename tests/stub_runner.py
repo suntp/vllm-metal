@@ -11,6 +11,7 @@ import mlx.core as mx
 import torch
 from vllm.config import AttentionConfig, CacheConfig, DeviceConfig
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
+from vllm.v1.core.sched.output import NewRequestData
 
 import vllm_metal.v1.model_runner as mr
 from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT
@@ -32,6 +33,27 @@ from vllm_metal.v1.pooling.backends.decoder.factory import (
 from vllm_metal.v1.prompt_logprobs import PromptLogprobsTracker
 from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
+
+
+def admit_prefill_request(
+    runner: mr.MetalModelRunner, prefill: mr.PrefillRequest
+) -> mr.RequestState:
+    """Install history for tests that start at a final prefill's forward/sample."""
+    assert prefill.prompt_len is not None
+    token_ids = list(prefill.full_prompt_token_ids or prefill.token_ids)
+    return runner._admit_request(
+        NewRequestData(
+            req_id=prefill.req_id,
+            prompt_token_ids=token_ids[: prefill.prompt_len],
+            prefill_token_ids=token_ids,
+            mm_features=[],
+            sampling_params=prefill.sampling_params,
+            pooling_params=prefill.pooling_params,
+            block_ids=tuple(prefill.block_ids),
+            num_computed_tokens=prefill.start_pos,
+            lora_request=None,
+        )
+    )
 
 
 def initialize_hybrid_runtime(
@@ -461,6 +483,14 @@ def make_nemotron_hybrid_plan(
     )
 
 
+class DenseStateViews(list[mx.array]):
+    """Dense test storage with the same row-read contract as CacheViews."""
+
+    def gather_rows(self, layer_idx: int, ids: mx.array) -> mx.array:
+        """Read selected rows from one layer."""
+        return self[layer_idx][ids]
+
+
 def make_state_cache(
     *,
     num_layers,
@@ -476,19 +506,163 @@ def make_state_cache(
     from vllm_metal.attention.caches.state_cache import PagedStateCache
 
     states = [
-        [
+        DenseStateViews(
             mx.zeros((max_seqs, conv_kernel_dim - 1, conv_dim), dtype=dtype)
             for _ in range(num_layers)
-        ]
+        )
     ]
     if num_v_heads is not None:
         states.append(
-            [
+            DenseStateViews(
                 mx.zeros(
                     (max_seqs, num_v_heads, value_head_dim, key_head_dim),
                     dtype=recurrent_dtype,
                 )
                 for _ in range(num_layers)
-            ]
+            )
         )
     return PagedStateCache(states)
+
+
+def make_kv_cache(
+    num_layers,
+    num_kv_heads,
+    head_dim,
+    num_blocks,
+    block_size,
+    dtype=mx.float16,
+    turboquant=False,
+    k_quant=None,
+    v_quant=None,
+    *,
+    kv_heads_per_layer=None,
+    head_dim_per_layer=None,
+    sliding_window_per_layer=None,
+):
+    """Zeroed ``MetalPagedKVCache`` bound to vLLM-allocated storage, as serving
+    binds it. Layers of one shape share a cache group; groups share a page size.
+    """
+    from vllm.config import VllmConfig
+    from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheGroupSpec,
+        SlidingWindowSpec,
+    )
+
+    from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+    from vllm_metal.attention.caches.storage import KVCacheStorage
+    from vllm_metal.v1.cache_policy import TurboQuantAttentionSpec
+
+    torch_dtype = {
+        mx.float16: torch.float16,
+        mx.bfloat16: torch.bfloat16,
+        mx.float32: torch.float32,
+    }[dtype]
+    shapes = zip(
+        kv_heads_per_layer or [num_kv_heads] * num_layers,
+        head_dim_per_layer or [head_dim] * num_layers,
+        sliding_window_per_layer or [-1] * num_layers,
+        strict=True,
+    )
+    names_by_shape: dict[tuple[int, int, int], list[str]] = {}
+    for i, shape in enumerate(shapes):
+        names_by_shape.setdefault(shape, []).append(f"layers.{i}")
+    groups = []
+    for (heads, size, window), names in names_by_shape.items():
+        common = {"block_size": block_size, "num_kv_heads": heads, "head_size": size}
+        if turboquant:
+            spec = TurboQuantAttentionSpec(
+                **common,
+                dtype=torch.int8,
+                k_quant=k_quant,
+                v_quant=v_quant or "q3_0",
+            )
+        elif window > 0:
+            spec = SlidingWindowSpec(**common, dtype=torch_dtype, sliding_window=window)
+        else:
+            spec = FullAttentionSpec(**common, dtype=torch_dtype)
+        groups.append(KVCacheGroupSpec(layer_names=names, kv_cache_spec=spec))
+
+    vllm_config = VllmConfig()
+    record_kv_cache_layout(vllm_config.cache_config, KV_CACHE_LAYOUT)
+    # Groups share tensors slot by slot, so the largest group sets the count.
+    tensors_per_block = max(len(names) for names in names_by_shape.values())
+    config = get_kv_cache_config_from_groups(
+        vllm_config,
+        groups,
+        groups[0].kv_cache_spec.page_size_bytes * num_blocks * tensors_per_block,
+    )
+    config.kv_cache_layout = vllm_config.cache_config.kv_cache_layout
+    assert config.num_blocks == num_blocks, (config.num_blocks, num_blocks)
+    storage = KVCacheStorage(config)
+    for tensor in storage.tensors.values():
+        tensor.zero_()
+    names = [f"layers.{i}" for i in range(num_layers)]
+    return MetalPagedKVCache.from_upstream(storage, names, dtype=dtype)
+
+
+def make_sdpa_runtime(
+    *,
+    num_layers,
+    num_kv_heads,
+    head_dim,
+    num_blocks,
+    block_size,
+    dtype,
+    cache_idx_map=None,
+    kv_heads_per_layer=None,
+    head_dim_per_layer=None,
+    sliding_window_per_layer=None,
+):
+    """SDPA runtime over a :func:`make_kv_cache` cache.
+
+    Serving binds runtimes from vLLM's ``KVCacheConfig``
+    (``initialize_from_config``); unit fixtures size a pool directly.
+    """
+    from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
+
+    runtime = SDPAPagedAttentionRuntime(
+        block_size=block_size,
+        dtype=dtype,
+        cache_idx_map=cache_idx_map,
+        sliding_window_per_layer=sliding_window_per_layer,
+    )
+    runtime._cache = make_kv_cache(
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        dtype=dtype,
+        kv_heads_per_layer=kv_heads_per_layer,
+        head_dim_per_layer=head_dim_per_layer,
+        sliding_window_per_layer=sliding_window_per_layer,
+    )
+    return runtime
+
+
+def make_mla_runtime(*, num_layers, latent_dim, num_blocks, block_size, dtype):
+    """MLA runtime over a count-allocated latent cache (unit fixtures only)."""
+    from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
+    from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
+
+    runtime = MLAPagedAttentionRuntime()
+    runtime._cache = MLAPagedLatentCache(
+        num_layers=num_layers,
+        latent_dim=latent_dim,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        dtype=dtype,
+    )
+    return runtime
+
+
+def adopt_draft_group(proposer, group_index, target_max_model_len):
+    """Hand a draft proposer its scheduler group without a storage bind.
+
+    Serving resolves both inside ``bind_paged_cache``; proposer unit fixtures
+    wire their own caches and only need the group and context limit.
+    """
+    proposer._scheduler_group_index = group_index
+    proposer._max_model_len = min(proposer._max_model_len, target_max_model_len)

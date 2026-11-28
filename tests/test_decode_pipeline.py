@@ -39,7 +39,6 @@ _CAPABLE_KWARGS = {
 _CLEAN_STEP_KWARGS = {
     "has_new_requests": False,
     "has_prefill_phase_requests": False,
-    "has_resumed_requests": False,
     "has_preempted_requests": False,
     "has_encoder_inputs": False,
     "has_spec_tokens": False,
@@ -106,7 +105,6 @@ def _make_scheduler_output(req_ids: list[str]) -> SchedulerOutput:
         total_num_scheduled_tokens=len(req_ids),
         scheduled_spec_decode_tokens={},
         scheduled_encoder_inputs={},
-        num_common_prefix_blocks=[],
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
         num_invalid_spec_tokens=None,
@@ -203,7 +201,6 @@ class TestGate:
         [
             ("has_new_requests", True, "new requests scheduled"),
             ("has_prefill_phase_requests", True, "prefill-phase requests"),
-            ("has_resumed_requests", True, "resumed requests"),
             ("has_preempted_requests", True, "preempted requests"),
             ("has_encoder_inputs", True, "encoder inputs scheduled"),
             ("has_spec_tokens", True, "speculative decode"),
