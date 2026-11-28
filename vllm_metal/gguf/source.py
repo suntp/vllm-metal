@@ -28,6 +28,10 @@ _QUANT_TAG_RE = re.compile(
 _REMOTE_PREFIXES = ("*.", "*-")
 _REMOTE_SUFFIXES = ("-*", "")
 _SHARD_NAME_RE = re.compile(r"-\d+-of-(\d+)\.gguf$")
+# Multimodal projector files carry quant tags too, e.g. mmproj-BF16.gguf.
+_PROJECTOR_MARKER = "mmproj"
+# So do speculative drafts that lead with their method, e.g. mtp-Qwen3.8-27B-Q8_0.gguf.
+_DRAFT_PREFIXES = ("mtp-", "dflash-")
 _SUPPORTED_REMOTE_TAGS = frozenset(
     {
         "Q8_0",
@@ -51,22 +55,16 @@ _SUPPORTED_REMOTE_TAGS = frozenset(
         "Q5_K_L",
         "Q6_K",
         "Q6_K_L",
+        "IQ4_NL",
+        "IQ4_XS",
+        "IQ3_S",
+        "IQ3_M",
         "F16",
         "F32",
         "BF16",
     }
 )
 _CONFIG_ALLOW_PATTERNS = ("config.json", "generation_config.json")
-_TOKENIZER_ALLOW_PATTERNS = (
-    "*.json",
-    "*.py",
-    "tokenizer.model",
-    "*.tiktoken",
-    "tiktoken.model",
-    "*.txt",
-    "*.jsonl",
-    "*.jinja",
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +177,12 @@ class RemoteGGUFReference:
         return str(snapshot_dir / filename)
 
     def _select_single_filename(self, filenames: list[str]) -> str:
+        filenames = [
+            filename
+            for filename in filenames
+            if _PROJECTOR_MARKER not in (basename := Path(filename).name.lower())
+            and not basename.startswith(_DRAFT_PREFIXES)
+        ]
         if not filenames:
             raise ValueError(
                 f"No {self.quant_type!r} GGUF file found in remote repository "
@@ -202,11 +206,10 @@ class RemoteGGUFReference:
 
 @dataclass(frozen=True, slots=True)
 class GGUFLoadSource:
-    """Local GGUF weights plus companion config/tokenizer sources."""
+    """Local GGUF weights and companion model config."""
 
     weights_path: str
     config_dir: str
-    tokenizer_dir: str
 
     @classmethod
     def from_model_config(
@@ -250,17 +253,49 @@ class GGUFLoadSource:
                 ignore_patterns=ignore_patterns,
                 token=token,
             )
-        tokenizer_dir = cls._resolve_companion_source(
-            model_config.tokenizer or model_config.model,
-            cache_dir=cache_dir,
-            revision=model_config.tokenizer_revision or model_config.revision,
-            token=token,
-            allow_patterns=_TOKENIZER_ALLOW_PATTERNS,
-        )
         return cls(
             weights_path=weights_path,
             config_dir=config_dir,
-            tokenizer_dir=tokenizer_dir,
+        )
+
+    @classmethod
+    def vocab_overrides(
+        cls,
+        weights_ref: str,
+        config_source: str,
+        *,
+        cache_dir: str | None,
+        revision: str | None,
+        token: bool | str | None,
+    ) -> dict[str, Any]:
+        """``hf_overrides`` that give vLLM the vocab a local .gguf holds.
+
+        A trimmed-vocab family's file has fewer embedding rows than its config's
+        ``vocab_size``; without these, vLLM accepts token ids the model cannot
+        index. Only a trimmed-vocab config opens the file. A remote reference is
+        not downloaded yet, so it gets none, as in vllm-gguf-plugin.
+        """
+        if not cls.is_weights_path(weights_ref) or not Path(weights_ref).is_file():
+            return {}
+        config_dir = cls._resolve_companion_source(
+            config_source,
+            cache_dir=cache_dir,
+            revision=revision,
+            token=token,
+            allow_patterns=_CONFIG_ALLOW_PATTERNS,
+        )
+        config = cls._read_config(config_dir)
+        model_type = str(config.get("model_type", ""))
+        if GGUFModelAdapter.trimmed_vocab_arch(model_type) is None:
+            return {}
+        from vllm_metal.gguf.loader import GGUFModelLoader
+
+        gguf_arch, embedding_rows = GGUFModelLoader.read_vocab_header(weights_ref)
+        arch = GGUFModelAdapter.resolve_arch(
+            gguf_arch=gguf_arch, config_model_type=model_type
+        )
+        return GGUFModelAdapter.vocab_overrides(
+            config, arch=arch, embedding_rows=embedding_rows
         )
 
     @staticmethod
@@ -294,8 +329,12 @@ class GGUFLoadSource:
         )
 
     @staticmethod
-    def _read_config_model_type(config_dir: str) -> str:
+    def _read_config(config_dir: str) -> dict[str, Any]:
         config_file = Path(config_dir) / "config.json"
         if not config_file.is_file():
             raise GGUFLoadError(f"No config.json in config_dir {config_dir!r}")
-        return str(json.loads(config_file.read_text()).get("model_type", ""))
+        return json.loads(config_file.read_text())
+
+    @classmethod
+    def _read_config_model_type(cls, config_dir: str) -> str:
+        return str(cls._read_config(config_dir).get("model_type", ""))

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Uninitialized KV backing: layout parity with vLLM, and slot masking.
 
-``KVCacheStorage`` allocates its backing store with ``torch.empty`` whenever
+``KVCacheStorage`` allocates its backing store uninitialized whenever
 vLLM says the pool does not have to be zeroed (uniform-precision attention
 caches; ``KVCacheConfig.needs_kv_cache_zeroing`` is False). On unified memory
 zero-filling a multi-GB pool commits every page, so a serving run that touches
@@ -114,23 +114,25 @@ def test_uniform_caches_skip_vllms_zero_filling_allocator(monkeypatch):
 
     The layout assertions below hold for both allocations, so they cannot tell
     the two apart. This pins the contract itself: a uniform-precision cache
-    never goes through vLLM's zero-filling allocator, while a Mamba cache still
-    does.
+    delegates to vLLM's allocator with an uninitialized ``allocate`` callback,
+    while a Mamba cache keeps vLLM's zero-filling default.
     """
-    delegated: list[KVCacheConfig] = []
+    allocators: list[object] = []
     original = storage_module.allocate_kv_cache
 
     def spy(config, *args, **kwargs):
-        delegated.append(config)
+        allocators.append(kwargs.get("allocate"))
         return original(config, *args, **kwargs)
 
     monkeypatch.setattr(storage_module, "allocate_kv_cache", spy)
 
     KVCacheStorage(_attention_config())
-    assert delegated == []
+    assert len(allocators) == 1
+    assert allocators[0] is not None
 
     KVCacheStorage(_hybrid_config())
-    assert len(delegated) == 1
+    assert len(allocators) == 2
+    assert allocators[1] is None
 
 
 def test_uninitialized_backing_matches_upstream_layout():
@@ -195,8 +197,7 @@ def _run_decode(ctx: int, tail_is_nan: bool) -> mx.array:
             assert bool(mx.all(mx.isnan(flat[ctx:]))), f"{name} NaN tail missing"
             assert bool(mx.all(mx.isfinite(flat[:ctx]))), f"{name} written rows changed"
 
-    out = mx.array(0)
-    get_ops().paged_attention_primitive(
+    out = get_ops().paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -209,7 +210,6 @@ def _run_decode(ctx: int, tail_is_nan: bool) -> mx.array:
         BLOCK_SIZE,
         ctx,
         -1,
-        out,
     )
     mx.eval(out)
     return out.reshape(num_q_heads, head_size)

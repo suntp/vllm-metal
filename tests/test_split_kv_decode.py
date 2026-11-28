@@ -30,9 +30,10 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+from tests.test_turboquant import _paged
 from tools.attention_bench_utils import attention_tolerances, ref_paged_attn
-from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.turboquant import (
+    V_QUANT_PARAMS,
     get_v_centroids,
     turbo_quant_decode,
     turbo_quant_encode,
@@ -71,8 +72,7 @@ def _run_paged_decode(
     cu_seqlens_q = mx.arange(num_seqs + 1, dtype=mx.int32)
     mx.eval(key_cache, value_cache, query, block_tables, kv_lens_arr, cu_seqlens_q)
 
-    out = mx.array(0)
-    get_ops().paged_attention_primitive(
+    out = get_ops().paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -85,7 +85,6 @@ def _run_paged_decode(
         BLOCK_SIZE,
         max_kv_len,
         -1,  # sliding_window (disabled here; windowed cells below)
-        out,
     )
     mx.eval(out)
 
@@ -199,8 +198,7 @@ def test_split_decode_sliding_window(kv_len: int, window: int) -> None:
     cu_seqlens_q = mx.array([0, 1], dtype=mx.int32)
     mx.eval(key_cache, value_cache, query, block_tables, seq_lens, cu_seqlens_q)
 
-    out = mx.array(0)
-    ops.paged_attention_primitive(
+    out = ops.paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -213,7 +211,6 @@ def test_split_decode_sliding_window(kv_len: int, window: int) -> None:
         BLOCK_SIZE,
         kv_len,
         window,
-        out,
     )
     mx.eval(out)
     o = np.array(out.astype(mx.float32))[0]
@@ -254,52 +251,28 @@ def test_split_decode_turboquant(quant: str, window: int) -> None:
     assert kv_len > ops.PARTITION_SIZE
 
     nblocks = (kv_len + BLOCK_SIZE - 1) // BLOCK_SIZE
-    cache = MetalPagedKVCache(
-        num_layers=1,
-        num_blocks=nblocks,
-        block_size=BLOCK_SIZE,
-        num_kv_heads=NUM_KV_HEADS,
-        head_dim=HEAD_SIZE,
-        dtype=mx.float16,
-        turboquant=True,
-        k_quant=quant,
-    )
     k = mx.random.normal(shape=(kv_len, NUM_KV_HEADS, HEAD_SIZE)).astype(mx.float16)
     v = mx.random.normal(shape=(kv_len, NUM_KV_HEADS, HEAD_SIZE)).astype(mx.float16)
     query = mx.random.normal(shape=(1, NUM_QUERY_HEADS, HEAD_SIZE)).astype(mx.float16)
     mx.eval(k, v, query)
 
     (k_packed, k_scale, k_zero), (v_packed, v_scale) = turbo_quant_encode(k, v, quant)
-    slot = mx.arange(kv_len, dtype=mx.int64)
-    layer = 0
-    flat_k = cache.key_caches[layer].reshape(-1, NUM_KV_HEADS, cache.k_packed_dim)
-    flat_k[slot] = k_packed
-    cache.key_caches[layer] = flat_k.reshape(cache.key_caches[layer].shape)
-    flat_v = cache.value_caches[layer].reshape(-1, NUM_KV_HEADS, cache.v_packed_dim)
-    flat_v[slot] = v_packed
-    cache.value_caches[layer] = flat_v.reshape(cache.value_caches[layer].shape)
-    scale_groups = k_scale.shape[-1]
-    for attr, data in [
-        ("key_scale_caches", k_scale),
-        ("value_scale_caches", v_scale),
-        ("key_zero_caches", k_zero),
-    ]:
-        arr = getattr(cache, attr)[layer]
-        flat = arr.reshape(-1, NUM_KV_HEADS, scale_groups)
-        flat[slot] = data
-        getattr(cache, attr)[layer] = flat.reshape(arr.shape)
-    mx.eval(cache.key_caches[layer], cache.value_caches[layer])
+    key_cache, value_cache, key_scale_cache, value_scale_cache, key_zero_cache = (
+        _paged(rows, nblocks, BLOCK_SIZE)
+        for rows in (k_packed, v_packed, k_scale, v_scale, k_zero)
+    )
+    mx.eval(key_cache, value_cache, key_scale_cache, value_scale_cache, key_zero_cache)
+    v_bits = V_QUANT_PARAMS["q3_0"]["bits"]
 
     block_tables = mx.arange(nblocks, dtype=mx.int32).reshape(1, nblocks)
     seq_lens = mx.array([kv_len], dtype=mx.int32)
     cu_seqlens_q = mx.array([0, 1], dtype=mx.int32)
-    out = mx.zeros((1, NUM_QUERY_HEADS, HEAD_SIZE), dtype=mx.float16)
-    mx.eval(block_tables, seq_lens, cu_seqlens_q, out)
+    mx.eval(block_tables, seq_lens, cu_seqlens_q)
 
-    ops.paged_attention_primitive(
+    out = ops.paged_attention_primitive(
         query,
-        cache.key_caches[layer],
-        cache.value_caches[layer],
+        key_cache,
+        value_cache,
         NUM_KV_HEADS,
         HEAD_SIZE**-0.5,
         0.0,
@@ -309,14 +282,13 @@ def test_split_decode_turboquant(quant: str, window: int) -> None:
         BLOCK_SIZE,
         kv_len,
         window,
-        out,
-        key_scale_cache=cache.key_scale_caches[layer],
-        value_scale_cache=cache.value_scale_caches[layer],
-        key_zero_cache=cache.key_zero_caches[layer],
-        v_centroids=get_v_centroids(cache.v_bits),
+        key_scale_cache=key_scale_cache,
+        value_scale_cache=value_scale_cache,
+        key_zero_cache=key_zero_cache,
+        v_centroids=get_v_centroids(v_bits),
         use_turboquant=True,
         quant_type=quant,
-        v_bits=cache.v_bits,
+        v_bits=v_bits,
     )
     mx.eval(out)
     o = np.array(out.astype(mx.float32))[0]
@@ -393,8 +365,7 @@ def test_split_decode_gemma4_full_attention(kv_lens: list[int]) -> None:
     cu_seqlens_q = mx.arange(num_seqs + 1, dtype=mx.int32)
     mx.eval(key_cache, value_cache, query, block_tables, seq_lens, cu_seqlens_q)
 
-    out = mx.array(0)
-    ops.paged_attention_primitive(
+    out = ops.paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -407,7 +378,6 @@ def test_split_decode_gemma4_full_attention(kv_lens: list[int]) -> None:
         GEMMA4_BLOCK_SIZE,
         max_kv_len,
         -1,
-        out,
     )
     mx.eval(out)
     o = np.array(out.astype(mx.float32))

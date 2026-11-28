@@ -38,9 +38,7 @@ def _cached_reqs(req_ids: list[str] | None = None) -> CachedRequestData:
     ids = req_ids or []
     return CachedRequestData(
         req_ids=ids,
-        resumed_req_ids=set(),
         new_token_ids=[],
-        all_token_ids={},
         new_block_ids=[None] * len(ids),
         num_computed_tokens=[0] * len(ids),
         num_output_tokens=[0] * len(ids),
@@ -67,7 +65,6 @@ def _scheduler_output(
         total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
         scheduled_spec_decode_tokens={},
         scheduled_encoder_inputs=scheduled_encoder_inputs or {},
-        num_common_prefix_blocks=[],
         finished_req_ids=finished_req_ids or set(),
         free_encoder_mm_hashes=free_encoder_mm_hashes or [],
         preempted_req_ids=preempted_req_ids or set(),
@@ -79,6 +76,7 @@ def _new_request(req_id: str, features: list[MultiModalFeatureSpec]) -> NewReque
     return NewRequestData(
         req_id=req_id,
         prompt_token_ids=[1],
+        prefill_token_ids=[1],
         mm_features=features,
         sampling_params=None,
         pooling_params=None,
@@ -96,11 +94,7 @@ def _paged_runner_with_encoder_cache():
     runner = make_stub_runner(
         encoder_cache=EncoderCache(),
         _paged_attention_runtime=SDPAPagedAttentionRuntime(
-            num_layers=1,
-            num_kv_heads=1,
-            head_dim=4,
-            block_size=16,
-            dtype=mx.float32,
+            block_size=16, dtype=mx.float32
         ),
         _paged_block_size=16,
     )
@@ -399,6 +393,56 @@ def test_run_vision_encoders_batches_uncached_features() -> None:
     assert (
         runner.encoder_cache.encoder_outputs["image-1"].deepstack_visual_embeds is None
     )
+
+
+def test_run_vision_encoders_encodes_each_request_under_its_lora() -> None:
+    """With tower/connector LoRA, a request's features go through its own
+    adapter's encoder weights, and the encoder is back on base weights after."""
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    active: list[int | None] = [None]
+
+    class _SpyLoRA:
+        encoder_enabled = True
+
+        @contextmanager
+        def encoder_adapter(self, lora_request):
+            active[0] = None if lora_request is None else lora_request.lora_int_id
+            try:
+                yield
+            finally:
+                active[0] = None
+
+    class _LoRAAwareAdapter(_RecordingAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.encoded_under: list[tuple[int | None, list[str]]] = []
+
+        def encode_multimodal(self, features):
+            self.encoded_under.append((active[0], [f.identifier for f in features]))
+            return super().encode_multimodal(features)
+
+    runner = _runner_with_encoder_cache()
+    runner._lora = _SpyLoRA()
+    adapter = _LoRAAwareAdapter()
+    runner._multimodal_adapter = adapter
+    cache = runner.encoder_cache
+    assert cache is not None
+    lora_7 = SimpleNamespace(lora_int_id=7)
+    for req_id, identifier, lora_request in (
+        ("req-0", "img-a", lora_7),
+        ("req-1", "img-b", None),
+        ("req-2", "img-c", lora_7),
+    ):
+        cache.add_request(req_id, [_feature(identifier)])
+        cache.set_lora_request(req_id, lora_request)
+
+    runner._run_vision_encoders({"req-0": [0], "req-1": [0], "req-2": [0]})
+
+    assert adapter.encoded_under == [(7, ["img-a", "img-c"]), (None, ["img-b"])]
+    assert active[0] is None
+    assert set(cache.encoder_outputs) == {"img-a", "img-b", "img-c"}
 
 
 def test_run_vision_encoders_iterates_multiple_requests_and_indices() -> None:

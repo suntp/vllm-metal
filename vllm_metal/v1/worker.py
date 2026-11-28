@@ -22,7 +22,12 @@ from vllm.distributed.kv_transfer import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
 )
-from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import (
+    checkpoint_prepare_distributed_state,
+    checkpoint_restore_distributed_state,
+    get_pp_group,
+    get_tp_group,
+)
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.tasks import SupportedTask
@@ -85,6 +90,7 @@ class MetalWorker(WorkerBase):
     # because its worker-facing method set is a superset of STTModelRunner's;
     # STT models are assigned an STTModelRunner at runtime (see init_device).
     model_runner: MetalModelRunner  # type: ignore[assignment]
+    _kv_cache_released = False
 
     def __init__(
         self,
@@ -113,6 +119,7 @@ class MetalWorker(WorkerBase):
             self.metal_config.k_quant = add.get("k_quant", "q8_0")
             self.metal_config.v_quant = add.get("v_quant", "q3_0")
             self.metal_config._validate_turboquant()
+        self.metal_config.apply_moe_expert_offload(add)
 
         # Disable custom all reduce (not supported on Metal)
         self.parallel_config.disable_custom_all_reduce = True
@@ -229,16 +236,6 @@ class MetalWorker(WorkerBase):
             Dictionary mapping layer names to KV cache specs
         """
         return self.model_runner.get_kv_cache_spec()
-
-    def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
-        """Initialize the KV cache.
-
-        Args:
-            num_gpu_blocks: Number of GPU cache blocks
-            num_cpu_blocks: Number of CPU cache blocks (unused on Metal)
-        """
-        self.cache_config.num_gpu_blocks = num_gpu_blocks
-        self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def get_supported_kv_cache_layouts(self) -> list[str]:
         """Report Metal's own page order instead of the CPU backend's LBHNC."""
@@ -391,14 +388,26 @@ class MetalWorker(WorkerBase):
         level 1 keeps them in place instead of copying them to the CPU.
         """
         if level != 1:
+            # vLLM pauses the scheduler before it calls the worker, and a
+            # refused sleep leaves it paused until wake_up().
             raise NotImplementedError(
-                f"Metal supports sleep level 1 only, got {level}."
+                f"Metal supports sleep level 1 only, got {level}. The engine "
+                "is paused; call wake_up() (POST /wake_up) to resume it."
             )
         self.discard(("kv_cache",))
 
     def wake_up(self, tags: list[str] | None = None) -> None:
-        if tags is None or "kv_cache" in tags:
+        # vLLM marks the KV cache as sleeping even when discard() raised, so
+        # restore only what was actually released.
+        if self._kv_cache_released and (tags is None or "kv_cache" in tags):
             self.model_runner.restore_kv_cache_memory()
+            self._kv_cache_released = False
+
+    def checkpoint_prepare(self) -> None:
+        checkpoint_prepare_distributed_state()
+
+    def checkpoint_restore(self) -> None:
+        checkpoint_restore_distributed_state()
 
     def discard(self, tags: tuple[str, ...]) -> None:
         if set(tags) != {"kv_cache"}:
@@ -411,6 +420,7 @@ class MetalWorker(WorkerBase):
             )
         before = mx.get_active_memory()
         self.model_runner.release_kv_cache_memory()
+        self._kv_cache_released = True
         gc.collect()
         mx.clear_cache()
         logger.info(
@@ -486,6 +496,9 @@ class MetalWorker(WorkerBase):
             self._metal_profiler = None
 
         if hasattr(self, "model_runner") and self.model_runner is not None:
+            expert_store = getattr(self.model_runner, "_expert_store", None)
+            if expert_store is not None:
+                expert_store.close()
             del self.model_runner
             self.model_runner = None
 

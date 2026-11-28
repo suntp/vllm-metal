@@ -35,7 +35,6 @@ def _scheduler_output(req_ids: list[str]) -> SchedulerOutput:
         total_num_scheduled_tokens=len(req_ids),
         scheduled_spec_decode_tokens={},
         scheduled_encoder_inputs={},
-        num_common_prefix_blocks=[],
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
         num_invalid_spec_tokens=None,
@@ -140,6 +139,22 @@ class TestDeferredDecodeCarriesConnectorOutput:
         assert output.kv_connector_output.finished_sending == {connector_env.tag}
         assert output.kv_connector_output.finished_recving == FINISHED_RECVING
         assert output.kv_connector_output.invalid_block_ids == INVALID_BLOCK_IDS
+
+    def test_connector_output_is_readable_without_resolving(self, connector_env):
+        """The executor salvages it this way when get_output() fails."""
+        scheduler_output = _scheduler_output(["r0"])
+        runner = _runner_on_eligible_step(scheduler_output)
+        runner._kv_connector_start_step(scheduler_output)
+
+        async_output = runner.sample_tokens(grammar_output=None)
+        salvaged = async_output.get_kv_connector_output()
+        pending_at_salvage = runner._decode_pipeline.has_pending
+        resolved = async_output.get_output()
+
+        assert pending_at_salvage
+        assert salvaged is not None
+        assert salvaged.finished_sending == {connector_env.tag}
+        assert salvaged is resolved.kv_connector_output
 
     def test_step_context_is_closed_once_the_deferred_step_is_submitted(
         self, connector_env

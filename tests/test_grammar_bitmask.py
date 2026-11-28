@@ -12,16 +12,18 @@ import numpy as np
 import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.sample.sampler import Sampler
 
 import vllm_metal.v1.model_runner as mr
 import vllm_metal.v1.structured_output as so
 from tests.stub_runner import make_stub_runner
+from vllm_metal.v1.sampling import Sampler
 from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
 # Shared instance used by unit tests that call apply_paged directly.
-_applier = MetalStructuredOutputApplier()
+_applier = MetalStructuredOutputApplier(mask_stride=1)
+# Two speculative tokens: each structured request owns three bitmask rows.
+_spec_applier = MetalStructuredOutputApplier(mask_stride=3)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -49,6 +51,17 @@ def _make_single_token_bitmask(
     return bitmask
 
 
+def _strided_bitmask(*blocks: list[int], stride: int = 3) -> np.ndarray:
+    """vLLM's layout: one block per request, unused rows left forbid-all."""
+    rows = []
+    for allowed_tokens in blocks:
+        rows += [_make_single_token_bitmask(token) for token in allowed_tokens]
+        rows += [np.zeros((1, NUM_BITMASK_WORDS), dtype=np.int32)] * (
+            stride - len(allowed_tokens)
+        )
+    return np.vstack(rows)
+
+
 def _make_scheduler_output(
     req_ids: list[str],
     *,
@@ -64,7 +77,6 @@ def _make_scheduler_output(
         total_num_scheduled_tokens=sum(num_scheduled.values()),
         scheduled_spec_decode_tokens=scheduled_spec_decode_tokens or {},
         scheduled_encoder_inputs={},
-        num_common_prefix_blocks=[],
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
         preempted_req_ids=set(),
@@ -314,19 +326,11 @@ class TestApplyGrammarBitmaskPaged:
         )
         grammar = _make_grammar_output(
             ["pf0", "a"],
-            np.vstack(
-                [
-                    _make_single_token_bitmask(allowed_prefill),
-                    *(
-                        _make_single_token_bitmask(token)
-                        for token in allowed_decode_rows
-                    ),
-                ]
-            ),
+            _strided_bitmask([allowed_prefill], list(allowed_decode_rows)),
         )
 
         result = _to_numpy(
-            _applier.apply_paged(
+            _spec_applier.apply_paged(
                 sched,
                 grammar,
                 decode_reqs,
@@ -373,16 +377,11 @@ class TestApplyGrammarBitmaskPaged:
         )
         grammar = _make_grammar_output(
             ["b", "a"],
-            np.vstack(
-                [
-                    *(_make_single_token_bitmask(token) for token in allowed_b_rows),
-                    *(_make_single_token_bitmask(token) for token in allowed_a_rows),
-                ]
-            ),
+            _strided_bitmask(list(allowed_b_rows), list(allowed_a_rows)),
         )
 
         result = _to_numpy(
-            _applier.apply_paged(
+            _spec_applier.apply_paged(
                 sched,
                 grammar,
                 decode_reqs,
@@ -426,7 +425,7 @@ class TestApplyGrammarBitmaskPaged:
         grammar = _make_grammar_output(["a"], _make_single_token_bitmask(7))
 
         with pytest.raises(ValueError, match="must match the scheduled spans"):
-            _applier.apply_paged(
+            _spec_applier.apply_paged(
                 sched,
                 grammar,
                 decode_reqs,
@@ -457,19 +456,13 @@ class TestApplyGrammarBitmaskPaged:
             num_scheduled_tokens={"a": 3},
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
         )
-        # "absent" owns one bitmask row (no spec tokens) but is not in the batch.
+        # "absent" owns a full block but is not in the batch.
         grammar = _make_grammar_output(
-            ["a", "absent"],
-            np.vstack(
-                [
-                    *(_make_single_token_bitmask(token) for token in allowed_a_rows),
-                    _make_single_token_bitmask(10),
-                ]
-            ),
+            ["a", "absent"], _strided_bitmask(list(allowed_a_rows), [10])
         )
 
         result = _to_numpy(
-            _applier.apply_paged(
+            _spec_applier.apply_paged(
                 sched,
                 grammar,
                 decode_reqs,
@@ -817,7 +810,7 @@ class TestSampleTokensGrammarPagedPath:
             num_scheduled_tokens={"r0": 3},
             scheduled_spec_decode_tokens={"r0": [-1, -1]},
         )
-        # Upstream builds 1 + len([-1, -1]) = 3 bitmask rows for the padded req.
+        # vLLM gives each structured request a block of mask_stride = 3 rows.
         grammar = _make_grammar_output(
             ["r0"],
             np.vstack(
@@ -829,7 +822,9 @@ class TestSampleTokensGrammarPagedPath:
             ),
         )
 
-        result = _applier.apply_paged(sched, grammar, decode_reqs, [], cu, 1, logits)
+        result = _spec_applier.apply_paged(
+            sched, grammar, decode_reqs, [], cu, 1, logits
+        )
 
         result_np = _to_numpy(result)
         assert np.isfinite(result_np[0, 0, allowed_token])
@@ -875,7 +870,7 @@ class TestSampleTokensGrammarPagedPath:
         )
 
         result = _to_numpy(
-            _applier.apply_paged(
+            _spec_applier.apply_paged(
                 sched,
                 grammar,
                 decode_reqs,

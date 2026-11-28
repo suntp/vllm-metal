@@ -17,8 +17,6 @@ import torch
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.multimodal.inputs import MultiModalFieldConfig
 from vllm.sampling_params import SamplingParams
-from vllm.transformers_utils.config import _CONFIG_REGISTRY
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.stt.audio import (
     N_FRAMES,
@@ -42,6 +40,7 @@ from vllm_metal.stt.whisper import WhisperConfig
 from vllm_metal.stt.whisper.adapter import WhisperRuntimeAdapter
 from vllm_metal.stt.whisper.transcriber import WhisperTranscriber
 from vllm_metal.v1 import sampling_batch
+from vllm_metal.v1.sampling import Sampler
 from vllm_metal.v1.stt_model_runner import STTModelRunner
 
 
@@ -170,6 +169,7 @@ class TestWhisperRuntimeAdapterDecode:
 
         assert result[-1] == 50257
 
+    @pytest.mark.usefixtures("whisper_hub_tokenizer_cache")
     @pytest.mark.parametrize("n_vocab", [51864, 51865, 51866])
     def test_runner_uses_fallback_eot_for_tokenizer_free_snapshot(
         self, tmp_path: Path, n_vocab: int
@@ -319,7 +319,6 @@ class TestExecuteSTTProtocol:
         output = runner._pending_output
         assert output is not None
         assert output.req_ids == ["r1", "r2"]
-        assert output.req_id_to_index == {"r1": 0, "r2": 1}
 
 
 class TestExtractAudioFeaturesFormats:
@@ -524,7 +523,6 @@ class TestSTTRunnerWorkerContract:
         runner.load_model()
 
         assert runner.model is fake_model
-        assert runner.tokenizer is None
         assert runner._stt_runtime_adapter is adapter
         fake_model.create_runtime_adapter.assert_called_once_with(str(tmp_path))
         load_weights.assert_called_once_with(
@@ -1022,7 +1020,6 @@ class TestQwen3ASRUpstreamContract:
     """Tests for the upstream vLLM contract used by the Metal plugin."""
 
     def test_upstream_qwen3_asr_support_is_available(self) -> None:
-        assert "qwen3_asr" in _CONFIG_REGISTRY
         assert "Qwen3ASRForConditionalGeneration" in ModelRegistry.get_supported_archs()
 
 

@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the Metal n-gram speculative-decode proposer.
 
-The proposer wraps vLLM's pure-Python/Numba n-gram kernel, so these tests need no
-model or engine: a ``SimpleNamespace`` ``vllm_config`` exercises the upstream
-constructor (which reads only scalar config) and a hand-built ``ProposeContext``
-drives ``propose``. They lock in the request filtering (greedy-only, skip
-intermediate prefills) and the array marshalling into the upstream kernel.
+The proposer wraps a Numba n-gram matcher, so these tests need no model or
+engine: a ``SimpleNamespace`` ``vllm_config`` supplies the scalar config both
+read and a hand-built ``ProposeContext`` drives ``propose``. They lock in the
+request filtering (greedy-only, skip intermediate prefills), the array
+marshalling into the matcher and the matcher's lookup.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 from vllm.sampling_params import SamplingParams
 
@@ -72,7 +73,7 @@ def _context(
     if decode_token_ids is None:
         decode_token_ids = [[state.token_ids[-1]] for _, state in decode_reqs]
     if prefill_result_modes is None:
-        prefill_result_modes = ["new_final"] * len(prefill_reqs)
+        prefill_result_modes = ["final"] * len(prefill_reqs)
     if request_states is None:
         request_states = dict(decode_reqs)
     return ProposeContext(
@@ -106,6 +107,39 @@ def _verified_segment(req_id: str, *, has_draft: bool = True) -> PagedDecodeSegm
         cache_start_pos=0,
         block_ids=(0,),
     )
+
+
+class TestNgramMatcher:
+    @pytest.mark.parametrize(
+        ("history", "k", "max_model_len", "expected"),
+        [
+            pytest.param(
+                [1, 2, 3, 9, 5, 2, 3, 7, 1, 2, 3], 3, 64, [9, 5, 2], id="longest-match"
+            ),
+            pytest.param(
+                [1, 2, 7, 1, 2, 8, 1, 2], 3, 64, [7, 1, 2], id="earliest-equal-match"
+            ),
+            pytest.param([1, 2, 3, 1, 2], 5, 64, [3, 1, 2], id="history-end"),
+            pytest.param([1, 2, 3, 1, 2], 3, 6, [3], id="max-model-len"),
+            pytest.param([1, 2, 3, 2], 3, 64, [], id="match-below-min-n"),
+            pytest.param([1], 3, 64, [], id="history-below-min-n"),
+        ],
+    )
+    def test_drafts_tokens_after_longest_suffix_match(
+        self, history, k, max_model_len, expected
+    ) -> None:
+        matcher = _proposer(max_model_len=max_model_len)._ngram
+        token_ids = np.array([history], dtype=np.int32)
+        lengths = np.array([len(history)], dtype=np.int32)
+
+        assert matcher.propose(k, lengths, token_ids) == [expected]
+
+    def test_reads_each_row_up_to_its_own_length(self) -> None:
+        matcher = _proposer()._ngram
+        token_ids = np.array([[1, 2, 3, 1, 2, 0], [5, 6, 7, 8, 5, 6]], dtype=np.int32)
+        lengths = np.array([5, 4], dtype=np.int32)
+
+        assert matcher.propose(3, lengths, token_ids) == [[3, 1, 2], []]
 
 
 class TestNgramProposerProtocol:
@@ -160,12 +194,16 @@ class TestNgramProposePropose:
 
         assert proposer.propose(ctx) is None
 
-    def test_draft_cap_trims_long_draft(self) -> None:
-        # A positional cap (hybrid state-block boundary) trims the matched
-        # draft instead of dropping the request.
+    @pytest.mark.parametrize("positional_cap,max_tokens", [(1, None), (1, 5), (3, 3)])
+    def test_draft_caps_take_the_tighter_bound(
+        self, positional_cap, max_tokens
+    ) -> None:
+        # The match yields three tokens. With one output already committed,
+        # max_tokens=5/3 leaves a draft budget of 3/1, respectively.
         proposer = _proposer(prompt_lookup_min=2, prompt_lookup_max=3)
         state = _request_state([1, 2, 3, 1, 2, 3, 1, 2])
-        ctx = _context(decode_reqs=[("r0", state)], draft_caps={"r0": 1})
+        state.sampling_params.max_tokens = max_tokens
+        ctx = _context(decode_reqs=[("r0", state)], draft_caps={"r0": positional_cap})
 
         drafts = proposer.propose(ctx)
 
@@ -193,6 +231,28 @@ class TestNgramProposePropose:
         assert drafts is not None
         assert drafts.draft_token_ids == [[3, 1, 2]]
 
+    @pytest.mark.parametrize("generated_tokens,expected_draft", [(2, [3]), (3, [])])
+    def test_remaining_output_tokens_bound_the_draft(
+        self, generated_tokens, expected_draft
+    ) -> None:
+        # max_tokens=4 with 2 generated leaves room for one draft plus the
+        # bonus token; with 3 generated there is no room. Each case starts
+        # fresh so a prior unverified proposal cannot leave pending state.
+        proposer = _proposer(prompt_lookup_min=2, prompt_lookup_max=3)
+        state = _request_state([1, 2, 3, 1, 2, 3, 1, 2])
+        state.sampling_params = SamplingParams(temperature=0.0, max_tokens=4)
+        state.generated_tokens = generated_tokens
+
+        drafts = proposer.propose(_context(decode_reqs=[("r0", state)]))
+        if expected_draft:
+            assert drafts is not None
+            assert drafts.req_ids == ["r0"]
+            assert drafts.draft_token_ids == [expected_draft]
+        else:
+            assert drafts is None
+            assert "r0" not in proposer._pending
+        assert proposer._miss_streak.get("r0", 0) == 0
+
     def test_empty_context_returns_none(self) -> None:
         assert _proposer().propose(_context()) is None
 
@@ -213,21 +273,30 @@ class TestNgramProposePropose:
 
         assert proposer.propose(ctx) is None
 
-    def test_finalized_prefill_participates(self) -> None:
+    @pytest.mark.parametrize("max_tokens,expected_draft", [(16, [6, 4, 5]), (2, [])])
+    def test_finalized_prefill_respects_output_budget(
+        self, max_tokens, expected_draft
+    ) -> None:
         proposer = _proposer(prompt_lookup_min=2)
         state = _request_state([4, 5, 6, 4, 5, 6, 4, 5])
+        # The first output is already committed. max_tokens=2 still passes
+        # eligibility but leaves no room for a draft plus a verifier token.
+        state.sampling_params.max_tokens = max_tokens
         prefill = SimpleNamespace(req_id="p0")
         ctx = _context(
             prefill_reqs=[prefill],
-            prefill_result_modes=["new_final"],
+            prefill_result_modes=["final"],
             request_states={"p0": state},
         )
 
         drafts = proposer.propose(ctx)
 
-        assert drafts is not None
-        assert drafts.req_ids == ["p0"]
-        assert drafts.draft_token_ids == [[6, 4, 5]]
+        if expected_draft:
+            assert drafts is not None
+            assert drafts.req_ids == ["p0"]
+            assert drafts.draft_token_ids == [expected_draft]
+        else:
+            assert drafts is None
 
     def test_skips_intermediate_prefill(self) -> None:
         proposer = _proposer(prompt_lookup_min=2)
@@ -254,6 +323,22 @@ class TestNgramProposePropose:
         assert drafts.req_ids == ["r0"]
         assert drafts.draft_token_ids == [[3, 1, 2]]
 
+    def test_mixed_output_budgets_preserve_request_alignment(self) -> None:
+        proposer = _proposer()
+        short = _request_state([1, 2, 3, 1, 2, 3, 1, 2])
+        last = _request_state([4, 5, 6, 4, 5, 6, 4, 5])
+        full = _request_state([7, 8, 9, 7, 8, 9, 7, 8])
+        short.sampling_params.max_tokens = 3  # Two output slots remain.
+        last.sampling_params.max_tokens = 2  # Only one output slot remains.
+        # Drop the middle row; distinct histories expose any shifted IDs.
+        ctx = _context(decode_reqs=[("r0", short), ("r1", last), ("r2", full)])
+
+        drafts = proposer.propose(ctx)
+
+        assert drafts is not None
+        assert drafts.req_ids == ["r0", "r2"]
+        assert drafts.draft_token_ids == [[3], [9, 7, 8]]
+
     def test_drops_prefill_already_seen_as_decode(self) -> None:
         # A request present in both decode and prefill lists must draft once.
         proposer = _proposer(prompt_lookup_min=2)
@@ -262,7 +347,7 @@ class TestNgramProposePropose:
         ctx = _context(
             decode_reqs=[("r0", state)],
             prefill_reqs=[prefill],
-            prefill_result_modes=["new_final"],
+            prefill_result_modes=["final"],
             request_states={"r0": state},
         )
 
@@ -276,9 +361,8 @@ class TestNgramMissThrottle:
     """The kernel scans a request's whole history every step whether or not
     it finds anything, so a request that never matches should stop being
     handed to the kernel after enough consecutive misses -- these tests
-    mock the wrapped upstream call directly so they exercise only the
-    throttle bookkeeping, independent of the installed vLLM's kernel
-    signature."""
+    mock the wrapped matcher call directly so they exercise only the
+    throttle bookkeeping."""
 
     def test_throttles_after_max_consecutive_misses(self) -> None:
         proposer = _proposer()

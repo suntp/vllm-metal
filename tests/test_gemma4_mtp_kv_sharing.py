@@ -9,14 +9,13 @@ from typing import Any
 import mlx.core as mx
 import pytest
 
-from tests.stub_runner import make_stub_runner
+from tests.stub_runner import make_kv_cache, make_sdpa_runtime, make_stub_runner
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.context import get_context
 from vllm_metal.attention.impls.sdpa_wrapper import (
     SDPAPagedAttentionWrapper,
     patch_sdpa_attention,
 )
-from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 from vllm_metal.v1.gemma4_mtp import (
     Gemma4MTPAssistantMetadata,
     Gemma4MTPAssistantRuntime,
@@ -75,7 +74,7 @@ def _target_args(
 
 
 def _target_cache(num_layers: int) -> MetalPagedKVCache:
-    return MetalPagedKVCache(
+    return make_kv_cache(
         num_layers=num_layers,
         num_kv_heads=1,
         head_dim=4,
@@ -471,7 +470,7 @@ def test_runtime_runs_tiny_assistant_forward_over_target_kv() -> None:
             hidden_size=hidden_size,
             non_shared_layer_types=layer_types,
         ),
-        target_kv_cache=MetalPagedKVCache(
+        target_kv_cache=make_kv_cache(
             num_layers=1,
             num_kv_heads=1,
             head_dim=hidden_size,
@@ -537,14 +536,14 @@ def test_reused_wrapper_rebinds_cache_through_owner_method() -> None:
 
 
 def test_cache_policy_installs_gemma4_mtp_kv_sharing() -> None:
-    backend = SDPAPagedAttentionRuntime(
+    backend = make_sdpa_runtime(
         num_layers=3,
         num_kv_heads=1,
         head_dim=4,
+        num_blocks=1,
         block_size=_BLOCK_SIZE,
         dtype=mx.float16,
     )
-    backend.initialize(num_blocks=1)
     installed = object()
 
     class _AssistantRuntime:

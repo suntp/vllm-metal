@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Device adapters for vLLM 0.31's upstream MRV2 runner.
+"""Device adapters for vLLM's upstream MRV2 runner.
 
 PyTorch's native streams and events use the single MPS default queue. Staging
 buffers use explicit CPU-to-MPS copies.
 """
-
-from functools import partial
 
 import numpy as np
 import torch
@@ -68,8 +66,9 @@ def staged_write(self):
         offsets.extend(range(row * stride + col, row * stride + col + end - start))
         start = end
     indices = torch.tensor(offsets, device=self.device, dtype=torch.int64)
-    values = torch.tensor(
-        self._staged_write_contents, device=self.device, dtype=self.dtype
+    # Upstream keeps ndarray and array writes as separate by-reference chunks.
+    values = self.write_contents.copy_chunks_to_uva(
+        self._staged_chunks(), self._staged_write_len
     )
     self.gpu.view(-1).index_copy_(0, indices, values)
     self.clear_staged_writes()
@@ -85,9 +84,11 @@ def compute_topk_scores(
     max_per_req_token_ids=0,
     logits_mode=False,
 ):
-    from vllm.v1.sample.sampler import Sampler
+    # TODO(M4): switch the MPS shim to upstream's gpu/sample stack once
+    # pluggable MRV2 components land (vllm#52719 / RFC vllm#51212).
+    from vllm_metal.v1.sampling import Sampler
 
-    # Explicit-token and prompt logprobs remain rejected by validate_request.
+    # Explicit-token logprobs remain rejected by validate_request.
     assert max_per_req_token_ids == 0
     scores = logits.float() if logits_mode else Sampler.compute_logprobs(logits)
     # Keep upstream's compiled rank helper eager on MPS.
@@ -96,37 +97,3 @@ def compute_topk_scores(
     if isinstance(cu_num_logits, torch.Tensor):
         return result._replace(cu_num_generated_tokens_tensor=cu_num_logits)
     return result._replace(cu_num_generated_tokens=cu_num_logits)
-
-
-def install():
-    from vllm.model_executor.layers.mamba.short_conv import ShortConv
-    from vllm.v1.worker.gpu import buffer_utils, model_runner
-    from vllm.v1.worker.gpu.sample import sampler
-
-    from vllm_metal.pytorch_backend import input_ops
-
-    if getattr(buffer_utils, "_metal_installed", False):
-        return
-
-    @ShortConv.register_oot
-    class MPSShortConv(ShortConv):
-        # Reuse upstream Torch ops without its CPU/CUDA custom-op wrapper.
-        forward = ShortConv.forward_native
-
-    # MRV2 0.31 uses these CUDA names even with an MPS device. Use native
-    # PyTorch objects; partial avoids duplicate Dynamo handler registration.
-    torch.cuda.Stream = torch.Stream
-    torch.cuda.Event = partial(torch.Event, device="mps")
-    torch.cuda.current_stream = partial(torch.accelerator.current_stream)
-    torch.cuda.set_stream = partial(torch.accelerator.set_stream)
-    # Explicit vLLM 0.31 bindings for the supported single-device path.
-    buffer_utils.NonUvaBuffer = MPSStagingBuffer
-    model_runner.async_tensor_h2d = copy_to_device
-    buffer_utils.StagedWriteTensor.apply_write = staged_write
-    buffer_utils.UvaBackedTensor.copy_to_uva = copy_changed_state
-
-    input_ops.install()
-    # validate_request limits sampling to greedy; scoring uses upstream Torch ops.
-    sampler.gumbel_sample = lambda logits, *args, **kwargs: logits.argmax(dim=-1)
-    sampler.compute_topk_scores = compute_topk_scores
-    buffer_utils._metal_installed = True

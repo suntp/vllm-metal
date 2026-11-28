@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""High-value contract tests for Metal V1 text pooling."""
+"""Contract tests for MLX text pooling."""
 
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ import numpy as np
 import pytest
 import torch
 from torch.nn.functional import normalize
+from transformers import RobertaConfig as TorchRobertaConfig
+from transformers import RobertaModel as TorchRobertaModel
 from transformers import XLMRobertaConfig as TorchXLMRobertaConfig
 from transformers import XLMRobertaModel as TorchXLMRobertaModel
 
@@ -29,6 +31,12 @@ from vllm_metal.v1.model_lifecycle import (  # noqa: E402
     LoadedGenerationModel,
     ModelLifecycle,
 )
+from vllm_metal.v1.pooling.backends.decoder.factory import (  # noqa: E402
+    build_decoder_pooling_backend,
+)
+from vllm_metal.v1.pooling.backends.decoder.models.d3 import (  # noqa: E402
+    D3ReadoutPooler,
+)
 from vllm_metal.v1.pooling.backends.decoder.models.qwen3 import (  # noqa: E402
     Qwen3RerankerPooler,
 )
@@ -39,6 +47,10 @@ from vllm_metal.v1.pooling.backends.decoder.runtime import (  # noqa: E402
 )
 from vllm_metal.v1.pooling.backends.encoder.factory import (  # noqa: E402
     load_encoder_pooling_backend,
+    supports_encoder_pooling_backend,
+)
+from vllm_metal.v1.pooling.backends.encoder.models.embedding_gemma2 import (  # noqa: E402
+    load_embedding_gemma2_backend,
 )
 from vllm_metal.v1.pooling.backends.encoder.models.loading import (  # noqa: E402
     load_encoder_weight_file,
@@ -213,6 +225,7 @@ def _pooling_model_config(**overrides):
         "revision": None,
         "tokenizer": "stub-pooling-model",
         "tokenizer_revision": None,
+        "tokenizer_mode": "auto",
         "get_head_size": lambda: 128,
         "is_hybrid": False,
     }
@@ -253,8 +266,11 @@ def _bge_m3_model_config(**overrides):
     return _pooling_model_config(**values)
 
 
-def _tiny_xlm_roberta_config() -> TorchXLMRobertaConfig:
-    return TorchXLMRobertaConfig(
+def _tiny_encoder_config(model_type="xlm-roberta"):
+    config_cls = (
+        TorchRobertaConfig if model_type == "roberta" else TorchXLMRobertaConfig
+    )
+    return config_cls(
         vocab_size=17,
         hidden_size=8,
         num_hidden_layers=1,
@@ -269,10 +285,20 @@ def _tiny_xlm_roberta_config() -> TorchXLMRobertaConfig:
     )
 
 
-def _save_tiny_xlm_roberta_checkpoint(tmp_path, architecture: str | None = None):
-    torch_config = _tiny_xlm_roberta_config()
-    transformers_model = TorchXLMRobertaModel(torch_config).eval()
-    transformers_model.save_pretrained(tmp_path, safe_serialization=True)
+def _save_tiny_encoder_checkpoint(
+    tmp_path,
+    architecture: str | None = None,
+    *,
+    model_type="xlm-roberta",
+    pytorch_weights=False,
+):
+    torch_config = _tiny_encoder_config(model_type)
+    model_cls = TorchRobertaModel if model_type == "roberta" else TorchXLMRobertaModel
+    transformers_model = model_cls(torch_config).eval()
+    if pytorch_weights:
+        torch.save(transformers_model.state_dict(), tmp_path / "pytorch_model.bin")
+    else:
+        transformers_model.save_pretrained(tmp_path, safe_serialization=True)
     if architecture is not None:
         torch_config.architectures = [architecture]
     return torch_config, transformers_model
@@ -296,15 +322,7 @@ def _make_runner(
         model_config=model_config or _pooling_model_config(),
         tokenizer=tokenizer,
         _paged_attention_runtime=(
-            SDPAPagedAttentionRuntime(
-                num_layers=1,
-                num_kv_heads=1,
-                head_dim=4,
-                block_size=4,
-                dtype=mx.float32,
-            )
-            if paged
-            else None
+            SDPAPagedAttentionRuntime(block_size=4, dtype=mx.float32) if paged else None
         ),
         _paged_block_size=4,
         num_layers=1,
@@ -327,6 +345,7 @@ def _new_req(
     return NewRequestData(
         req_id=req_id,
         prompt_token_ids=token_ids,
+        prefill_token_ids=token_ids,
         mm_features=[],
         sampling_params=None,
         pooling_params=pooling_params or _pooling_params(task),
@@ -340,9 +359,7 @@ def _new_req(
 def _cached_req_data(req_ids: list[str], num_computed_tokens: list[int]):
     return SimpleNamespace(
         req_ids=req_ids,
-        resumed_req_ids=set(),
         new_token_ids=[],
-        all_token_ids={},
         new_block_ids=[None] * len(req_ids),
         num_computed_tokens=num_computed_tokens,
         num_output_tokens=[0] * len(req_ids),
@@ -378,7 +395,6 @@ def _scheduler_output(
         kv_cache_block_copies=None,
         new_block_ids_to_zero=None,
         scheduled_encoder_inputs={},
-        num_common_prefix_blocks=[],
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
         preempted_req_ids=set(),
@@ -443,6 +459,34 @@ class TestMetalPoolingCapabilities:
         runner = _make_runner()
 
         assert runner.supported_worker_tasks() == ("embed",)
+
+    @pytest.mark.parametrize("classify", [False, True])
+    def test_only_reranking_loads_the_configured_tokenizer(self, classify) -> None:
+        config = (_classification_model_config if classify else _pooling_model_config)(
+            tokenizer="custom-tokenizer",
+            tokenizer_revision="tokenizer-revision",
+            trust_remote_code=True,
+        )
+        with patch(
+            "vllm_metal.v1.pooling.backends.decoder.models.qwen3.cached_get_tokenizer",
+            return_value=_ClassifierTokenizer(),
+        ) as load_tokenizer:
+            runner = _make_runner(
+                model=_PoolingModel(_ClassifierSequenceModel()), model_config=config
+            )
+        assert runner.supported_worker_tasks() == (
+            ("classify",) if classify else ("embed",)
+        )
+        if classify:
+            load_tokenizer.assert_called_once_with(
+                "custom-tokenizer",
+                runner_type="pooling",
+                tokenizer_mode="auto",
+                revision="tokenizer-revision",
+                trust_remote_code=True,
+            )
+        else:
+            load_tokenizer.assert_not_called()
 
     def test_supported_worker_tasks_rejects_incompatible_pooling_model(self) -> None:
         runner = make_stub_runner(
@@ -622,7 +666,6 @@ class TestMetalPoolingCapabilities:
         runner.kv_cache_dtype = None
         loaded = LoadedGenerationModel(
             model=runner.model,
-            tokenizer=runner.tokenizer,
             model_args={},
         )
 
@@ -660,7 +703,6 @@ class TestMetalPoolingCapabilities:
         runner._model_lifecycle = lifecycle
         loaded = LoadedEncoderBackend(
             model=SimpleNamespace(config=SimpleNamespace(vocab_size=16)),
-            tokenizer=object(),
             model_args={"vocab_size": 16},
             pooling_backend=pooling_backend,
         )
@@ -699,19 +741,139 @@ class TestMetalPoolingCapabilities:
                 (_SupportedEmbedPooler(), _SupportedEmbedPooler()),
             )
 
-    @pytest.mark.parametrize("pooling_type", ["CLS", "MEAN"])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("length", [7, 515])
+    def test_embedding_gemma2_checkpoint_preserves_projected_mean_embeddings(
+        self, tmp_path, dtype, length
+    ) -> None:
+        """Load only text from a full checkpoint and match HF pooled embeddings."""
+        hf = pytest.importorskip("transformers.models.embedding_gemma2")
+        torch.manual_seed(0)
+        text_config = hf.EmbeddingGemma2TextConfig(
+            vocab_size=32,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=4,
+            global_head_dim=8,
+            num_global_key_value_heads=1,
+            hidden_size_per_layer_input=8,
+            embedding_dim=12,
+        )
+        config = hf.EmbeddingGemma2Config(
+            text_config=text_config,
+            vision_config={
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "head_dim": 4,
+                "patch_size": 2,
+                "position_embedding_size": 16,
+            },
+            audio_config={
+                "hidden_size": 8,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "subsampling_conv_channels": [4, 2],
+                "output_proj_dims": 8,
+            },
+        )
+        reference = hf.EmbeddingGemma2Model(config).to(dtype).eval()
+        reference.save_pretrained(tmp_path)
+        assert reference.vision_tower is not None
+        assert reference.audio_tower is not None
+        model_config = _encoder_model_config(
+            model=str(tmp_path),
+            hf_config=config,
+            dtype=dtype,
+            pooler_config=_pooler_config(seq_pooling_type="MEAN"),
+            is_matryoshka=True,
+            matryoshka_dimensions=None,
+            embedding_size=text_config.embedding_dim,
+        )
+        backend = load_encoder_pooling_backend(model_config)
+        assert supports_encoder_pooling_backend(model_config)
+        assert backend.model.model.vision_tower is None
+        assert backend.model.model.audio_tower is None
+        assert backend.model_args["vocab_size"] == text_config.vocab_size
+
+        ids = torch.randint(3, text_config.vocab_size, (2, length))
+        ids[1, -3:] = 0
+        mask = (ids != 0).long()
+        with torch.no_grad():
+            expected = reference(input_ids=ids, attention_mask=mask).last_hidden_state
+        actual = backend.pooling_backend.forward_padded(
+            mx.array(ids.numpy()), mx.array(mask.numpy())
+        )
+        # BF16 CPU and Metal kernels can differ by a few rounding steps.
+        tolerance = 1e-5 if dtype == torch.float32 else 1e-2
+        torch.testing.assert_close(
+            mlx_to_torch(actual.astype(mx.float32), device="cpu"),
+            expected.float(),
+            atol=tolerance,
+            rtol=tolerance,
+        )
+        for dimensions in (None, 6):
+            params = _pooling_params(task="embed", dimensions=dimensions)
+            params.verify(model_config)
+            requests = [
+                _new_req(str(i), row[valid.bool()].tolist(), pooling_params=params)
+                for i, (row, valid) in enumerate(zip(ids, mask, strict=True))
+            ]
+            outputs = backend.pooling_backend.pool_scheduler_output(
+                _scheduler_output(new_reqs=requests), model_config
+            )
+            assert [output.req_id for output in outputs] == ["0", "1"]
+            for i, output in enumerate(outputs):
+                vector = expected[i, mask[i].bool(), :dimensions].float().mean(0)
+                torch.testing.assert_close(
+                    output.pooler_output,
+                    normalize(vector, dim=0),
+                    atol=1e-5 if dtype == torch.float32 else 1e-2,
+                    rtol=1e-5 if dtype == torch.float32 else 1e-2,
+                )
+                assert (
+                    torch.nn.functional.cosine_similarity(
+                        output.pooler_output, vector, dim=0
+                    )
+                    > 0.9998
+                )
+
+    @pytest.mark.parametrize("quantization", ["mlx", None])
+    def test_embedding_gemma2_rejects_quantization_before_loading(self, quantization):
+        config = _encoder_model_config(
+            hf_config=_hf_config(
+                model_type="embedding_gemma2",
+                quantization_config={} if quantization else {"bits": 4},
+            ),
+            quantization=quantization,
+        )
+        with pytest.raises(NotImplementedError, match="does not support quantization"):
+            load_embedding_gemma2_backend(config)
+
+    @pytest.mark.parametrize("model_type", ["xlm-roberta", "roberta"])
+    @pytest.mark.parametrize("pooling_type", ["CLS", "LAST", "MEAN"])
     @pytest.mark.parametrize("dimensions", [None, 4])
-    def test_xlm_roberta_checkpoint_matches_transformers(
+    def test_encoder_checkpoint_preserves_loading_and_pooling_contract(
         self,
         tmp_path,
         dimensions,
         pooling_type,
+        model_type,
     ) -> None:
         torch.manual_seed(0)
-        torch_config, transformers_model = _save_tiny_xlm_roberta_checkpoint(tmp_path)
+        torch_config, transformers_model = _save_tiny_encoder_checkpoint(
+            tmp_path, model_type=model_type
+        )
 
         model_config = _encoder_model_config(
-            model=str(tmp_path),
+            model="encoder-checkpoint",
+            revision="model-revision",
+            trust_remote_code=True,
             tokenizer="custom-tokenizer",
             tokenizer_revision="tokenizer-revision",
             hf_config=torch_config,
@@ -724,11 +886,16 @@ class TestMetalPoolingCapabilities:
             embedding_size=torch_config.hidden_size,
         )
 
-        with patch(
-            "vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta."
-            "AutoTokenizer.from_pretrained",
-            return_value=object(),
-        ) as load_tokenizer:
+        with (
+            patch(
+                "vllm_metal.v1.pooling.backends.encoder.models.loading.snapshot_download",
+                return_value=str(tmp_path),
+            ) as download,
+            patch(
+                "transformers.AutoTokenizer.from_pretrained",
+                return_value=object(),
+            ) as load_tokenizer,
+        ):
             loaded_backend = load_xlm_roberta_backend(model_config)
 
         input_ids = torch.tensor(
@@ -745,7 +912,7 @@ class TestMetalPoolingCapabilities:
                 attention_mask=attention_mask,
             ).last_hidden_state
 
-        actual_hidden = loaded_backend.model(
+        actual_hidden = loaded_backend.pooling_backend.forward_padded(
             mx.array(input_ids.numpy(), dtype=mx.int32),
             mx.array(attention_mask.numpy(), dtype=mx.int32),
         )
@@ -773,7 +940,7 @@ class TestMetalPoolingCapabilities:
         expected_pooled = (
             expected_tokens.mean(dim=0)
             if pooling_type == "MEAN"
-            else expected_tokens[0]
+            else expected_tokens[-1 if pooling_type == "LAST" else 0]
         )
         expected_embedding = normalize(expected_pooled, dim=0)
 
@@ -784,11 +951,88 @@ class TestMetalPoolingCapabilities:
             atol=1e-5,
             rtol=1e-5,
         )
-        load_tokenizer.assert_called_once_with(
-            "custom-tokenizer",
-            revision="tokenizer-revision",
-            trust_remote_code=False,
+        assert download.call_count == 1
+        assert download.call_args.kwargs["repo_id"] == "encoder-checkpoint"
+        assert download.call_args.kwargs["revision"] == "model-revision"
+        load_tokenizer.assert_not_called()
+
+    @pytest.mark.parametrize("model_type", ["xlm-roberta", "roberta"])
+    @pytest.mark.parametrize(
+        "torch_dtype,mlx_dtype,atol",
+        [
+            (torch.float32, mx.float32, 1e-5),
+            (torch.float16, mx.float16, 1e-3),
+            (torch.bfloat16, mx.bfloat16, 1e-2),
+        ],
+    )
+    def test_encoder_pytorch_checkpoint_preserves_dtype_and_padding(
+        self,
+        tmp_path,
+        model_type,
+        torch_dtype,
+        mlx_dtype,
+        atol,
+    ) -> None:
+        """The loader/adapter must return hidden states, preserving masked tokens."""
+        torch.manual_seed(0)
+        config, reference = _save_tiny_encoder_checkpoint(
+            tmp_path,
+            model_type=model_type,
+            pytorch_weights=True,
         )
+        model_config = _encoder_model_config(
+            model=str(tmp_path),
+            hf_config=config,
+            dtype=torch_dtype,
+        )
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            return_value=object(),
+        ):
+            backend = load_encoder_pooling_backend(model_config).pooling_backend
+        ids = torch.tensor([[0, 5, 6, 2, 1, 1], [1, 1, 0, 7, 8, 2]])
+        mask = ids != config.pad_token_id
+        with torch.no_grad():
+            expected = reference(ids, attention_mask=mask).last_hidden_state
+        actual = backend.forward_padded(mx.array(ids.numpy()), mx.array(mask.numpy()))
+        assert actual.dtype == mlx_dtype
+        actual_numpy = np.array(actual.astype(mx.float32))
+        np.testing.assert_allclose(actual_numpy, expected.numpy(), atol=atol, rtol=atol)
+        for row in range(2):
+            unpadded = mx.array(ids[row, mask[row]].numpy()[None])
+            hidden = backend.profile_forward(unpadded)
+            np.testing.assert_allclose(
+                actual_numpy[row, mask[row].numpy()],
+                np.array(hidden[0].astype(mx.float32)),
+                atol=atol,
+                rtol=atol,
+            )
+
+    @pytest.mark.parametrize(
+        "invalid_weights,error",
+        [
+            ("missing", "Missing .* parameters"),
+            ("unexpected", "parameters not in model"),
+        ],
+    )
+    def test_encoder_loader_rejects_incomplete_or_extra_weights(
+        self,
+        tmp_path,
+        invalid_weights,
+        error,
+    ) -> None:
+        config, reference = _save_tiny_encoder_checkpoint(
+            tmp_path, pytorch_weights=True
+        )
+        weights = reference.state_dict()
+        if invalid_weights == "missing":
+            del weights["embeddings.word_embeddings.weight"]
+        else:
+            weights["unexpected.weight"] = torch.ones(1)
+        torch.save(weights, tmp_path / "pytorch_model.bin")
+        model_config = _encoder_model_config(model=str(tmp_path), hf_config=config)
+        with pytest.raises(ValueError, match=error):
+            load_xlm_roberta_backend(model_config)
 
     def test_xlm_roberta_loader_rejects_quantization_before_download(self) -> None:
         model_config = _encoder_model_config(
@@ -814,7 +1058,7 @@ class TestMetalPoolingCapabilities:
 
     def test_bge_m3_dense_pooling_uses_encoder_backbone(self, tmp_path) -> None:
         torch.manual_seed(0)
-        torch_config, transformers_model = _save_tiny_xlm_roberta_checkpoint(
+        torch_config, transformers_model = _save_tiny_encoder_checkpoint(
             tmp_path,
             "BgeM3EmbeddingModel",
         )
@@ -827,8 +1071,7 @@ class TestMetalPoolingCapabilities:
         )
 
         with patch(
-            "vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta."
-            "AutoTokenizer.from_pretrained",
+            "transformers.AutoTokenizer.from_pretrained",
             return_value=object(),
         ):
             loaded_backend = load_encoder_pooling_backend(model_config)
@@ -855,13 +1098,42 @@ class TestMetalPoolingCapabilities:
             rtol=1e-5,
         )
 
-    def test_bge_m3_token_classify_uses_sparse_head(self, tmp_path) -> None:
+    def test_bge_m3_loader_rejects_missing_sparse_head(self, tmp_path) -> None:
+        config, _ = _save_tiny_encoder_checkpoint(tmp_path, "BgeM3EmbeddingModel")
+        model_config = _bge_m3_model_config(model=str(tmp_path), hf_config=config)
+
+        with (
+            patch(
+                "transformers.AutoTokenizer.from_pretrained",
+                return_value=object(),
+            ),
+            pytest.raises(FileNotFoundError, match="Missing BGE-M3 sparse head"),
+        ):
+            load_encoder_pooling_backend(model_config)
+
+    @pytest.mark.parametrize("use_activation", [True, False])
+    @pytest.mark.parametrize(
+        "token_ids,kept_indices",
+        [([0, 5, 6, 2], [1, 2]), ([5, 6], [0, 1]), ([0, 2], [])],
+    )
+    def test_bge_m3_token_classify_uses_sparse_head(
+        self,
+        tmp_path,
+        use_activation,
+        token_ids,
+        kept_indices,
+    ) -> None:
         torch.manual_seed(0)
-        torch_config, transformers_model = _save_tiny_xlm_roberta_checkpoint(
+        torch_config, transformers_model = _save_tiny_encoder_checkpoint(
             tmp_path,
             "BgeM3EmbeddingModel",
         )
         sparse_linear = _save_bge_m3_sparse_head(tmp_path, torch_config.hidden_size)
+        if not use_activation:
+            # Negative scores make an unwanted ReLU observable.
+            with torch.no_grad():
+                sparse_linear.bias.fill_(-2.0)
+            torch.save(sparse_linear.state_dict(), tmp_path / "sparse_linear.pt")
         model_config = _bge_m3_model_config(
             model=str(tmp_path),
             tokenizer=str(tmp_path),
@@ -870,20 +1142,21 @@ class TestMetalPoolingCapabilities:
         )
 
         with patch(
-            "vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta."
-            "AutoTokenizer.from_pretrained",
+            "transformers.AutoTokenizer.from_pretrained",
             return_value=object(),
         ):
             loaded_backend = load_encoder_pooling_backend(model_config)
 
-        input_ids = torch.tensor([[0, 5, 6, 2]], dtype=torch.long)
+        input_ids = torch.tensor([token_ids], dtype=torch.long)
         attention_mask = (input_ids != torch_config.pad_token_id).to(torch.long)
         with torch.no_grad():
             hidden_states = transformers_model(
                 input_ids,
                 attention_mask=attention_mask,
             ).last_hidden_state
-            expected_scores = torch.relu(sparse_linear(hidden_states[0]))
+            expected_scores = sparse_linear(hidden_states[0])
+            if use_activation:
+                expected_scores = torch.relu(expected_scores)
 
         request = _new_req(
             "req-0",
@@ -891,6 +1164,7 @@ class TestMetalPoolingCapabilities:
             pooling_params=_pooling_params(
                 task="token_classify",
                 requires_token_ids=True,
+                use_activation=use_activation,
             ),
         )
         outputs = loaded_backend.pooling_backend.pool_scheduler_output(
@@ -899,9 +1173,10 @@ class TestMetalPoolingCapabilities:
         )
 
         assert len(outputs) == 1
+        assert outputs[0].pooler_output.device.type == "cpu"
         assert torch.allclose(
             outputs[0].pooler_output,
-            expected_scores.squeeze(-1)[1:-1],
+            expected_scores.squeeze(-1)[kept_indices],
             atol=1e-5,
             rtol=1e-5,
         )
@@ -1119,6 +1394,39 @@ class TestMetalPoolingRunnerOutput:
 
 
 class TestMetalPoolingFailFast:
+    @pytest.mark.parametrize(
+        ("model_type", "architecture"),
+        [
+            ("embedding_gemma2", "EmbeddingGemma2Model"),
+            ("xlm-roberta", "BgeM3EmbeddingModel"),
+            ("xlm-roberta", "XLMRobertaModel"),
+            ("roberta", "RobertaModel"),
+        ],
+    )
+    @pytest.mark.parametrize("entrypoint", ["factory", "lifecycle"])
+    def test_encoder_pooling_rejects_multimodal_config_before_loading(
+        self, model_type, architecture, entrypoint
+    ) -> None:
+        runner = _make_runner(
+            paged=False,
+            model_config=_encoder_model_config(
+                hf_config=_hf_config(
+                    model_type=model_type, architectures=[architecture]
+                ),
+                multimodal_config=SimpleNamespace(language_model_only=False),
+            ),
+        )
+        lifecycle = ModelLifecycle(runner, MagicMock())
+        with (
+            patch.object(lifecycle, "_load_generation") as load_generation,
+            pytest.raises(NotImplementedError, match="--language-model-only"),
+        ):
+            if entrypoint == "factory":
+                load_encoder_pooling_backend(runner.model_config)
+            else:
+                lifecycle.load()
+        load_generation.assert_not_called()
+
     def test_non_decoder_pooling_models_fail_fast_on_execute(
         self,
     ) -> None:
@@ -1358,3 +1666,162 @@ class TestMetalPoolingProfileWarmup:
         assert sequence_model.calls == 1
         runner._extract_logits.assert_not_called()
         set_cache_limit.assert_called_once_with(80)
+
+
+class TestD3ReadoutPooler:
+    def _model_config(self, readout_dir, **overrides):
+        readout = mx.array(
+            [[1.0, 0.0], [0.0, 2.0], [0.5, 0.5]],
+            dtype=mx.float32,
+        )
+        mx.save_safetensors(
+            str(readout_dir / "readout.safetensors"), {"weight": readout}
+        )
+        hf_config = _hf_config(
+            architectures=["D3ForSequenceClassification"],
+            decision_config={
+                "codes": ["A", "B", "C"],
+                "attention_mode": "noncausal_full_attention",
+            },
+        )
+        values = {
+            "model": str(readout_dir),
+            "hf_config": hf_config,
+            "pooler_config": _pooler_config(task="classify", use_activation=False),
+        }
+        values.update(overrides)
+        return _pooling_model_config(**values)
+
+    def test_scores_last_token_against_the_readout(self, tmp_path) -> None:
+        pooler = D3ReadoutPooler(self._model_config(tmp_path))
+        span = DecoderPoolingSpan(
+            start_row=0,
+            num_tokens=2,
+            is_complete=True,
+            pooling_params=_pooling_params(task="classify", use_activation=False),
+        )
+
+        assert pooler.is_supported()
+        logits = pooler.pool_one(
+            mx.array([[[9.0, 9.0], [1.0, 2.0]]], dtype=mx.float32),
+            span,
+        )
+
+        assert logits.tolist() == pytest.approx([1.0, 4.0, 1.5])
+
+    @pytest.mark.parametrize("use_activation", [False, True])
+    def test_use_activation_follows_upstream_classify(
+        self, tmp_path, use_activation
+    ) -> None:
+        """/v1/systemone sends False and softmaxes over one question's codes;
+        True is upstream PoolerClassify over the whole code space."""
+        config = self._model_config(tmp_path)
+        config.pooler_config.logit_mean = 1.0
+        config.pooler_config.logit_sigma = 2.0
+        pooler = D3ReadoutPooler(config)
+        span = DecoderPoolingSpan(
+            start_row=0,
+            num_tokens=2,
+            is_complete=True,
+            pooling_params=_pooling_params(
+                task="classify", use_activation=use_activation
+            ),
+        )
+
+        logits = pooler.pool_one(
+            mx.array([[[9.0, 9.0], [1.0, 2.0]]], dtype=mx.float32),
+            span,
+        )
+
+        if use_activation:
+            assert logits.tolist() == pytest.approx(
+                mx.softmax(mx.array([0.0, 1.5, 0.25])).tolist()
+            )
+            assert float(logits.sum()) == pytest.approx(1.0, abs=1e-6)
+        else:
+            assert logits.tolist() == pytest.approx([0.0, 1.5, 0.25])
+
+    def test_pooler_config_activation_applies_when_params_are_silent(
+        self, tmp_path
+    ) -> None:
+        config = self._model_config(
+            tmp_path, pooler_config=_pooler_config(task="classify", use_activation=True)
+        )
+        span = DecoderPoolingSpan(
+            start_row=0,
+            num_tokens=2,
+            is_complete=True,
+            pooling_params=_pooling_params(task="classify"),
+        )
+
+        logits = D3ReadoutPooler(config).pool_one(
+            mx.array([[[9.0, 9.0], [1.0, 2.0]]], dtype=mx.float32),
+            span,
+        )
+
+        assert float(logits.sum()) == pytest.approx(1.0, abs=1e-6)
+
+    def test_checkpoint_dir_skips_hub_resolution(self, tmp_path, monkeypatch) -> None:
+        """The loader already resolved the dir; the pooler must not ask the Hub."""
+        config = self._model_config(tmp_path, model="vllm-sr/d3-nano")
+
+        def _refuse(*args, **kwargs):
+            raise AssertionError("checkpoint_dir must skip Hub resolution")
+
+        monkeypatch.setattr(
+            "vllm_metal.v1.model_adapter._local_checkpoint_dir", _refuse
+        )
+
+        assert D3ReadoutPooler(config, checkpoint_dir=tmp_path).is_supported()
+
+    def test_unresolvable_checkpoint_dir_is_unsupported(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        config = self._model_config(tmp_path, model="vllm-sr/d3-nano")
+        monkeypatch.setattr(
+            "vllm_metal.v1.model_adapter._local_checkpoint_dir", lambda *a, **k: None
+        )
+
+        assert not D3ReadoutPooler(config).is_supported()
+
+    def test_missing_readout_is_unsupported(self, tmp_path) -> None:
+        config = self._model_config(tmp_path)
+        (tmp_path / "readout.safetensors").unlink()
+
+        assert not D3ReadoutPooler(config).is_supported()
+
+    def test_factory_refuses_a_d3_checkpoint_without_its_readout(
+        self, tmp_path
+    ) -> None:
+        """A server that starts without the readout answers 501 on every
+        decision request; the load must fail instead."""
+        config = self._model_config(tmp_path)
+        (tmp_path / "readout.safetensors").unlink()
+
+        with pytest.raises(ValueError, match="readout.safetensors"):
+            build_decoder_pooling_backend(_PoolingModel(), config)
+
+    def test_other_architectures_leave_d3_disabled(self, tmp_path) -> None:
+        config = self._model_config(
+            tmp_path,
+            hf_config=_hf_config(architectures=["Qwen3ForCausalLM"]),
+        )
+
+        assert not D3ReadoutPooler(config).is_supported()
+
+    def test_non_d3_pooling_never_reads_the_readout(self, tmp_path, monkeypatch):
+        """A Qwen3 pooling load must not touch the readout: the d3 file reader
+        only runs once the checkpoint declares the d3 contract."""
+
+        def _refuse(*args, **kwargs):
+            raise AssertionError("readout read for a non-d3 checkpoint")
+
+        config = _pooling_model_config(
+            model=str(tmp_path),
+            hf_config=_hf_config(architectures=["Qwen3ForCausalLM"]),
+        )
+        monkeypatch.setattr(D3ReadoutPooler, "_readout", _refuse)
+
+        backend = build_decoder_pooling_backend(_PoolingModel(), config)
+
+        assert backend.supported_tasks() == ("embed",)

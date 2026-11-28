@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 import vllm.v1.kv_offload.tiering.spec as tiering_spec_module
 from vllm.v1.kv_offload.base import LookupResult, ReqContext
+from vllm.v1.kv_offload.file_mapper import FileMapper
 from vllm.v1.kv_offload.tiering.base import ScheduleEndContext, TransferJob
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 from vllm.v1.kv_offload.tiering.fs import io as upstream_io
@@ -224,6 +225,55 @@ def test_blocks_round_trip_through_disk(tmp_path: Path) -> None:
         tier.shutdown()
 
 
+def test_restart_restores_only_the_loaded_weights(tmp_path: Path) -> None:
+    q4, q8 = tmp_path / "q4.gguf", tmp_path / "q8.gguf"
+    q4.write_bytes(b"q4")
+    q8.write_bytes(b"q8")
+    alias = tmp_path / "alias.gguf"
+    alias.symlink_to(q4)
+    key = _key(b"same prompt")
+
+    def restart(weights: Path | None, expected: LookupResult) -> None:
+        tier = _tier(tmp_path, gguf_weights_path=str(weights) if weights else None)
+        try:
+            assert _lookup(tier, key, ReqContext(req_id="probe")) is expected
+            if expected is LookupResult.MISS:
+                _store_keys(tier, [key])
+        finally:
+            tier.shutdown()
+
+    for weights in (q4, q8, None):
+        restart(weights, LookupResult.MISS)
+    for weights in (alias, q8, None):
+        restart(weights, LookupResult.HIT)
+    q8.replace(q4)
+    restart(alias, LookupResult.MISS)
+    before = q4.stat()
+    q4.write_bytes(b"v2")
+    os.utime(q4, ns=(before.st_atime_ns, before.st_mtime_ns))
+    restart(q4, LookupResult.MISS)
+
+
+def test_legacy_block_is_evicted_without_being_restored(tmp_path: Path) -> None:
+    key = _key(b"legacy prefix")
+    store = prepare_root_dir(str(tmp_path / "kv-store"))
+    legacy_mapper = FileMapper.from_offloading_spec(
+        store, _fake_spec(BLOCK), parallel_agnostic=True
+    )
+    legacy = Path(legacy_mapper.get_file_name(key))
+    legacy.parent.mkdir(parents=True)
+    legacy.write_bytes(bytes(BLOCK))
+
+    tier = _tier(tmp_path, max_size_gib=BLOCK / (1 << 30))
+    try:
+        assert _lookup(tier, key, ReqContext(req_id="probe")) is LookupResult.MISS
+        _store_keys(tier, [key])
+        assert not legacy.exists()
+        assert Path(tier.file_mapper.get_file_name(key)).is_file()
+    finally:
+        tier.shutdown()
+
+
 def test_failed_load_overrides_cached_hit(tmp_path: Path) -> None:
     """Upstream's failed-load negative cache (vllm#49328) still works here."""
     pool = np.zeros((4, BLOCK), dtype=np.uint8)
@@ -289,7 +339,7 @@ def test_empty_jobs_complete_and_leave_no_bookkeeping(tmp_path: Path) -> None:
         assert done.wait(timeout=10), "drain_jobs() hung on a keyless job"
         assert len(list(tier.get_finished_jobs())) == 4
         assert tier._store_job_paths == {} and tier._load_job_paths == {}
-        assert tier._store_job_keys == {} and tier._load_job_keys == {}
+        assert tier._load_job_keys == {}
     finally:
         tier.shutdown()
 

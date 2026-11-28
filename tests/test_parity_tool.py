@@ -7,7 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from tools.check_parity import check_parity, compare_results, http_generate, http_result
+from tools.check_parity import (
+    check_parity,
+    compare_results,
+    http_generate,
+    http_result,
+    main,
+    serving,
+)
 from tools.parity_utils import parity_report
 
 
@@ -109,6 +116,9 @@ class TestParityTool:
             assert payload["ignore_eos"] and payload["return_token_ids"]
             assert payload["return_tokens_as_token_ids"]
             assert payload["temperature"] == 0
+            assert payload["repetition_penalty"] == 1.0
+            assert payload["presence_penalty"] == payload["frequency_penalty"] == 0.0
+            assert payload["top_k"] == -1 and payload["top_p"] == 1.0
             sent.append(payload["prompt"])
             prompts = payload["prompt"]
             if isinstance(prompts[0], int):
@@ -168,9 +178,20 @@ class TestParityTool:
         with pytest.raises(ValueError, match="input token IDs"):
             http_generate("http://localhost/v1", "model", [{"input_ids": [1]}], 1)
 
-    @pytest.mark.parametrize("backend", ["mlx", "mps"])
+    @pytest.mark.parametrize(
+        "backend,spec",
+        [
+            ("mlx", None),
+            ("mps", None),
+            (
+                "mps",
+                {"method": "eagle3", "model": "draft", "num_speculative_tokens": 3},
+            ),
+        ],
+        ids=["mlx", "mps", "mps-eagle3"],
+    )
     def test_canonical_flow_reuses_reference_and_server(
-        self, monkeypatch, tmp_path, backend
+        self, monkeypatch, tmp_path, backend, spec
     ):
         monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
         monkeypatch.setenv("PYTORCH_ENABLE_MPS_FALLBACK", "1")
@@ -185,13 +206,26 @@ class TestParityTool:
 
         @contextmanager
         def server(
-            model, max_model_len, max_num_seqs, gpu_memory_utilization, log_path, env
+            model,
+            max_model_len,
+            max_num_seqs,
+            gpu_memory_utilization,
+            log_path,
+            env,
+            additional_config,
+            trust_remote_code,
+            speculative_config=None,
+            extra_args=None,
         ):
+            assert speculative_config == spec
+            assert extra_args is None
+            assert not trust_remote_code
             assert max_num_seqs == 2
             assert gpu_memory_utilization == 0.65
             assert env["VLLM_METAL_BACKEND"] == backend
             if backend == "mps":
                 assert env["PYTORCH_ENABLE_MPS_FALLBACK"] == "0"
+            assert additional_config is None
             events.append("server started")
             yield "http://localhost/v1"
             events.append("server stopped")
@@ -209,6 +243,7 @@ class TestParityTool:
             1,
             top_k=2,
             output_dir=tmp_path,
+            speculative_config=spec,
         )
         assert events == [
             "reference exited",
@@ -223,3 +258,151 @@ class TestParityTool:
             "TOP_K_MATCH": 1,
             "FAIL": 0,
         }
+
+    def test_trust_remote_code_reaches_reference_and_server(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        commands = []
+        trusted = []
+        row = {**self._result([2], []), "input_ids": [1]}
+
+        def generate_reference(command, **kwargs):
+            commands.append(command)
+            path = Path(command[command.index("--generate-reference") + 1])
+            path.write_text(json.dumps([row]))
+
+        @contextmanager
+        def server(*args, speculative_config=None, extra_args=None):
+            assert speculative_config is None
+            trusted.append(args[-1])
+            yield "http://localhost/v1"
+
+        monkeypatch.setattr("subprocess.run", generate_reference)
+        monkeypatch.setattr("tools.check_parity.serving", server)
+        monkeypatch.setattr("tools.check_parity.http_generate", lambda *args: args[2])
+
+        assert check_parity(
+            str(tmp_path),
+            ["test prompt"],
+            1,
+            batch_sizes=(1,),
+            output_dir=tmp_path,
+            trust_remote_code=True,
+            reference_backend="mlx-vlm",
+        )
+        assert "--trust-remote-code" in commands[0]
+        assert commands[0][commands[0].index("--reference-backend") + 1] == "mlx-vlm"
+        assert trusted == [True]
+
+    def test_reference_model_reaches_reference_and_server_tokenizer(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # The Hugging Face cache links each file name to an extensionless blob.
+        blob = tmp_path / "blob"
+        blob.write_bytes(b"")
+        gguf = tmp_path / "model.gguf"
+        gguf.symlink_to(blob)
+        dense = tmp_path / "dense"
+        dense.mkdir()
+        commands = []
+        servers = []
+        row = {**self._result([2], []), "input_ids": [1]}
+
+        def generate_reference(command, **kwargs):
+            commands.append(command)
+            path = Path(command[command.index("--generate-reference") + 1])
+            path.write_text(json.dumps([row]))
+
+        @contextmanager
+        def server(model, *args, speculative_config=None, extra_args=None):
+            servers.append((model, extra_args))
+            yield "http://localhost/v1"
+
+        monkeypatch.setattr("subprocess.run", generate_reference)
+        monkeypatch.setattr("tools.check_parity.serving", server)
+        monkeypatch.setattr("tools.check_parity.http_generate", lambda *args: args[2])
+
+        assert check_parity(
+            str(gguf),
+            ["test prompt"],
+            1,
+            batch_sizes=(1,),
+            output_dir=tmp_path,
+            reference_model=str(dense),
+        )
+        assert commands[0][commands[0].index("--model") + 1] == str(dense)
+        assert servers == [(str(gguf), ["--tokenizer", str(dense)])]
+
+    @pytest.mark.parametrize(
+        "option",
+        [["--trust-remote-code"], ["--reference-model", "dense"]],
+        ids=["trust-remote-code", "reference-model"],
+    )
+    def test_unsupported_options_are_rejected_with_speculative_method(
+        self, monkeypatch, capsys, option
+    ) -> None:
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "check_parity.py",
+                "--model",
+                "target",
+                "--method",
+                "draft_model",
+                "--draft",
+                "draft",
+                *option,
+            ],
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            main()
+
+        assert exc.value.code == 2
+        assert f"{option[0]} cannot be combined with --method" in (
+            capsys.readouterr().err
+        )
+
+
+@pytest.mark.parametrize(
+    "prefix_caching,flag",
+    [(False, "--no-enable-prefix-caching"), (True, "--enable-prefix-caching")],
+)
+def test_serving_sets_prefix_caching_and_appends_args(
+    monkeypatch, tmp_path, prefix_caching, flag
+):
+    commands = []
+
+    class Exited:
+        pid = 12345
+
+        def __init__(self, command, **kwargs):
+            commands.append(command)
+
+        def poll(self):
+            return 1
+
+        def wait(self, timeout=None):
+            return 1
+
+    monkeypatch.setattr("subprocess.Popen", Exited)
+    monkeypatch.setattr("os.killpg", lambda pid, sig: None)
+    extra = ["--kv-offloading-size", "1"]
+    with (
+        pytest.raises(RuntimeError, match="exited during startup"),
+        serving(
+            "model",
+            64,
+            1,
+            0.5,
+            tmp_path / "log",
+            {},
+            prefix_caching=prefix_caching,
+            extra_args=extra,
+        ),
+    ):
+        pass
+    [command] = commands
+    assert flag in command
+    assert ("--no-enable-prefix-caching" in command) != prefix_caching
+    assert command[-2:] == extra

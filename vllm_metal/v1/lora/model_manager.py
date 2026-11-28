@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import logging
+import re
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
 
 import mlx.core as mx
@@ -20,7 +22,7 @@ from .layers import (
     can_wrap_qlora,
 )
 from .peft_loader import LoadedLoRA, LoRALayerWeightsMLX
-from .punica_wrapper import PunicaWrapperMLX
+from .punica_wrapper import EncoderPunicaWrapperMLX, PunicaWrapperMLX
 
 if TYPE_CHECKING:
     from vllm.config.lora import LoRAConfig
@@ -30,11 +32,24 @@ logger = logging.getLogger(__name__)
 _WrappedModule = MLXLinearWithLoRA | MLXQuantizedLinearWithLoRA
 _PreparedLoRAWeights = tuple[mx.array, mx.array, int]
 _PreparedModuleUpdate = tuple[_WrappedModule, _PreparedLoRAWeights | None]
+_EMBEDDING_MODULES = frozenset({"embed_tokens", "lm_head"})
 
 
 class _PreparedAdapterUpdate(NamedTuple):
     module_updates: list[_PreparedModuleUpdate]
     loaded_modules: int
+
+
+@dataclass(frozen=True)
+class EncoderLoRATarget:
+    """Multimodal encoder (tower and connector) that LoRA may adapt.
+
+    ``prefix`` names the encoder's modules the way adapter weights do after
+    the model's weights mapper, e.g. ``visual.`` for ``visual.blocks.0.attn.qkv``.
+    """
+
+    module: nn.Module
+    prefix: str
 
 
 class MLXLoRAModelManager:
@@ -45,8 +60,10 @@ class MLXLoRAModelManager:
         max_num_seqs: int,
         max_num_batched_tokens: int,
         dtype: mx.Dtype,
+        encoder: EncoderLoRATarget | None = None,
     ):
         self.model, self.lora_config = model, lora_config
+        self.encoder = encoder
         self.max_num_seqs, self.max_num_batched_tokens = (
             max_num_seqs,
             max_num_batched_tokens,
@@ -73,6 +90,7 @@ class MLXLoRAModelManager:
         self.punica_wrapper = PunicaWrapperMLX(
             max_num_batched_tokens, max_num_seqs, self.lora_slots
         )
+        self.encoder_punica_wrapper = EncoderPunicaWrapperMLX()
         self._last_mapping: LoRAMapping | None = None
         self._wrap_target_modules()
 
@@ -88,60 +106,96 @@ class MLXLoRAModelManager:
         return len(self._registered)
 
     def _wrap_target_modules(self) -> None:
-        targets = self.lora_config.target_modules
-        repls: list[tuple[str, _WrappedModule]] = []
-        for name, m in self.model.named_modules():
-            if not is_in_target_modules(name, targets):
-                continue
-            if can_wrap(m):
-                repls.append(
-                    (
-                        name,
-                        MLXLinearWithLoRA(
-                            m,
-                            self.lora_slots,
-                            self.lora_config.max_lora_rank,
-                            self.dtype,
-                        ),
-                    )
-                )
-            elif can_wrap_qlora(m):
-                repls.append(
-                    (
-                        name,
-                        MLXQuantizedLinearWithLoRA(
-                            m,
-                            self.lora_slots,
-                            self.lora_config.max_lora_rank,
-                            self.dtype,
-                        ),
-                    )
-                )
-        if not repls:
+        roots: list[tuple[nn.Module, str, PunicaWrapperMLX | EncoderPunicaWrapperMLX]]
+        roots = [(self.model, "", self.punica_wrapper)]
+        if self.encoder is not None:
+            roots.append(
+                (self.encoder.module, self.encoder.prefix, self.encoder_punica_wrapper)
+            )
+        wrapped: list[_WrappedModule] = []
+        for root, prefix, punica_wrapper in roots:
+            repls = self._wrappable_modules(root, prefix)
+            for name, w in repls:
+                w.set_mapping(punica_wrapper)
+                self.modules[prefix + name] = w
+                wrapped.append(w)
+            if repls:
+                root.update_modules(tree_unflatten(repls))
+        if not wrapped:
             raise RuntimeError(
                 "MLXLoRAModelManager found no LoRA target modules to wrap. "
                 "LoRAConfig.target_modules may exclude every wrappable module, "
                 "or the selected leaves may not expose a supported linear "
                 "contract for LoRA/QLoRA wrapping."
             )
-        for name, w in repls:
-            w.set_mapping(self.punica_wrapper)
-            self.modules[name] = w
-        self.model.update_modules(tree_unflatten(repls))
+        num_plain = sum(1 for w in wrapped if isinstance(w, MLXLinearWithLoRA))
         logger.info(
-            "MLXLoRAModelManager wrapped %d modules (%d plain, %d quantized).",
-            len(repls),
-            sum(1 for _, w in repls if isinstance(w, MLXLinearWithLoRA)),
-            sum(1 for _, w in repls if isinstance(w, MLXQuantizedLinearWithLoRA)),
+            "MLXLoRAModelManager wrapped %d modules (%d plain, %d quantized, "
+            "%d in the multimodal encoder).",
+            len(wrapped),
+            num_plain,
+            len(wrapped) - num_plain,
+            sum(1 for name in self.modules if self._is_encoder_module(name)),
         )
 
-    def add_adapter(self, adapter: LoadedLoRA) -> bool:
+    def _wrappable_modules(
+        self, root: nn.Module, prefix: str
+    ) -> list[tuple[str, _WrappedModule]]:
+        targets = self.lora_config.target_modules
+        repls: list[tuple[str, _WrappedModule]] = []
+        for name, m in root.named_modules():
+            if not is_in_target_modules(prefix + name, targets):
+                continue
+            if can_wrap(m):
+                wrapper_cls: type[_WrappedModule] = MLXLinearWithLoRA
+            elif can_wrap_qlora(m):
+                wrapper_cls = MLXQuantizedLinearWithLoRA
+            else:
+                continue
+            repls.append(
+                (
+                    name,
+                    wrapper_cls(
+                        m,
+                        self.lora_slots,
+                        self.lora_config.max_lora_rank,
+                        self.dtype,
+                    ),
+                )
+            )
+        return repls
+
+    def _is_encoder_module(self, name: str) -> bool:
+        return self.encoder is not None and name.startswith(self.encoder.prefix)
+
+    def set_encoder_adapter(self, lora_id: int | None) -> None:
+        """Route the next encoder calls through ``lora_id`` (``None``: base)."""
+        if lora_id is None:
+            self.encoder_punica_wrapper.set_slot(None)
+            return
+        if self.encoder is None:
+            raise RuntimeError(
+                "Encoder LoRA routing requested but no multimodal encoder "
+                "was wrapped; pass --enable-tower-connector-lora."
+            )
+        slot = self._slot_for_adapter(lora_id)
+        if slot is None:
+            raise ValueError(
+                f"LoRA adapter {lora_id} is not active in a LoRA slot; "
+                "activate it before encoding with it."
+            )
+        self.encoder_punica_wrapper.set_slot(slot)
+
+    def add_adapter(
+        self, adapter: LoadedLoRA, *, require_activation_slot: bool = False
+    ) -> bool:
         if adapter.lora_id in self._registered:
             self._registered.touch(adapter.lora_id)
             return False
 
-        # Validate before eviction so a malformed new adapter cannot destroy a
-        # working cache entry.
+        # Check capacity and weights before evicting a cached adapter.
+        if require_activation_slot:
+            self._next_activation_slot()
         self._prepare_adapter_update(adapter, 0)
 
         if len(self._registered) >= self.capacity:
@@ -155,16 +209,15 @@ class MLXLoRAModelManager:
         if lora_id not in self._registered:
             raise ValueError(f"LoRA adapter {lora_id} is not registered")
 
+        # Check capacity and validate weights before replacing the cached adapter.
         slot = self._slot_for_adapter(lora_id)
         if slot is None:
-            slot = 0
+            slot = self._next_activation_slot()
         prepared = self._prepare_adapter_update(adapter, slot)
 
         self._registered[lora_id] = adapter
         self._registered.touch(lora_id)
         if self._slot_for_adapter(lora_id) is None:
-            slot = self._next_activation_slot()
-            prepared = self._prepare_adapter_update(adapter, slot)
             self._activate_prepared(lora_id, slot, prepared)
         else:
             self._commit_adapter_update(lora_id, slot, prepared)
@@ -224,8 +277,11 @@ class MLXLoRAModelManager:
             return False
         self._active.pop(lora_id, None)
         self.lora_index_to_id[slot] = None
+        if self.encoder_punica_wrapper.slot == slot:
+            self.encoder_punica_wrapper.set_slot(None)
         for w in self.modules.values():
             w.reset_lora(slot)
+        self._materialize_slots()
         self._last_mapping = None
         return True
 
@@ -300,12 +356,14 @@ class MLXLoRAModelManager:
     ) -> _PreparedAdapterUpdate:
         updates: list[_PreparedModuleUpdate] = []
         loaded = 0
+        consumed: set[str] = set()
         for name, module in self.modules.items():
             weights = _lookup_weights_for_module(adapter, name)
             if weights is None:
                 updates.append((module, None))
                 continue
             loaded += 1
+            consumed.add(weights.module_name)
             lora_a, lora_b = module.prepare_lora_weights(
                 slot,
                 weights.lora_a,
@@ -316,6 +374,27 @@ class MLXLoRAModelManager:
                     module,
                     (lora_a, lora_b, int(weights.lora_a.shape[0])),
                 )
+            )
+        # Upstream applies LoRA to embedding modules and to MoE experts (the
+        # ".experts" names its check_unexpected_modules accepts). Metal does
+        # not wrap mlx_lm's SwitchLinear experts, so refuse rather than serve
+        # the adapter without them. Modules excluded by the deployment
+        # target_modules are dropped, as upstream does.
+        unsupported = {
+            name
+            for name in adapter.weights.keys() - consumed
+            if (name.rsplit(".", 1)[-1] in _EMBEDDING_MODULES or ".experts" in name)
+            and is_in_target_modules(name, self.lora_config.target_modules)
+        }
+        if unsupported:
+            # An MoE adapter has one module per expert per layer.
+            patterns = sorted(
+                {re.sub(r"(?<=\.)\d+(?=\.)", "*", n) for n in unsupported}
+            )
+            raise ValueError(
+                f"LoRA adapter {adapter.lora_id} contains weights for "
+                f"{patterns} that this model cannot apply on Metal. "
+                "Use an adapter trained for supported target modules."
             )
         if loaded == 0:
             raise ValueError(
@@ -338,8 +417,28 @@ class MLXLoRAModelManager:
                 continue
             lora_a, lora_b, rank = weights
             module.set_prepared_lora(slot, lora_a, lora_b, rank=rank)
+        self._materialize_slots()
         self.lora_index_to_id[slot] = lora_id
         self._last_mapping = None
+
+    def _materialize_slots(self) -> None:
+        """Schedule pending slot writes for evaluation now.
+
+        A slot write is a lazy MLX update of the module's stacked weights. A
+        wrapped module that does not run before its next write, such as the
+        multimodal encoder during text-only steps, would chain every write
+        onto the previous one and keep the buffers each write captured alive.
+        Under adapter churn that grows the process's live Metal buffer count
+        until allocation fails. ``async_eval`` resolves the chain without
+        waiting for an in-flight forward.
+        """
+        mx.async_eval(
+            [
+                stacked
+                for module in self.modules.values()
+                for stacked in (module.lora_a_stacked, module.lora_b_stacked)
+            ]
+        )
 
 
 def _lookup_weights_for_module(

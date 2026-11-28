@@ -15,9 +15,20 @@ import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
-from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
-from vllm.v1.kv_offload.base import GPULoadStoreSpec
+from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheGroupSpec,
+    MLAAttentionSpec,
+)
+from vllm.v1.kv_offload.base import (
+    CanonicalKVCacheRef,
+    CanonicalKVCaches,
+    CanonicalKVCacheTensor,
+    DevicePointers,
+    GPULoadStoreSpec,
+)
+from vllm.v1.kv_offload.pointer_utils import resolve_device_pointers
 
 from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT
 from vllm_metal.attention.caches.storage import KVCacheStorage
@@ -36,12 +47,20 @@ def make_storage(
     num_blocks: int = 8,
     block_size: int = 4,
     turboquant: bool = False,
+    mla: bool = False,
     k_quant: str = "q8_0",
     v_quant: str = "q3_0",
 ) -> KVCacheStorage:
-    """A single-group full-attention cache allocated by vLLM."""
-    if turboquant:
-        spec: FullAttentionSpec = TurboQuantAttentionSpec(
+    """A single-group full-attention cache allocated by vLLM.
+
+    With ``mla``, one latent head of ``head_dim`` per token, as MLA binds it.
+    """
+    if mla:
+        spec: FullAttentionSpec = MLAAttentionSpec(
+            block_size=block_size, num_kv_heads=1, head_size=head_dim, dtype=dtype
+        )
+    elif turboquant:
+        spec = TurboQuantAttentionSpec(
             block_size=block_size,
             num_kv_heads=num_kv_heads,
             head_size=head_dim,
@@ -105,6 +124,26 @@ def make_region(
     )
 
 
+def canonical_caches(storage: KVCacheStorage) -> CanonicalKVCaches:
+    """What upstream's ``register_kv_caches`` builds from ``storage.tensors``.
+
+    One ``(num_blocks, page)`` int8 view and one data ref per layer, the
+    layout of Metal's single full-attention group.
+    """
+    tensors, refs = [], []
+    for name, layer in storage.tensors.items():
+        page = storage.specs[name].page_size_bytes
+        view = torch.tensor([], dtype=torch.int8).set_(
+            layer.untyped_storage(),
+            layer.storage_offset() * layer.element_size(),
+            (storage.config.num_blocks, page),
+            (layer.stride(0) * layer.element_size(), 1),
+        )
+        refs.append(CanonicalKVCacheRef(tensor_idx=len(tensors), page_size_bytes=page))
+        tensors.append(CanonicalKVCacheTensor(tensor=view, page_size_bytes=page))
+    return CanonicalKVCaches(tensors=tensors, group_data_refs=[refs])
+
+
 def make_worker(
     storage: KVCacheStorage,
     *,
@@ -122,6 +161,7 @@ def make_worker(
         kv_bytes_per_chunk = chunk_bytes(storage, blocks_per_chunk)
     return MetalKVOffloadWorker(
         storage,
+        canonical_caches(storage),
         blocks_per_chunk=blocks_per_chunk,
         num_cpu_chunks=num_cpu_chunks,
         region=region,
@@ -158,3 +198,10 @@ def gpu_spec(block_ids: list[int], block_index: int = 0) -> GPULoadStoreSpec:
     return GPULoadStoreSpec(
         block_ids, group_sizes=[len(block_ids)], block_indices=[block_index]
     )
+
+
+def device_ptrs(
+    worker: MetalKVOffloadWorker, block_ids: list[int], block_index: int = 0
+) -> DevicePointers:
+    """The pointers upstream's connector worker submits for these blocks."""
+    return resolve_device_pointers(gpu_spec(block_ids, block_index), worker.kv_caches)

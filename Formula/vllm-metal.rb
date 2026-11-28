@@ -4,10 +4,10 @@ class VllmMetal < Formula
   desc "LLM inference server for Apple Silicon using vLLM"
   homepage "https://github.com/vllm-project/vllm-metal"
   # Pin a stable release; old development release assets are deleted.
-  url "https://github.com/vllm-project/vllm-metal/releases/download/v0.31.0/vllm_metal-0.31.0-cp312-cp312-macosx_15_0_arm64.whl",
+  url "https://github.com/vllm-project/vllm-metal/releases/download/v0.34.0/vllm_metal-0.34.0-cp312-cp312-macosx_15_0_arm64.whl",
       using: :nounzip
-  version "0.31.0"
-  sha256 "e2ab31296f8c42d8b65c8d5f5490f160087d1070178444870a5672e44aaacf6e"
+  version "0.34.0"
+  sha256 "27141e0134e92358b494b3609df3a3f4be611852a9201b34ad7dbc0cbad8029f"
   license "Apache-2.0"
 
   depends_on arch: :arm64
@@ -21,8 +21,9 @@ class VllmMetal < Formula
   # Match .github/vllm-release-tag.commit at the plugin tag when updating.
   # The macOS CPU wheel supplies vLLM; this plugin provides Metal execution.
   resource "vllm" do
-    url "https://github.com/vllm-project/vllm/releases/download/v0.31.0/vllm-0.31.0%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl"
-    sha256 "21378516a51ff15029f71168e827b94660e21b39484eb52277166f01ac7dd686"
+    url "https://github.com/vllm-project/vllm/releases/download/v0.34.0/vllm-0.34.0%2Bcpu-cp38-abi3-macosx_11_0_arm64.whl"
+    version "0.34.0"
+    sha256 "cd0abe2a9d698bc0bef36ac9aa38da34307c53572ddee60ca35faef280af99d2"
   end
 
   def install
@@ -37,23 +38,19 @@ class VllmMetal < Formula
     system libexec/"bin/pip", "install", vllm_wheel,
            buildpath/"vllm_metal-#{version}-cp312-cp312-macosx_15_0_arm64.whl"
 
-    # TVM-FFI uses wheel RECORD files to locate its own and xgrammar's native
-    # libraries. Save them outside site-packages before Homebrew cleans them.
     site_packages = libexec/"lib/python3.12/site-packages"
+    torch_requirements = site_packages/"vllm_metal/requirements-torch.txt"
+    system libexec/"bin/pip", "install", "-r", torch_requirements if torch_requirements.exist?
+
+    # TVM-FFI uses wheel RECORD files to locate its own and xgrammar's native
+    # libraries. Keep the files in pkgshare and link them back so cleanup preserves them.
     %w[apache_tvm_ffi xgrammar].each do |package|
       record = site_packages.glob("#{package}-*.dist-info/RECORD").fetch(0)
       (pkgshare/"#{package}.record").write record.read
+      record.dirname.install_symlink pkgshare/"#{package}.record" => "RECORD"
     end
 
     bin.install_symlink libexec/"bin/vllm"
-  end
-
-  def post_install
-    site_packages = libexec/"lib/python3.12/site-packages"
-    %w[apache_tvm_ffi xgrammar].each do |package|
-      metadata = site_packages.glob("#{package}-*.dist-info").fetch(0)
-      cp pkgshare/"#{package}.record", metadata/"RECORD"
-    end
   end
 
   def caveats

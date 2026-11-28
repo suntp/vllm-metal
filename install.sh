@@ -51,16 +51,18 @@ fetch_release() {
   echo "$release_data"
 }
 
-# Print "<tag>\n<wheel url>" from a GitHub release payload on stdin.
+# Print "<tag>\n<wheel url>" for the running Python's wheel tag from a GitHub
+# release payload on stdin.
 extract_wheel_url() {
   local channel="$1"
 
-  CHANNEL="$channel" python3 -c '
+  CHANNEL="$channel" python -c '
 import json
 import os
 import sys
 
 channel = os.environ["CHANNEL"]
+python_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
 try:
     data = json.load(sys.stdin)
 except Exception:
@@ -76,7 +78,15 @@ else:
 
 for release in releases:
     for asset in release.get("assets", []):
-        if (asset.get("name") or "").endswith(".whl"):
+        name = asset.get("name") or ""
+        parts = name.rsplit("-", 3)
+        if (
+            name.startswith("vllm_metal-")
+            and len(parts) == 4
+            and parts[1:3] == [python_tag, python_tag]
+            and parts[3].startswith("macosx_")
+            and parts[3].endswith("_arm64.whl")
+        ):
             print(release.get("tag_name", ""))
             print(asset.get("browser_download_url", ""))
             sys.exit(0)
@@ -113,7 +123,9 @@ fetch_release_vllm_tag() {
 install_vllm() {
   local vllm_release_tag="$1"
   local vllm_version="${vllm_release_tag#v}"
-  local vllm_wheel_url="https://github.com/vllm-project/vllm/releases/download/${vllm_release_tag}/vllm-${vllm_version}%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl"
+  local download_url="https://github.com/vllm-project/vllm/releases/download/${vllm_release_tag}"
+  # vLLM's prebuilt macOS arm64 wheel is tagged cp38-abi3.
+  local vllm_wheel_url="${download_url}/vllm-${vllm_version}%2Bcpu-cp38-abi3-macosx_11_0_arm64.whl"
 
   echo ""
   section "Installing vLLM core"
@@ -160,6 +172,13 @@ download_and_install_wheel() {
     exit 1
   fi
 
+  # Use this wheel's Torch pins. Older releases retain vLLM's defaults.
+  local torch_requirements
+  torch_requirements=$(python -I -c 'from importlib.metadata import distribution; print(distribution("vllm-metal").locate_file("vllm_metal/requirements-torch.txt"))')
+  if [[ -f "$torch_requirements" ]]; then
+    uv pip install -r "$torch_requirements"
+  fi
+
   success "Installed ${package_name}"
 }
 
@@ -194,6 +213,8 @@ Options:
   -h, --help        Show this help.
 
 The channel can also be set with VLLM_METAL_CHANNEL=dev|stable.
+Set VLLM_METAL_PYTHON=3.12|3.13 to select Python (default: 3.12).
+Set VLLM_METAL_VENV to override the environment directory.
 EOF
         exit 0
         ;;
@@ -258,6 +279,7 @@ EOF
     venv="$script_dir/.venv-vllm-metal"
   fi
 
+  venv="${VLLM_METAL_VENV:-$venv}"
   ensure_venv "$venv"
   if ! require_arm64_python python; then
     exit 1
@@ -269,7 +291,8 @@ EOF
     install_vllm "$vllm_release_tag"
 
     # Source checkouts build native artifacts; release installs use the wheel.
-    uv pip install -e .
+    uv pip install -e ".[build]"
+    uv pip install -r vllm_metal/requirements-torch.txt
     ensure_metal_toolchain
     build_native_artifacts
   else
@@ -288,7 +311,7 @@ EOF
     fi
 
     if [[ -z "$wheel_url" ]]; then
-      error "No wheel file found in the latest ${channel} release."
+      error "No compatible wheel found for Python ${VLLM_METAL_PYTHON:-3.12} in the ${channel} releases."
       exit 1
     fi
 

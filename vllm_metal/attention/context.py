@@ -132,6 +132,9 @@ class PagedAttentionContext:
     kv_groups: tuple[PagedKVGroupContext, ...] | None = None
     # Fixed at worker startup and deducted before scheduler KV allocation.
     tq_prefill_workspace_bytes: int = 0
+    # The caller reads (prompt logprobs) or routes (LoRA) every packed row's
+    # output, so no fast path may reduce rows.
+    all_rows_consumed: bool = False
     # Kernel-format metadata memo, keyed by (KV group index, cache block
     # size).  The context lives for exactly one forward pass, so entries
     # never go stale; every layer of a group reuses the first layer's
@@ -152,6 +155,12 @@ class PagedAttentionContext:
     paged_native_capabilities: dict[str, bool] | None = None
     # Immutable native length statistics, shared by all KV groups/layers.
     gqa_length_plan: Any = None
+    # NAX tile counts keyed by (sliding window, first sequence), so whole
+    # batches and prefill subsets are shared only by matching layers.
+    nax_tile_work: Any = None
+    # Per-row Llama 4 query scale memo keyed by (beta, original_max); every
+    # scaled layer of this forward shares it (``impls.sdpa.llama4_query_scale``).
+    llama4_query_scales: dict[tuple[float, int], Any] = field(default_factory=dict)
 
 
 def set_context(ctx: PagedAttentionContext) -> None:
@@ -190,8 +199,11 @@ class OffsetCache:
     from this object.
     """
 
-    def __init__(self, offset: int) -> None:
+    def __init__(self, offset: int, index: int | None = None) -> None:
         self.offset = offset
+        # Position in the cache list passed to the model. A looped model hands
+        # each loop of a layer its own entry, so this names that loop's KV layer.
+        self.index = index
 
     # --- satisfy KVCache protocol expected by create_attention_mask ---------
 
@@ -222,6 +234,7 @@ def prepare_grouped(
     merge_verify_windows: bool = False,
     *,
     tq_prefill_workspace_bytes: int = 0,
+    all_rows_consumed: bool = False,
 ) -> None:
     """Compute metadata for every scheduler KV-cache group in one forward pass.
 
@@ -252,6 +265,9 @@ def prepare_grouped(
             the tiled one.
         tq_prefill_workspace_bytes: allowance already reserved by the worker
             before KV allocation. Defaults to zero, disabling materialization.
+        all_rows_consumed: the caller reads (prompt logprobs) or routes (LoRA)
+            every packed row's output, so row-reducing fast paths must keep
+            every row. Defaults to False.
     """
     group_slot_mappings: list[list[int]] = [[] for _ in block_sizes]
     group_block_tables: list[list[list[int]]] = [[] for _ in block_sizes]
@@ -344,6 +360,7 @@ def prepare_grouped(
             verify_window_q=1 if prefill_requests else max_decode_window,
             kv_groups=kv_groups,
             tq_prefill_workspace_bytes=tq_prefill_workspace_bytes,
+            all_rows_consumed=all_rows_consumed,
         )
     )
 

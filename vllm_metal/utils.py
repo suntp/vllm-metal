@@ -3,6 +3,7 @@
 
 import logging
 import mmap
+import os
 import re
 import subprocess
 import time
@@ -149,6 +150,50 @@ def get_model_download_path(
 
     # Fallback: Let mlx_lm or mlx_vlm handle the download natively from HuggingFace
     return model_repo_name
+
+
+def resolve_mlx_lm_model_path(
+    model_name: str | Path,
+    *,
+    revision: str | None = None,
+    token: str | bool | None = None,
+    cache_dir: str | None = None,
+) -> Path:
+    """Resolve a local checkpoint using mlx-lm's file filters and Hub selection.
+
+    The filters come from mlx_lm's text-model set plus any file a pooling
+    backend reads on top of the backbone. d3 scores prompts with
+    ``readout.safetensors``, which does not match ``model*.safetensors``; a repo
+    id served without it loads the backbone and then has no classify pooler.
+    """
+    model_path = Path(model_name)
+    if model_path.exists():
+        return model_path
+
+    from mlx_lm.utils import DEFAULT_ALLOW_PATTERNS
+
+    allow_patterns = [*DEFAULT_ALLOW_PATTERNS, "readout.safetensors"]
+    if os.getenv("MLXLM_USE_MODELSCOPE", "False").lower() == "true":
+        from modelscope import snapshot_download
+
+        return Path(
+            snapshot_download(
+                str(model_name),
+                revision=revision,
+                allow_patterns=allow_patterns,
+            )
+        )
+    from huggingface_hub import snapshot_download
+
+    return Path(
+        snapshot_download(
+            str(model_name),
+            revision=revision,
+            token=token,
+            cache_dir=cache_dir,
+            allow_patterns=allow_patterns,
+        )
+    )
 
 
 def set_wired_limit() -> None:

@@ -6,14 +6,11 @@ from __future__ import annotations
 import builtins
 import importlib.util
 import json
-import os
 import sys
 from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
-from transformers import AutoConfig
-from transformers.models.auto import configuration_auto
 
 import vllm_metal.compat as compat
 
@@ -88,33 +85,6 @@ def _write_mismatched_bytelevel_tokenizer_repo(path) -> None:
         json.dumps(special_tokens_map),
         encoding="utf-8",
     )
-
-
-def _write_gemma4_assistant_config(path) -> None:
-    config = {
-        "architectures": ["Gemma4AssistantForCausalLM"],
-        "backbone_hidden_size": 1536,
-        "model_type": "gemma4_assistant",
-        "text_config": {
-            "hidden_size": 256,
-            "hidden_size_per_layer_input": 0,
-            "layer_types": [
-                "sliding_attention",
-                "sliding_attention",
-                "sliding_attention",
-                "full_attention",
-            ],
-            "model_type": "gemma4_text",
-            "num_attention_heads": 4,
-            "num_hidden_layers": 4,
-            "num_key_value_heads": 1,
-            "num_kv_shared_layers": 4,
-            "vocab_size_per_layer_input": 0,
-        },
-        "tie_word_embeddings": True,
-        "use_ordered_embeddings": True,
-    }
-    (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
 
 
 class _ByteLevelBackend:
@@ -261,33 +231,7 @@ class TestByteLevelTokenizerCompatPatch:
         assert captured_kwargs["_commit_hash"] == "abc123"
 
 
-class TestGemma4MTPConfigCompatPatch:
-    def test_missing_registration_uses_compat_assistant_config(
-        self, monkeypatch, tmp_path
-    ) -> None:
-        config_mapping = configuration_auto.CONFIG_MAPPING
-        monkeypatch.setattr(config_mapping, "_mapping", dict(config_mapping._mapping))
-        monkeypatch.setattr(
-            config_mapping, "_extra_content", dict(config_mapping._extra_content)
-        )
-        config_mapping._mapping.pop("gemma4_assistant", None)
-        config_mapping._extra_content.pop("gemma4_assistant", None)
-
-        with pytest.raises(ValueError, match="gemma4_assistant"):
-            AutoConfig.for_model("gemma4_assistant")
-
-        _write_gemma4_assistant_config(tmp_path)
-        compat._patch_vllm_gemma4_mtp_config_loading()
-
-        config = AutoConfig.from_pretrained(tmp_path)
-
-        assert config.model_type == "gemma4_assistant"
-        assert config.architectures == ["Gemma4AssistantForCausalLM"]
-        assert config.backbone_hidden_size == 1536
-        assert config.text_config.model_type == "gemma4_text"
-        assert config.text_config.num_hidden_layers == 4
-        assert config.get_text_config() is config.text_config
-
+class TestApplyCompatPatches:
     def test_registration_time_failures_do_not_stop_other_patches(
         self,
         monkeypatch,
@@ -295,20 +239,6 @@ class TestGemma4MTPConfigCompatPatch:
         calls: list[str] = []
 
         monkeypatch.setattr(compat, "_APPLIED", False)
-        monkeypatch.setattr(
-            compat,
-            "_transformers_knows_gemma4_assistant",
-            lambda _auto_config: False,
-        )
-
-        def _raise_missing_gemma4_config():
-            raise ModuleNotFoundError("No module named 'transformers.models.gemma4'")
-
-        monkeypatch.setattr(
-            compat,
-            "_gemma4_assistant_config_class",
-            _raise_missing_gemma4_config,
-        )
 
         def _raise_bytelevel_import_error() -> None:
             calls.append("bytelevel")
@@ -329,10 +259,261 @@ class TestGemma4MTPConfigCompatPatch:
             "_patch_mlx_lm_qwen3_flat_weight_prefix",
             lambda: calls.append("qwen3_flat_prefix"),
         )
+        monkeypatch.setattr(
+            compat,
+            "_patch_mlx_lm_minicpm4_model_type",
+            lambda: calls.append("minicpm4_model_type"),
+        )
 
         compat.apply_compat_patches()
 
-        assert calls == ["bytelevel", "qwen35_fp8", "qwen3_flat_prefix"]
+        assert calls == [
+            "bytelevel",
+            "qwen35_fp8",
+            "qwen3_flat_prefix",
+            "minicpm4_model_type",
+        ]
+
+
+# vLLM's own LFM3 registrations (vllm/model_executor/models/registry.py).
+_VLLM_LFM3 = {
+    "Lfm3ForCausalLM": "vllm.model_executor.models.lfm3:Lfm3ForCausalLM",
+    "Lfm3VlForConditionalGeneration": (
+        "vllm.model_executor.models.lfm3_vl:Lfm3VlForConditionalGeneration"
+    ),
+    "Lfm3AudioForConditionalGeneration": (
+        "vllm.model_executor.models.lfm3_audio:Lfm3AudioForConditionalGeneration"
+    ),
+}
+
+
+class TestModelMetadataCompat:
+    @pytest.fixture(autouse=True)
+    def metal_mlx(self, monkeypatch):
+        import vllm.platforms as platforms
+
+        from vllm_metal.platform import MetalPlatform
+
+        monkeypatch.delenv("VLLM_METAL_BACKEND", raising=False)
+        monkeypatch.setattr(platforms, "current_platform", MetalPlatform())
+
+    @pytest.fixture
+    def registry(self, monkeypatch):
+        """vLLM's model registry with its own LFM3 entries, restored after the test.
+
+        Any earlier test that loads vLLM's general plugins has already run
+        ``register_model_compat`` on the shared registry.
+        """
+        from vllm.model_executor.models import ModelRegistry
+
+        monkeypatch.setattr(ModelRegistry, "models", dict(ModelRegistry.models))
+        for architecture, model_cls in _VLLM_LFM3.items():
+            ModelRegistry.register_model(architecture, model_cls)
+        return ModelRegistry
+
+    @pytest.mark.parametrize(
+        ("architecture", "expected"),
+        [
+            ("Lfm3ForCausalLM", _VLLM_LFM3["Lfm3ForCausalLM"]),
+            (
+                "Lfm3VlForConditionalGeneration",
+                "vllm_metal.patches.lfm3_registry:Lfm3VlForConditionalGeneration",
+            ),
+            (
+                "Lfm3AudioForConditionalGeneration",
+                "vllm_metal.patches.lfm3_audio_registry:"
+                "Lfm3AudioForConditionalGeneration",
+            ),
+        ],
+        ids=["text-stays-native", "vl", "audio"],
+    )
+    def test_mlx_overrides_only_lfm3_vl_and_audio(
+        self, registry, architecture, expected
+    ) -> None:
+        compat.register_model_compat()
+        compat.register_model_compat()
+
+        registered = registry.models[architecture]
+        assert f"{registered.module_name}:{registered.class_name}" == expected
+
+    @pytest.mark.parametrize(
+        ("is_metal", "backend"),
+        [(False, "mlx"), (True, "mps")],
+    )
+    def test_other_platforms_and_backends_keep_vllms_native_lfm3(
+        self, registry, monkeypatch, is_metal, backend
+    ) -> None:
+        import vllm.platforms as platforms
+        from vllm.platforms.cpu import CpuPlatform
+
+        monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
+        if not is_metal:
+            monkeypatch.setattr(platforms, "current_platform", CpuPlatform())
+
+        compat.register_model_compat()
+
+        registered = {
+            architecture: f"{entry.module_name}:{entry.class_name}"
+            for architecture, entry in registry.models.items()
+            if architecture in _VLLM_LFM3
+        }
+        assert registered == _VLLM_LFM3
+
+
+def _write_nanbeige_config(path) -> None:
+    (path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["NanbeigeForCausalLM"],
+                "model_type": "nanbeige",
+                "hidden_size": 3072,
+                "num_hidden_layers": 22,
+                "num_attention_heads": 48,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "num_loops": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+class TestNanbeigeCompat:
+    @pytest.fixture(autouse=True)
+    def metal_mlx(self, monkeypatch):
+        import vllm.platforms as platforms
+
+        from vllm_metal.platform import MetalPlatform
+
+        monkeypatch.delenv("VLLM_METAL_BACKEND", raising=False)
+        monkeypatch.setattr(platforms, "current_platform", MetalPlatform())
+
+    @pytest.fixture(autouse=True)
+    def without_nanbeige(self, monkeypatch):
+        """Hide any Nanbeige config registration in Transformers."""
+        from transformers.models.auto import configuration_auto
+
+        config_mapping = configuration_auto.CONFIG_MAPPING
+        monkeypatch.setattr(config_mapping, "_mapping", dict(config_mapping._mapping))
+        monkeypatch.setattr(
+            config_mapping, "_extra_content", dict(config_mapping._extra_content)
+        )
+        config_mapping._mapping.pop("nanbeige", None)
+        config_mapping._extra_content.pop("nanbeige", None)
+
+    def test_checkpoint_config_loads_and_pickles(self, tmp_path) -> None:
+        """vllm.LLM sends the config to spawned EngineCore workers by pickle."""
+        import pickle
+
+        from transformers import AutoConfig
+
+        _write_nanbeige_config(tmp_path)
+        compat.register_model_compat()
+        config = pickle.loads(pickle.dumps(AutoConfig.from_pretrained(tmp_path)))
+
+        assert config.model_type == "nanbeige"
+        assert config.num_hidden_layers == 22
+        assert config.num_loops == 2
+
+    def test_existing_registration_is_kept(self) -> None:
+        """Once Transformers knows nanbeige, the hook must leave it alone."""
+        from transformers import AutoConfig
+        from transformers.models.auto import configuration_auto
+
+        existing = type("ExistingConfig", (), {"model_type": "nanbeige"})
+        AutoConfig.register("nanbeige", existing, exist_ok=True)
+
+        compat.register_model_compat()
+
+        assert configuration_auto.CONFIG_MAPPING["nanbeige"] is existing
+
+
+def _write_prism_hadamard_config(
+    path,
+    *,
+    with_vision: bool = True,
+    architectures: list[str] | None = None,
+) -> None:
+    payload: dict[str, object] = {
+        "schema_version": 2 if with_vision else 1,
+        "model_type": "prism_hadamard_qwen35",
+        "text_config": {"model_type": "qwen3_5_text"},
+    }
+    if with_vision:
+        payload["vision_config"] = {"model_type": "qwen3_5"}
+    if architectures is not None:
+        payload["architectures"] = architectures
+    (path / "config.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+class TestPrismHadamardQwen35Compat:
+    @pytest.fixture(autouse=True)
+    def metal_mlx(self, monkeypatch):
+        import vllm.platforms as platforms
+
+        from vllm_metal.platform import MetalPlatform
+
+        monkeypatch.delenv("VLLM_METAL_BACKEND", raising=False)
+        monkeypatch.setattr(platforms, "current_platform", MetalPlatform())
+
+    @pytest.fixture(autouse=True)
+    def without_prism_hadamard(self, monkeypatch):
+        """Hide any prism_hadamard_qwen35 config registration in Transformers."""
+        from transformers.models.auto import configuration_auto
+
+        config_mapping = configuration_auto.CONFIG_MAPPING
+        monkeypatch.setattr(config_mapping, "_mapping", dict(config_mapping._mapping))
+        monkeypatch.setattr(
+            config_mapping, "_extra_content", dict(config_mapping._extra_content)
+        )
+        config_mapping._mapping.pop("prism_hadamard_qwen35", None)
+        config_mapping._extra_content.pop("prism_hadamard_qwen35", None)
+
+    def test_vlm_config_loads_defaults_and_pickles(self, tmp_path) -> None:
+        """vllm.LLM sends the config to spawned EngineCore workers by pickle."""
+        import pickle
+
+        from transformers import AutoConfig
+
+        _write_prism_hadamard_config(tmp_path, with_vision=True)
+        compat.register_model_compat()
+        config = pickle.loads(pickle.dumps(AutoConfig.from_pretrained(tmp_path)))
+
+        assert config.model_type == "prism_hadamard_qwen35"
+        assert config.architectures == ["Qwen3_5ForConditionalGeneration"]
+        assert config.text_config.model_type == "qwen3_5_text"
+
+    def test_text_only_config_defaults_to_causal_lm(self, tmp_path) -> None:
+        from transformers import AutoConfig
+
+        _write_prism_hadamard_config(tmp_path, with_vision=False)
+        compat.register_model_compat()
+
+        assert AutoConfig.from_pretrained(tmp_path).architectures == [
+            "Qwen3_5ForCausalLM"
+        ]
+
+    def test_explicit_architectures_are_preserved(self, tmp_path) -> None:
+        from transformers import AutoConfig
+
+        _write_prism_hadamard_config(tmp_path, architectures=["CustomQwen3_5Arch"])
+        compat.register_model_compat()
+
+        assert AutoConfig.from_pretrained(tmp_path).architectures == [
+            "CustomQwen3_5Arch"
+        ]
+
+    def test_existing_registration_is_kept(self) -> None:
+        """Once Transformers knows prism_hadamard_qwen35, leave it alone."""
+        from transformers import AutoConfig
+        from transformers.models.auto import configuration_auto
+
+        existing = type("ExistingConfig", (), {"model_type": "prism_hadamard_qwen35"})
+        AutoConfig.register("prism_hadamard_qwen35", existing, exist_ok=True)
+
+        compat.register_model_compat()
+
+        assert configuration_auto.CONFIG_MAPPING["prism_hadamard_qwen35"] is existing
 
 
 def _install_fake_qwen35_modules(monkeypatch, *, include_moe: bool):
@@ -384,6 +565,23 @@ def _install_fake_qwen35_modules(monkeypatch, *, include_moe: bool):
 
     monkeypatch.setattr(importlib.util, "find_spec", _fake_find_spec)
     return dense_module, moe_module
+
+
+class TestMiniCPM4ModelTypeCompatPatch:
+    def test_minicpm4_resolves_to_the_minicpm_module(self, monkeypatch) -> None:
+        from mlx_lm import utils as mlx_lm_utils
+
+        remapping = dict(mlx_lm_utils.MODEL_REMAPPING)
+        remapping.pop("minicpm4", None)
+        monkeypatch.setattr(mlx_lm_utils, "MODEL_REMAPPING", remapping)
+        config = {"model_type": "minicpm4", "architectures": ["MiniCPMForCausalLM"]}
+        with pytest.raises(ValueError, match="minicpm4"):
+            mlx_lm_utils._get_classes(config)
+
+        compat._patch_mlx_lm_minicpm4_model_type()
+
+        model_cls, _ = mlx_lm_utils._get_classes(config)
+        assert model_cls.__module__ == "mlx_lm.models.minicpm"
 
 
 class TestQwen35Fp8CompatPatch:
@@ -445,25 +643,17 @@ class TestQwen35Fp8CompatPatch:
         assert dequantized.shape == (129, 130)
         np.testing.assert_allclose(dequantized, expected)
 
-    def test_dequant_real_mlx_fp8_values_when_enabled(self) -> None:
-        if os.environ.get("VLLM_METAL_RUN_REAL_MLX_FP8_TESTS") != "1":
-            pytest.skip("VLLM_METAL_RUN_REAL_MLX_FP8_TESTS=1 not set")
-
+    def test_dequantizes_real_fp8_values_with_block_scale(self) -> None:
         import mlx.core as mx
 
-        fp8_dtype = getattr(mx, "float8_e4m3fn", None)
-        if fp8_dtype is None:
-            pytest.skip("mlx.core has no float8_e4m3fn dtype")
-
-        weight = mx.array([[1.0, -2.0], [0.5, 4.0]], dtype=mx.float32).astype(fp8_dtype)
-        scale_inv = mx.array([[2.0]], dtype=mx.float32)
+        weight = mx.to_fp8(mx.array([[1.0, -2.0], [0.5, 4.0]]))
+        scale_inv = mx.array([[2.0]])
 
         dequantized = compat._dequantize_qwen35_fp8_weight(weight, scale_inv, mx)
-        mx.eval(dequantized)
 
         np.testing.assert_allclose(
-            np.array(dequantized, dtype=np.float32),
-            np.array([[2.0, -4.0], [1.0, 8.0]], dtype=np.float32),
+            np.array(dequantized.astype(mx.float32)),
+            [[2.0, -4.0], [1.0, 8.0]],
         )
 
     def test_rejects_unexpected_fp8_block_scale_shape(self, monkeypatch) -> None:
@@ -992,7 +1182,7 @@ class TestQwen3FlatWeightPrefixTransform:
         fake_self = _HeadfulQwen3Self(tie_word_embeddings=False)
         assert fake_self.lm_head is not None
 
-        with compat.embedding_load_scope():
+        with compat.headless_load_scope():
             out = compat._qwen3_flat_weight_prefix(
                 fake_self, _flat_official_qwen3_weights()
             )
@@ -1117,9 +1307,78 @@ class TestQwen3FlatPrefixRealStrictLoad:
 
             # Embedding pooling never calls logits: the module is dropped, the
             # strict load passes.
-            with compat.embedding_load_scope():
+            with compat.headless_load_scope():
                 pooling = model_cls(_tiny_qwen3_args(tie_word_embeddings=False))
                 self._load_like_mlx_lm(pooling, flat)
             assert not hasattr(pooling, "lm_head")
         finally:
             _unwrap_qwen3_sanitize(model_cls)
+
+
+class TestD3WeightLayoutTransform:
+    """Unit tests for the remap applied before mlx_lm's Qwen3.5 sanitize."""
+
+    def test_flat_d3_backbone_gets_wrapper_prefix(self) -> None:
+        weights = {
+            "language_model.embed_tokens.weight": "W-embed",
+            "language_model.layers.0.self_attn.q_proj.weight": "W-q",
+            "language_model.norm.weight": "W-norm",
+            "visual.patch_embed.proj.weight": "W-patch",
+            "visual.blocks.0.attn.qkv.weight": "W-visual",
+        }
+
+        out = compat._d3_weight_layout(None, weights)
+
+        assert set(out) == {
+            "language_model.model.embed_tokens.weight",
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            "language_model.model.norm.weight",
+        }
+        assert out["language_model.model.embed_tokens.weight"] == "W-embed"
+
+    def test_headless_scope_drops_the_unused_vocabulary_head(self) -> None:
+        class _FakeLanguageModel:
+            def __init__(self) -> None:
+                self.args = SimpleNamespace(tie_word_embeddings=False)
+                self.lm_head = object()
+
+        model = SimpleNamespace(language_model=_FakeLanguageModel())
+        weights = {
+            "language_model.embed_tokens.weight": "W-embed",
+            "language_model.layers.0.self_attn.q_proj.weight": "W-q",
+        }
+
+        compat._d3_weight_layout(model, weights)
+        assert model.language_model.lm_head is not None
+
+        with compat.headless_load_scope():
+            out = compat._d3_weight_layout(model, weights)
+
+        assert not hasattr(model.language_model, "lm_head")
+        assert "language_model.model.layers.0.self_attn.q_proj.weight" in out
+
+    def test_tied_checkpoint_keeps_its_tied_head(self) -> None:
+        class _FakeLanguageModel:
+            def __init__(self) -> None:
+                self.args = SimpleNamespace(tie_word_embeddings=True)
+                self.lm_head = object()
+
+        model = SimpleNamespace(language_model=_FakeLanguageModel())
+        weights = {"language_model.embed_tokens.weight": "W-embed"}
+
+        with compat.headless_load_scope():
+            compat._d3_weight_layout(model, weights)
+
+        assert model.language_model.lm_head is not None
+
+    def test_wrapper_layout_passes_through(self) -> None:
+        weights = {
+            "language_model.model.layers.0.self_attn.q_proj.weight": "W-q",
+        }
+
+        assert compat._d3_weight_layout(None, weights) == weights
+
+    def test_other_layouts_pass_through(self) -> None:
+        weights = {"model.embed_tokens.weight": "W-embed", "lm_head.weight": "W-head"}
+
+        assert compat._d3_weight_layout(None, weights) == weights

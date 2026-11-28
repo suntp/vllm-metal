@@ -15,8 +15,8 @@ class MLAPagedLatentCache:
 
     Layout per layer: [num_blocks, block_size, latent_dim].
 
-    Standalone MLA allocates its own arrays; hybrid MLA binds views of the
-    scheduler-owned shared cache storage.
+    ``from_upstream`` binds views of the scheduler-owned shared cache storage;
+    the count-based constructor allocates private arrays.
     """
 
     @classmethod
@@ -111,6 +111,10 @@ class MLAPagedLatentCache:
 
     def copy_blocks(self, block_copies: Sequence[tuple[int, int]]) -> None:
         """Apply scheduler copy-on-write operations to latent-cache blocks."""
+        if self._storage is not None:
+            # An index-assign on a view would never reach the shared backing.
+            self._storage.copy_blocks(block_copies)
+            return
         if not block_copies:
             return
 

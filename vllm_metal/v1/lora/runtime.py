@@ -4,7 +4,8 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 from vllm.lora.layers import LoRAMapping
@@ -17,6 +18,9 @@ if TYPE_CHECKING:
     import mlx.nn as nn
     from vllm.config.lora import LoRAConfig
     from vllm.lora.request import LoRARequest
+    from vllm.model_executor.models.utils import WeightsMapper
+
+    from .model_manager import EncoderLoRATarget
 
 logger = logging.getLogger(__name__)
 
@@ -49,11 +53,18 @@ class MetalLoRARuntime:
 
     def __init__(self) -> None:
         self._manager: MetalWorkerLoRAManager | None = None
+        self._encoder_enabled = False
         self._requests_by_id: dict[int, LoRARequest] = {}
+        self._step_uses_adapter = False
 
     @property
     def enabled(self) -> bool:
         return self._manager is not None
+
+    @property
+    def step_uses_adapter(self) -> bool:
+        """Whether the step last prepared routes any row through an adapter."""
+        return self._step_uses_adapter
 
     def setup(
         self,
@@ -65,6 +76,8 @@ class MetalLoRARuntime:
         max_num_seqs: int,
         max_num_batched_tokens: int,
         max_position_embeddings: int | None,
+        encoder: EncoderLoRATarget | None = None,
+        weights_mapper: WeightsMapper | None = None,
     ) -> None:
         if lora_config is None:
             return
@@ -88,7 +101,28 @@ class MetalLoRARuntime:
             max_num_batched_tokens=max_num_batched_tokens,
             dtype=TORCH_TO_MLX_DTYPE[lora_config.lora_dtype],
             max_position_embeddings=max_position_embeddings,
+            encoder=encoder,
+            weights_mapper=weights_mapper,
         )
+        self._encoder_enabled = encoder is not None
+
+    @property
+    def encoder_enabled(self) -> bool:
+        return self._manager is not None and self._encoder_enabled
+
+    @contextmanager
+    def encoder_adapter(self, lora_request: LoRARequest | None) -> Iterator[None]:
+        """Run the multimodal encoder through ``lora_request``'s adapter."""
+        assert self._manager is not None
+        if lora_request is not None:
+            self.add_adapter(lora_request)
+        self._manager.set_encoder_adapter(
+            None if lora_request is None else lora_request.lora_int_id
+        )
+        try:
+            yield
+        finally:
+            self._manager.set_encoder_adapter(None)
 
     def add_adapter(self, lora_request: LoRARequest) -> bool:
         if self._manager is None:
@@ -140,3 +174,4 @@ class MetalLoRARuntime:
             active_requests.add(lora_request)
         mapping = builder.build() if not builder.is_empty() else None
         self._manager.set_active_adapters(active_requests, mapping)
+        self._step_uses_adapter = bool(active_requests)

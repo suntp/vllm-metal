@@ -9,15 +9,21 @@ python tools/check_parity.py --model Qwen/Qwen3-0.6B
 VLLM_METAL_BACKEND=mps PYTORCH_ENABLE_MPS_FALLBACK=0 \
   python tools/check_parity.py --model Qwen/Qwen3-0.6B --top-k 5
 python tools/check_parity.py --model /path/to/checkpoint --top-k 5 --batch-size 1 2 --output-dir parity-results
+python tools/check_parity.py --model LiquidAI/LFM3-1.7B-MLX-4bit --reference-backend mlx-vlm --top-k 5
+python tools/check_parity.py --model /path/to/Qwen3.5-0.8B-Q6_K.gguf --reference-model Qwen/Qwen3.5-0.8B --top-k 8
 ```
 
-The tool generates the native MLX reference once and exits that process before starting one `vllm serve` instance. It checks `/health`, compares individual prompts and pairs of prompts through `/v1/completions`, then stops the server. The server's sequence limit is the largest requested batch size, and prefix caching is disabled. Each pair is submitted in one HTTP request. These are request batch sizes, not assertions about the actual GPU batch size. Both backends use the same checkpoint and input token IDs. MPS serving disables PyTorch's optional CPU fallback.
+The tool generates the native MLX reference once and exits that process before starting one `vllm serve` instance. It checks `/health`, compares individual prompts and pairs of prompts through `/v1/completions`, then stops the server. The server's sequence limit is the largest requested batch size, and prefix caching is disabled. Each pair is submitted in one HTTP request. These are request batch sizes, not assertions about the actual GPU batch size. Both backends use the same input token IDs and, unless `--reference-model` is set, the same checkpoint. MPS serving disables PyTorch's optional CPU fallback.
 
-The default is the 40 prompts in `tools/parity_prompts.py`, greedy decoding, and 10 output tokens, ignoring EOS. Use `--prompt` for custom text, `--max-tokens` for output length, and `--help` for all options. Inputs are plain text without a chat template. Logs, the native reference, and a summary are saved to `--output-dir`, or a new temporary directory printed at startup. The tool selects an available localhost port automatically.
+For a local GGUF file, set `--reference-model` to the checkpoint it was converted from.
+
+The default is the 40 prompts in `tools/parity_prompts.py`, greedy decoding, and 10 output tokens, ignoring EOS. Use `--prompt` for custom text, `--max-tokens` for output length, `--trust-remote-code` for checkpoints whose model type vLLM does not know and that ship their own config code, and `--help` for all options. Inputs are plain text without a chat template. Logs, the native reference, and a summary are saved to `--output-dir`, or a new temporary directory printed at startup. The tool selects an available localhost port automatically.
 
 - `EXACT`: every output token matches.
 - `TOP_K_MATCH`: the first divergence passes mutual top-K membership; later tokens are not compared. Enabled with `--top-k K`.
 - `FAIL`: a mismatch fails the comparison, or generation is incomplete.
+
+Parity checks may be unreliable for MoE models. When mismatches occur, investigate routing flips between experts with nearly tied scores.
 
 Exit status is 0 when all prompts pass, otherwise nonzero. No saved golden token IDs or regeneration step is needed.
 
@@ -61,6 +67,10 @@ Measure speed separately with the [DSpark serving benchmark](https://github.com/
 
 Parity runs daily at 07:17 UTC on `main`. Users with repository write access can also comment `/ci parity` on an open PR once the workflow is on the default branch.
 
-Both triggers invoke this same tool for Qwen3-0.6B and Qwen3.5-0.8B on macOS 15 and 26 with Xcode 26.3: 40 shared prompts, 20 output tokens, top-K 5, and HTTP request batch sizes 1/2. CI supplies the checkpoint and environment and collects the tool's results.
+Both triggers invoke this same tool for Qwen3-0.6B and Qwen3.5-0.8B on a self-hosted Apple Silicon Mac: 40 shared prompts, 20 output tokens, top-K 5, and HTTP request batch sizes 1/2. The Qwen3.5-0.8B job also compares a pinned Q6_K GGUF file of that checkpoint with its native reference at top-K 8. CI supplies the checkpoint and environment and collects the tool's results.
 
-The `Parity` check links to job summaries and artifacts containing the native reference, server log, and per-batch results, retained for 14 days. Regular PR CI runs fast tests without starting model servers.
+The Qwen3-0.6B job also checks speculative output parity and FP32 acceptance
+and rejection recovery, including prefix-cache reuse.
+
+The `Parity` check links to summary tables and diagnostic artifacts, retained
+for 14 days. Regular PR CI runs fast tests without starting model servers.

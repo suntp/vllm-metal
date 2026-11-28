@@ -16,8 +16,7 @@ plugin's own mechanism), which vLLM loads in ``EngineArgs.__post_init__`` and
 again inside the EngineCore/worker subprocesses, so the registration is
 spawn-safe without import-time patching.
 
-This module must stay importable WITHOUT the optional ``gguf`` package: a
-default install loads it on every vLLM run via the entry point.
+Keep GGUF parsing imports lazy: the entry point loads on every vLLM run.
 
 # SCAFFOLDING: remove when vllm-project/vllm-gguf-plugin installs and imports
 # on macOS; then depend on it for this layer (register() already no-ops when
@@ -30,6 +29,7 @@ import importlib
 import importlib.util
 from functools import wraps
 from pathlib import Path
+from typing import Any
 
 import torch
 from vllm.model_executor.layers.quantization import (
@@ -41,7 +41,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
 
-from vllm_metal.gguf.source import RemoteGGUFReference
+from vllm_metal.gguf.source import GGUFLoadSource, RemoteGGUFReference
 
 __all__ = ["GGUFEngineIntegration", "MetalGGUFConfig", "register"]
 
@@ -82,6 +82,13 @@ class MetalGGUFConfig(QuantizationConfig):
     @classmethod
     def from_config(cls, config: dict) -> MetalGGUFConfig:
         return cls()
+
+    @classmethod
+    def override_quantization_method(
+        cls, hf_quant_cfg: dict[str, Any], user_quant: str | None, hf_config: Any = None
+    ) -> str | None:
+        # The .gguf carries its own quantization, so the config source's is ignored.
+        return "gguf" if user_quant == "gguf" else None
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> None:
         # Never exercised: vllm-metal bypasses vLLM's model executor.
@@ -148,7 +155,7 @@ class GGUFEngineIntegration:
         """Whether ``model`` reads as the plugin's ``repo_id:quant`` syntax.
 
         Mirrors the official plugin's public ``is_remote_gguf`` at the shape
-        level while keeping the optional ``gguf`` package out of this module.
+        level while keeping the ``gguf`` package out of this module.
         """
         return model is not None and RemoteGGUFReference.parse(model) is not None
 
@@ -231,17 +238,50 @@ class GGUFEngineIntegration:
                         f"Cannot serve GGUF model with quantization={self.quantization!r}; "
                         "leave quantization unset or use 'gguf'."
                     )
+                vocab_overrides = GGUFLoadSource.vocab_overrides(
+                    self.model_weights or gguf_model,
+                    config_source,
+                    cache_dir=self.download_dir,
+                    revision=self.revision,
+                    token=self.hf_token,
+                )
                 self.quantization = "gguf"
                 if not self.model_weights:
                     self.model_weights = gguf_model
                 if self.served_model_name is None:
                     self.served_model_name = [gguf_model]
                 self.model = config_source
+                if vocab_overrides:
+                    self.hf_overrides = cls._with_vocab_overrides(
+                        self.hf_overrides, vocab_overrides
+                    )
             return original(self, *args, **kwargs)
 
         EngineArgs.create_model_config = create_model_config
         arg_utils_module.get_model_path = get_model_path
         EngineArgs._metal_gguf_patched = True
+
+    @staticmethod
+    def _with_vocab_overrides(
+        hf_overrides: Any, vocab_overrides: dict[str, Any]
+    ) -> Any:
+        """Add the file's vocab to ``hf_overrides``; the user's own values win.
+
+        A callable ``hf_overrides`` (Python API only) is left as given.
+        """
+        if callable(hf_overrides):
+            return hf_overrides
+        user = dict(hf_overrides or {})
+        merged = {**vocab_overrides, **user}
+        if (
+            isinstance(user.get("text_config"), dict)
+            and "text_config" in vocab_overrides
+        ):
+            merged["text_config"] = {
+                **vocab_overrides["text_config"],
+                **user["text_config"],
+            }
+        return merged
 
     @classmethod
     def _patch_speculator_probe(cls) -> None:

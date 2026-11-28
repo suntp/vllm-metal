@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Metal vLLM v1 model runner.
+MLX model runner for vLLM's V2 scheduler contract.
 
 Orchestration only: coordinates scheduling, dispatch, and output assembly.
 Model-specific behavior belongs in adapters; backend-specific kernels live in
@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeAlias, cast
 import mlx.core as mx
 import numpy as np
 import torch
-from vllm.config import VllmConfig
+from vllm.config import LoRAConfig, VllmConfig
 from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
@@ -45,13 +45,12 @@ from vllm.v1.outputs import (
     LogprobsTensors,
     ModelRunnerOutput,
 )
-from vllm.v1.sample.logits_processor import LOGITSPROCS_GROUP
-from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu.kv_connector import (
     NO_OP_KV_CONNECTOR,
     ActiveKVConnector,
     KVConnector,
 )
+from vllm.v1.worker.gpu.sample.logits_processor.loader import LOGITSPROCS_GROUP
 
 from vllm_metal import envs
 from vllm_metal.attention.context import (
@@ -100,7 +99,7 @@ from vllm_metal.v1.gemma4_mtp import (
     Gemma4MTPAssistantRuntime,
     Gemma4MTPAssistantSource,
 )
-from vllm_metal.v1.lora import MetalLoRARuntime
+from vllm_metal.v1.lora import EncoderLoRATarget, MetalLoRARuntime
 from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_adapter import (
     DefaultModelAdapter,
@@ -125,9 +124,11 @@ from vllm_metal.v1.proposer import (
     MetalProposer,
     ProposeContext,
 )
+from vllm_metal.v1.sampling import Sampler
 from vllm_metal.v1.sampling_batch import (
     SamplingBatch,
     create_request_generator,
+    native_sampling_key,
     sample_decode_tokens,
     sample_from_logits,
     sample_prefill_tokens,
@@ -139,6 +140,7 @@ from vllm_metal.v1.spec_decode import (
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
 if TYPE_CHECKING:
+    from vllm_metal.moe_offload import ExpertStore
     from vllm_metal.patches.aux_hidden_states import AuxHiddenStateCapture
     from vllm_metal.v1.kv_offload.connector import MetalOffloadingConnector
 
@@ -147,7 +149,6 @@ logger = init_logger(__name__)
 
 SchedulerMemoryReportingMode: TypeAlias = Literal[
     "stt_nominal",
-    "paged_attention_capacity",
     "paged_attention_layout_budget",
     "pooling_no_kv",
 ]
@@ -181,7 +182,7 @@ class RequestState:
     # ``len(token_ids) - 1 + mrope_position_delta``; ``None`` for text-only.
     mrope_position_delta: int | None = None
     # Scheduler-reconciled prefix-cache-hit boundary (the same value used to
-    # resume the target's own paged prefill, see `_add_new_requests`).
+    # resume the target's own paged prefill, see `_admit_request`).
     # DraftModelProposer reuses this as the draft cache's ingest
     # boundary instead of self-tracking it, so a cache hit shared across
     # requests skips re-ingest for the draft's KV too (#482).
@@ -219,7 +220,7 @@ class _PendingPrefillEntry:
 
     output_idx: int
     prefill: PrefillRequest
-    result_mode: Literal["intermediate", "new_final", "cached_final"]
+    result_mode: Literal["intermediate", "final"]
 
 
 @dataclass
@@ -231,7 +232,6 @@ class _ExecutionBatch:
     sampled_tokens: list[list[int]] = field(default_factory=list)
     sample_logprobs: list[LogprobsLists | None] = field(default_factory=list)
     pooler_outputs: list[torch.Tensor | None] = field(default_factory=list)
-    new_reqs_by_id: dict[str, NewRequestData] = field(default_factory=dict)
     paged_prefill_entries: list[_PendingPrefillEntry] = field(default_factory=list)
     paged_decode_reqs: list[tuple[str, RequestState]] = field(default_factory=list)
     # Completed prompt-logprobs tensors, delivered on the step that finishes
@@ -278,7 +278,6 @@ class _ExecutionBatch:
         """Build ``ModelRunnerOutput`` from this completed batch."""
         return ModelRunnerOutput(
             req_ids=self.req_ids,
-            req_id_to_index=self.req_id_to_index,
             sampled_token_ids=self.sampled_tokens,
             logprobs=self.merged_logprobs(),
             prompt_logprobs_dict=dict(self.prompt_logprobs_dict),
@@ -368,13 +367,14 @@ class _PagedForwardState(NamedTuple):
 class MetalModelRunner:
     """Model runner for MLX-based inference on Metal.
 
-    Implements the vLLM v1 model runner interface for Apple Silicon.
+    Implements the vLLM model runner interface for Apple Silicon.
     """
 
     # Class-level defaults so stub runners built via __new__ are safe on
     # paths that check connector state.
     _kv_connector_driver: KVConnector | None = None
     _kv_step_finished_req_ids: set[str] | None = None
+    _expert_store: "ExpertStore | None" = None
 
     def __init__(self, vllm_config: VllmConfig):
         """Initialize model runner.
@@ -395,15 +395,8 @@ class MetalModelRunner:
         self.scheduler_config = vllm_config.scheduler_config
         self.use_async_scheduling = bool(self.scheduler_config.async_scheduling)
         self.metal_config = get_config()
-        # MLX-native sampling key chain (opt-in via VLLM_METAL_NATIVE_SAMPLING).
-        # Derived from the engine seed, so sampling is reproducible for a
-        # fixed request schedule; split once per sampling call. A live key is
-        # the single runtime capability signal for the native random path.
-        self._native_sample_key: mx.array | None = (
-            mx.random.key(self.model_config.seed)
-            if envs.VLLM_METAL_NATIVE_SAMPLING
-            else None
-        )
+        self._native_sampling_enabled = envs.VLLM_METAL_NATIVE_SAMPLING
+        self._native_sampling_step = 0
         self._model_adapter: ModelAdapter = DefaultModelAdapter()
         self._cache_policy = ModelCachePolicy(self, self._model_adapter)
         self._model_lifecycle = ModelLifecycle(self, self._model_adapter)
@@ -411,7 +404,6 @@ class MetalModelRunner:
         self._spec_decode_controller = SpeculativeDecodeController()
 
         self.model: Any = None
-        self.tokenizer: Any = None
         self.model_args: dict[str, Any] = {}
         self._is_vlm: bool = False  # Will be set during model loading
         self._is_pooling: bool = (
@@ -439,6 +431,7 @@ class MetalModelRunner:
 
         # Request state cache for incremental decoding
         self._request_states: dict[str, RequestState] = {}
+        self._awaiting_readmission: set[str] = set()
 
         # Image-block state; lives outside RequestState because a
         # one-step prefill has no RequestState during its forward.
@@ -502,15 +495,16 @@ class MetalModelRunner:
         self._pp_model: PipelinedModel | None = None
 
         # Structured-output bitmask applier for the paged path.
-        self._structured_output_applier = MetalStructuredOutputApplier()
+        self._structured_output_applier = MetalStructuredOutputApplier(
+            mask_stride=vllm_config.num_speculative_tokens
+            + (0 if self.model_config.is_diffusion else 1)
+        )
 
         # Per-request prompt-logprobs accumulation across prefill chunks
         # (populated only for requests whose SamplingParams ask for it).
         self._prompt_logprobs_tracker = PromptLogprobsTracker()
 
-        # One-step-ahead decode pipelining (owner: decode_pipeline.py).
-        # Gate-eligible pure-decode greedy steps defer the sampling sync one
-        # step so the next step's graph build overlaps the in-flight forward.
+        # Defer the sampling sync so the next graph build overlaps the forward.
         self._decode_pipeline = DecodePipeline(
             build_output=_ExecutionBatch.to_model_runner_output,
             validate=self._validate_scheduled_outputs,
@@ -536,7 +530,8 @@ class MetalModelRunner:
         cannot use the standard Metal kernel. Worker uses this to select the
         appropriate paged attention backend for PR2.
         """
-        return "kv_lora_rank" in self.model_args
+        # mlx-vlm's mistral3 config declares kv_lora_rank=None for non-MLA text.
+        return self.model_args.get("kv_lora_rank") is not None
 
     @property
     def is_hybrid(self) -> bool:
@@ -719,16 +714,21 @@ class MetalModelRunner:
         if callable(text_config):
             cfg = text_config()
             max_position_embeddings = getattr(cfg, "max_position_embeddings", None)
+        lora_config = self.vllm_config.lora_config
         self._lora.setup(
             model=self._forward_model,
-            lora_config=self.vllm_config.lora_config,
+            lora_config=lora_config,
             is_stt=False,
             speculative_decode_enabled=self.vllm_config.speculative_config is not None,
             max_num_seqs=self.scheduler_config.max_num_seqs,
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             max_position_embeddings=max_position_embeddings,
+            encoder=self._lora_encoder_target(lora_config),
+            weights_mapper=getattr(
+                self._multimodal_adapter, "lora_weights_mapper", None
+            ),
         )
-        # Probed here because it runs a cacheless one-token forward, which is
+        # Probed here because it runs an isolated one-token forward, which is
         # only safe before a paged context is installed. PP takes another
         # forward branch that never requests selection.
         self._selective_logits_supported = (
@@ -765,6 +765,49 @@ class MetalModelRunner:
                     not self.vllm_config.cache_config.enable_prefix_caching
                 ),
             )
+
+    def _lora_encoder_target(
+        self, lora_config: LoRAConfig | None
+    ) -> EncoderLoRATarget | None:
+        """Resolve the encoder for tower/connector LoRA, as upstream's
+        ``LoRAModelManager._maybe_init_mm`` gates it."""
+        if lora_config is None:
+            return None
+        adapter = self._multimodal_adapter
+        if adapter is None:
+            # Metal serves this model without its vision encoder: a text
+            # model, a VLM forced text-only (``multimodal_config`` cleared, so
+            # ``is_multimodal_model`` is false) or a language-model-only load.
+            if lora_config.enable_tower_connector_lora:
+                logger.warning(
+                    "`enable_tower_connector_lora` has no effect: %s is served "
+                    "without a vision encoder on Metal, so LoRA applies to the "
+                    "language model only.",
+                    self.model_config.model,
+                )
+            return None
+        target = getattr(adapter, "lora_encoder_target", None)
+        if not lora_config.enable_tower_connector_lora:
+            if target is not None:
+                logger.info(
+                    "%s supports adding LoRA to the tower modules. If needed, "
+                    "please set `enable_tower_connector_lora=True`.",
+                    self.model_config.model,
+                )
+            return None
+        if target is None:
+            logger.warning(
+                "LoRA with tower connector is enabled, but the model %s "
+                "does not support it on Metal. This will be ignored.",
+                self.model_config.model,
+            )
+            return None
+        logger.warning(
+            "LoRA for the tower and connector of multimodal models is "
+            "experimental and may contain bugs. Please report any related issues on "
+            "GitHub if you encounter them."
+        )
+        return target()
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self._lora.add_adapter(lora_request)
@@ -952,6 +995,10 @@ class MetalModelRunner:
     def tq_prefill_workspace_bytes(self) -> int:
         return self._cache_policy.tq_prefill_workspace_bytes
 
+    @property
+    def moe_expert_reserved_bytes(self) -> int:
+        return 0 if self._expert_store is None else self._expert_store.reserved_bytes
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get KV cache specification.
 
@@ -968,22 +1015,22 @@ class MetalModelRunner:
         """Hand the runtime's KV storage to the KV connector, and build its driver.
 
         Called by the worker after ``initialize_kv_cache`` when a KV connector
-        is configured. Only the SDPA runtime binds vLLM's allocation as
-        ``KVCacheStorage``. Hybrid, MLA and count-based (draft model) caches
-        have nothing the connector can address.
+        is configured. Only the SDPA and MLA runtimes' ``KVCacheStorage`` is
+        registered. Hybrid caches have no layout the connector can address.
         """
+        from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
         from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 
         runtime = self._paged_attention_runtime
         storage = None
-        if isinstance(runtime, SDPAPagedAttentionRuntime):
+        if isinstance(runtime, (SDPAPagedAttentionRuntime, MLAPagedAttentionRuntime)):
             try:
                 storage = runtime.storage
             except RuntimeError:
                 storage = None
         if storage is None:
             raise NotImplementedError(
-                "KV offloading on Metal requires the SDPA paged attention "
+                "KV offloading on Metal requires the SDPA or MLA paged attention "
                 "runtime with storage bound from the KV cache config; "
                 f"{type(runtime).__name__} provides none."
             )
@@ -1130,6 +1177,11 @@ class MetalModelRunner:
         mx.synchronize()
         overhead = mx.get_cache_memory() - cache_before
         mx.set_cache_limit(overhead)
+        if self._expert_store is not None:
+            # The dummy batch routes every token to the same top_k experts,
+            # so profiling sees little of the expert memory. The plan reserves
+            # it instead; start serving from an empty cache.
+            self._expert_store.clear()
         return overhead
 
     def _mm_step_can_run(self, adapter: MultimodalRuntimeAdapter) -> bool:
@@ -1249,12 +1301,6 @@ class MetalModelRunner:
             return None
         return mx.arange(rows - max_sampled_rows, rows, dtype=mx.int32)
 
-    def build_paged_attention_runtime(
-        self, *, block_size: int
-    ) -> PagedAttentionRuntime:
-        """Build the paged-attention backend for the loaded model."""
-        return self._cache_policy.build_paged_attention_runtime(block_size=block_size)
-
     @property
     def paged_attention_runtime(self) -> PagedAttentionRuntime | None:
         """Return the installed paged-attention backend, if any."""
@@ -1314,7 +1360,7 @@ class MetalModelRunner:
             block_size=block_size,
         )
 
-    def install_drafter(self, *, num_blocks: int, block_size: int) -> None:
+    def install_drafter(self) -> None:
         """Install or bind the configured drafter after cache planning."""
         spec = self.vllm_config.speculative_config
         if spec is None:
@@ -1332,17 +1378,13 @@ class MetalModelRunner:
                     f"{spec.method} was not loaded and bound to scheduler KV"
                 )
         elif spec.uses_draft_model():
-            drafter = cast(DraftModelProposer, self._drafter)
-            drafter.bind_paged_cache(
-                num_blocks=num_blocks,
-                block_size=block_size,
-                dtype=cast(mx.Dtype, self.kv_cache_dtype),
-            )
+            # Bound to the shared KV storage by _initialize_upstream_storage,
+            # immediately before this call.
+            pass
         elif spec.method == "ngram":
             from vllm_metal.v1.ngram_proposer import NgramProposer
 
-            # N-gram drafts from token history alone — no model, no KV cache, so
-            # num_blocks/block_size are unused here.
+            # N-gram drafts from token history alone.
             self._drafter = NgramProposer.build(
                 vllm_config=self.vllm_config,
                 controller=self._spec_decode_controller,
@@ -1526,6 +1568,8 @@ class MetalModelRunner:
         mm_prefill_deltas: dict[str, int] = {}
         # Lazy send op for the non-last pipeline stage (None otherwise).
         pp_send_handle: mx.array | None = None
+        # Prompt logprobs read every prompt row, so no forward path may prune rows.
+        needs_prompt_logprob_rows = self._needs_prompt_logprob_rows(prefill_reqs)
 
         prepare_grouped(
             decode_info,
@@ -1533,6 +1577,11 @@ class MetalModelRunner:
             self._paged_group_block_sizes,
             merge_verify_windows=self.merge_verify_windows,
             tq_prefill_workspace_bytes=self.tq_prefill_workspace_bytes,
+            # LoRA routing covers every packed row, so pruning rows (Gemma 4
+            # YOCO) would leave the adapter layers with fewer rows than routes.
+            all_rows_consumed=(
+                needs_prompt_logprob_rows or self._lora.step_uses_adapter
+            ),
         )
         try:
             ctx = get_context()
@@ -1579,7 +1628,7 @@ class MetalModelRunner:
                 )
 
             # ---- forward (lazy graph + async submit) ----
-            offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
+            offset_caches = [OffsetCache(0, index=i) for i in range(self.num_layers)]
             # On a pipeline-eligible step with a pending deferred sample, the
             # decode inputs are the previous step's lazy tokens (device
             # gather) — the host list still ends in placeholders there.
@@ -1602,6 +1651,18 @@ class MetalModelRunner:
                     DecoderPoolingBackend,
                     self._pooling_backend,
                 )
+                # A checkpoint whose model config is not causal (d3's
+                # noncausal_full_attention) scores the prompt with the whole
+                # input in view: one bidirectional block per prefill segment.
+                # Linear (GDN) layers keep their recurrence, so only
+                # full-attention layers take the block.
+                hf_config = getattr(self.model_config, "hf_config", None)
+                if ctx is not None and not getattr(hf_config, "is_causal", True):
+                    ctx.bidi_layer_kinds = frozenset({"full"})
+                    ctx.segment_bidi_ranges = [
+                        [(pr.start_pos, pr.start_pos + len(pr.token_ids))]
+                        for pr in prefill_reqs
+                    ]
                 pooling_hidden_states = decoder_pooling_backend.forward_packed(
                     input_ids,
                     offset_caches,
@@ -1609,7 +1670,7 @@ class MetalModelRunner:
             elif use_mm_forward:
                 assert adapter is not None
                 selects = self._mm_forward_selects_rows(adapter)
-                if selects and not self._needs_prompt_logprob_rows(prefill_reqs):
+                if selects and not needs_prompt_logprob_rows:
                     logits_layout = self._paged_logits_layout(
                         cu_seqlens,
                         num_decode_segments=len(decode_segments),
@@ -1660,13 +1721,6 @@ class MetalModelRunner:
                     and bool(prefill_reqs)
                     and all(pr.prompt_len is None for pr in prefill_reqs)
                     and self._drafter is None
-                )
-                # Prompt-logprobs requests need a logits row for every prompt
-                # position, so their steps skip both head-pruning paths: the
-                # projection-free intermediate forward (no logits at all) and
-                # the selective layout (last prefill row only).
-                needs_prompt_logprob_rows = self._needs_prompt_logprob_rows(
-                    prefill_reqs
                 )
                 if (
                     intermediate_only
@@ -1749,6 +1803,7 @@ class MetalModelRunner:
         states_missing = False
         decode_req_ids: list[str] = []
         decode_params: list[SamplingParams] = []
+        decode_output_lengths: list[int] = []
         for req_id in cached_reqs.req_ids:
             state = self._request_states.get(req_id)
             if state is None:
@@ -1762,6 +1817,7 @@ class MetalModelRunner:
             decode_req_ids.append(req_id)
             if state.sampling_params is not None:
                 decode_params.append(state.sampling_params)
+                decode_output_lengths.append(len(state.token_ids) - state.prompt_len)
 
         adapter = self._multimodal_adapter
         mm_forward_forced = self._mm_forward_forced(adapter)
@@ -1789,7 +1845,6 @@ class MetalModelRunner:
                 bool(scheduler_output.scheduled_new_reqs) or states_missing
             ),
             has_prefill_phase_requests=has_prefill_phase,
-            has_resumed_requests=bool(cached_reqs.resumed_req_ids),
             has_preempted_requests=bool(scheduler_output.preempted_req_ids),
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
             has_spec_tokens=bool(
@@ -1802,25 +1857,38 @@ class MetalModelRunner:
         sampling = SamplingShape(
             native_greedy=(
                 not states_missing
-                and SamplingBatch.params_allow_native_greedy(decode_params)
+                and SamplingBatch.params_allow_native_greedy(
+                    decode_params, decode_output_lengths
+                )
             ),
             native_random=(
-                self._native_sample_key is not None
+                self._native_sampling_enabled
                 and not states_missing
-                and SamplingBatch.params_allow_native_random(decode_params)
+                and SamplingBatch.params_allow_native_random(
+                    decode_params, decode_output_lengths, allow_seed=True
+                )
             ),
         )
         return self._decode_pipeline.evaluate_gate(capabilities, step, sampling)
 
     def _next_native_sample_key(self) -> mx.array:
-        """Split the runner's sampling key chain and return the step key."""
-        if self._native_sample_key is None:
+        """Derive a fresh key without retaining a lazy MLX RNG dependency.
+
+        The zero-based counter advances per native sampling sub-batch with
+        unseeded random rows (decode and prefill count separately). Greedy,
+        seeded-only and torch calls do not advance it. Deferred sampling
+        advances at graph construction, never again at resolution.
+        """
+        if not self._native_sampling_enabled:
             raise RuntimeError(
-                "native sampling key requested while the chain is disabled "
+                "native sampling key requested while native sampling is disabled "
                 "— gate desync."
             )
-        self._native_sample_key, subkey = mx.random.split(self._native_sample_key)
-        return subkey
+        key = native_sampling_key(
+            self.model_config.seed, self._native_sampling_step, domain="engine"
+        )
+        self._native_sampling_step += 1
+        return key
 
     def _sample_paged_batch(
         self,
@@ -1928,6 +1996,15 @@ class MetalModelRunner:
 
         # ---- sample tokens ----
         vocab_size = self._vocab_size
+        # Draft rows use the greedy verifier below. Only plain decode rows
+        # and completed prefills can use the native sampling key.
+        next_native_rng_key = (
+            self._next_native_sample_key
+            if self._native_sampling_enabled
+            and grammar_output is None
+            and not scheduler_output.has_structured_output_requests
+            else None
+        )
         decode_token_ids: list[list[int]] = [[] for _ in decode_reqs]
         decode_logprobs_rows: list[LogprobsLists | None] = [None for _ in decode_reqs]
         if has_scheduled_drafts:
@@ -1985,7 +2062,10 @@ class MetalModelRunner:
                     generators=generators,
                 )
                 plain_result = sample_from_logits(
-                    plain_logits, plain_batch, self._sampler
+                    plain_logits,
+                    plain_batch,
+                    self._sampler,
+                    next_native_rng_key=next_native_rng_key,
                 )
                 for plain_index, (decode_index, _, _) in enumerate(plain_items):
                     decode_token_ids[decode_index] = [
@@ -2003,6 +2083,7 @@ class MetalModelRunner:
                 num_decode_tokens,
                 self._sampler,
                 vocab_size=vocab_size,
+                next_native_rng_key=next_native_rng_key,
             )
             decode_token_ids = [[token_id] for token_id in decode_result.token_ids]
             decode_logprobs = decode_result.logprobs
@@ -2013,6 +2094,7 @@ class MetalModelRunner:
             num_decode_segments,
             self._sampler,
             vocab_size=vocab_size,
+            next_native_rng_key=next_native_rng_key,
         )
 
         # ---- update decode state ----
@@ -2039,9 +2121,7 @@ class MetalModelRunner:
         if isinstance(hybrid_runtime, HybridPagedAttentionRuntime):
             state_cache = hybrid_runtime.state_cache
             if state_cache.spec_verify_stash is not None:
-                committed_rows = [len(ids) for ids in decode_token_ids] + [
-                    len(pr.token_ids) for pr in prefill_reqs
-                ]
+                committed_rows = [len(ids) for ids in decode_token_ids]
                 apply_spec_decode_acceptance(
                     state_cache, GDNLazyKernels.shared(), committed_rows
                 )
@@ -2071,28 +2151,6 @@ class MetalModelRunner:
 
             batch.set_output(entry.output_idx, [next_token], logprobs)
             mm_delta = mm_prefill_deltas.get(prefill.req_id)
-            if entry.result_mode == "new_final":
-                prompt_len = prefill.prompt_len
-                assert prompt_len is not None
-                full_prompt = (
-                    prefill.full_prompt_token_ids
-                    if prefill.full_prompt_token_ids is not None
-                    else prefill.token_ids
-                )
-                self._request_states[prefill.req_id] = RequestState(
-                    token_ids=full_prompt + [next_token],
-                    prompt_len=prompt_len,
-                    sampling_params=prefill.sampling_params,
-                    pooling_params=prefill.pooling_params,
-                    generator=prefill.generator,
-                    generated_tokens=1,
-                    block_ids=prefill.block_ids,
-                    lora_id=prefill.lora_id,
-                    mrope_position_delta=mm_delta,
-                    num_computed_tokens=prefill.start_pos,
-                )
-                continue
-
             req_state = self._request_states[prefill.req_id]
             req_state.token_ids.append(next_token)
             req_state.generated_tokens = len(req_state.token_ids) - req_state.prompt_len
@@ -2209,10 +2267,8 @@ class MetalModelRunner:
                     f"{seg_end - seg_start} of {len(prefill.token_ids)} chunk "
                     "rows — the selective-logits gate desynced."
                 )
-            state = self._request_states.get(prefill.req_id)
-            prompt_token_ids = (
-                full_prompt if state is None else full_prompt[: state.prompt_len]
-            )
+            state = self._request_states[prefill.req_id]
+            prompt_token_ids = full_prompt[: state.prompt_len]
             tensors = self._prompt_logprobs_tracker.observe_chunk(
                 prefill.req_id,
                 prompt_token_ids=prompt_token_ids,
@@ -2232,6 +2288,7 @@ class MetalModelRunner:
             return
         self.encoder_cache.remove_request(req_id)
         self.encoder_cache.add_request(req_id, new_req.mm_features)
+        self.encoder_cache.set_lora_request(req_id, new_req.lora_request)
 
     def _pre_register_new_request_mm_features(
         self, new_reqs: list[NewRequestData]
@@ -2344,6 +2401,7 @@ class MetalModelRunner:
             return
 
         features_to_encode: list[MultiModalFeatureSpec] = []
+        feature_req_ids: list[str] = []
         identifiers_to_encode: set[str] = set()
         for req_id, feature_indices in scheduled_encoder_inputs.items():
             mm_features = cache.mm_features.get(req_id)
@@ -2365,19 +2423,50 @@ class MetalModelRunner:
                 ):
                     continue
                 features_to_encode.append(feature)
+                feature_req_ids.append(req_id)
                 identifiers_to_encode.add(feature.identifier)
 
         if not features_to_encode:
             return
 
-        outputs = adapter.encode_multimodal(features_to_encode)
-        if len(outputs) != len(features_to_encode):
+        if not self._lora.encoder_enabled:
+            self._encode_features(features_to_encode)
+            return
+
+        # Each request's features run through its own adapter's tower and
+        # connector weights; the scheduler already keys their identifiers by
+        # LoRA name, so cached outputs never cross adapters.
+        groups: dict[int, tuple[LoRARequest | None, list[MultiModalFeatureSpec]]] = {}
+        for feature, req_id in zip(features_to_encode, feature_req_ids, strict=True):
+            lora_request = cache.lora_requests[req_id]
+            lora_id = 0 if lora_request is None else lora_request.lora_int_id
+            groups.setdefault(lora_id, (lora_request, []))[1].append(feature)
+        for lora_request, features in groups.values():
+            with self._lora.encoder_adapter(lora_request):
+                # Evaluate before the slot changes: the outputs are lazy.
+                self._encode_features(features, evaluate=True)
+
+    def _encode_features(
+        self, features: list[MultiModalFeatureSpec], *, evaluate: bool = False
+    ) -> None:
+        adapter = self._multimodal_adapter
+        cache = self.encoder_cache
+        assert adapter is not None and cache is not None
+        outputs = adapter.encode_multimodal(features)
+        if len(outputs) != len(features):
             raise RuntimeError(
                 f"encode_multimodal returned {len(outputs)} outputs for "
-                f"{len(features_to_encode)} features; adapter must return one "
+                f"{len(features)} features; adapter must return one "
                 "result per feature."
             )
-        for feature, output in zip(features_to_encode, outputs, strict=True):
+        if evaluate:
+            mx.eval(
+                [
+                    (output.hidden_states, output.deepstack_visual_embeds or [])
+                    for output in outputs
+                ]
+            )
+        for feature, output in zip(features, outputs, strict=True):
             cache.encoder_outputs[feature.identifier] = output
 
     def _run_mm_paged_forward(
@@ -2691,6 +2780,59 @@ class MetalModelRunner:
             kept.append((r0, r1))
         return kept or None
 
+    def _admit_request(self, new_req: NewRequestData) -> RequestState:
+        """Install scheduler history for a fresh or preempted request."""
+        req_id = new_req.req_id
+        validate_pooling_request(
+            new_req,
+            self.model_config,
+            pooling_backend=self._pooling_backend,
+        )
+        sampling_params = new_req.sampling_params or SamplingParams()
+        if new_req.lora_request is not None:
+            self._lora.add_adapter(new_req.lora_request)
+
+        mrope_position_delta = None
+        if req_id in self._awaiting_readmission:
+            # Preemption retains the old state for in-flight sampling. Only
+            # readmission replaces its history with the scheduler's snapshot.
+            preempted = self._request_states[req_id]
+            generator = preempted.generator
+            mrope_position_delta = preempted.mrope_position_delta
+            self._awaiting_readmission.remove(req_id)
+            self._paged_request_seq_lens.pop(req_id, None)
+            self._mm_bidi_states.pop(req_id, None)
+        else:
+            generator = create_request_generator(sampling_params)
+
+        state = RequestState(
+            token_ids=list(new_req.prefill_token_ids),
+            prompt_len=new_req.prompt_len,
+            sampling_params=sampling_params,
+            pooling_params=new_req.pooling_params,
+            generator=generator,
+            block_ids=self._copy_paged_block_ids(new_req.block_ids),
+            lora_id=_lora_id_from_request_data(new_req),
+            mrope_position_delta=mrope_position_delta,
+            num_computed_tokens=new_req.num_computed_tokens,
+        )
+        # generated_tokens stays zero until prefill completes, including when
+        # replaying committed outputs, so cached chunks keep taking prefill.
+        self._request_states[req_id] = state
+        if self._paged_state_group_indices:
+            self._state_block_ids_by_req[req_id] = self._copy_state_block_ids(
+                new_req.block_ids
+            )
+        # Prompt logprobs are still owed only while no output exists.
+        if (
+            sampling_params.prompt_logprobs is not None
+            and len(state.token_ids) == state.prompt_len
+        ):
+            self._prompt_logprobs_tracker.register(
+                req_id, sampling_params.prompt_logprobs
+            )
+        return state
+
     def _handle_new_requests(
         self,
         batch: _ExecutionBatch,
@@ -2698,108 +2840,30 @@ class MetalModelRunner:
         scheduler_output: SchedulerOutput,
     ) -> None:
         """Register new requests and collect their scheduled prefill chunks."""
-        batch.new_reqs_by_id = {req.req_id: req for req in new_reqs}
-
         for new_req in new_reqs:
             req_id = new_req.req_id
-            pooling_params = new_req.pooling_params
-            validate_pooling_request(
-                new_req,
-                self.model_config,
-                pooling_backend=self._pooling_backend,
-            )
-
             # mm_features were pre-registered before encoder dispatch in
             # ``execute_model``; no further bookkeeping needed here.
-            token_ids = new_req.prompt_token_ids or []
-            sampling_params = new_req.sampling_params or SamplingParams()
-            lora_id = _lora_id_from_request_data(new_req)
-            if new_req.lora_request is not None:
-                self._lora.add_adapter(new_req.lora_request)
-
-            if not token_ids:
+            state = self._admit_request(new_req)
+            if not state.token_ids:
                 batch.add_output(req_id, [0])
                 continue
-
-            generator = create_request_generator(sampling_params)
-
-            if sampling_params.prompt_logprobs is not None:
-                self._prompt_logprobs_tracker.register(
-                    req_id, sampling_params.prompt_logprobs
-                )
-            sched_block_ids = self._copy_paged_block_ids(new_req.block_ids)
-            if self._paged_state_group_indices:
-                self._state_block_ids_by_req[req_id] = self._copy_state_block_ids(
-                    new_req.block_ids
-                )
-            scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            computed_tokens = new_req.num_computed_tokens
-            prompt_len = len(token_ids)
-            cur_len = computed_tokens + scheduled_tokens
-            is_intermediate = cur_len < prompt_len
-
-            output_idx = batch.add_output(req_id, [])
-
-            batch.paged_prefill_entries.append(
-                _PendingPrefillEntry(
-                    output_idx=output_idx,
-                    prefill=PrefillRequest(
-                        req_id=req_id,
-                        token_ids=token_ids[computed_tokens:cur_len],
-                        sampling_params=sampling_params,
-                        pooling_params=pooling_params,
-                        block_ids=sched_block_ids,
-                        generator=generator,
-                        prompt_len=prompt_len if not is_intermediate else None,
-                        start_pos=computed_tokens,
-                        full_prompt_token_ids=None,
-                        lora_id=lora_id,
-                    ),
-                    result_mode="intermediate" if is_intermediate else "new_final",
-                )
+            self._collect_prefill_chunk(
+                batch,
+                req_id,
+                state,
+                new_req.num_computed_tokens,
+                scheduler_output.num_scheduled_tokens[req_id],
             )
 
-            # Intermediate chunks need RequestState immediately so a cached
-            # continuation in the next step can find the request.
-            if is_intermediate:
-                self._request_states[req_id] = RequestState(
-                    token_ids=list(token_ids),
-                    prompt_len=prompt_len,
-                    sampling_params=sampling_params,
-                    pooling_params=pooling_params,
-                    generator=generator,
-                    generated_tokens=0,
-                    block_ids=sched_block_ids,
-                    lora_id=lora_id,
-                    num_computed_tokens=computed_tokens,
-                )
-
     def _update_pp_stage_states(self, scheduler_output: SchedulerOutput) -> None:
-        """Maintain ``_request_states`` on a non-last pipeline stage.
+        """Advance cached request histories on a non-last pipeline stage.
 
         Non-last stages do not sample, so they mirror the scheduler token stream
         to keep cached steps able to run forward and send activations downstream.
         Cached-state presence is checked before model work; block ids are
         updated later from cached scheduler metadata.
         """
-        for new_req in scheduler_output.scheduled_new_reqs:
-            token_ids = list(new_req.prompt_token_ids or [])
-            self._request_states[new_req.req_id] = RequestState(
-                token_ids=token_ids,
-                prompt_len=len(token_ids),
-                sampling_params=new_req.sampling_params or SamplingParams(),
-                pooling_params=new_req.pooling_params,
-                block_ids=(
-                    self._copy_paged_block_ids(new_req.block_ids)
-                    if new_req.block_ids
-                    else []
-                ),
-            )
-            if self._paged_state_group_indices and new_req.block_ids:
-                self._state_block_ids_by_req[new_req.req_id] = (
-                    self._copy_state_block_ids(new_req.block_ids)
-                )
-
         cached = scheduler_output.scheduled_cached_reqs
         if not cached.new_token_ids:
             return
@@ -2829,31 +2893,48 @@ class MetalModelRunner:
             state = self._request_states[req_id]
 
             new_block_ids = cached_reqs.new_block_ids[i]
-            resumed = req_id in cached_reqs.resumed_req_ids
-            if not resumed:
-                if new_block_ids is not None:
+            if new_block_ids is not None:
+                for group_index, group_block_ids in enumerate(
+                    self._copy_paged_block_ids(new_block_ids)
+                ):
+                    state.block_ids[group_index].extend(group_block_ids)
+                if self._paged_state_group_indices:
+                    req_state_ids = self._state_block_ids_by_req[req_id]
                     for group_index, group_block_ids in enumerate(
-                        self._copy_paged_block_ids(new_block_ids)
+                        self._copy_state_block_ids(new_block_ids)
                     ):
-                        state.block_ids[group_index].extend(group_block_ids)
-                    if self._paged_state_group_indices:
-                        req_state_ids = self._state_block_ids_by_req[req_id]
-                        for group_index, group_block_ids in enumerate(
-                            self._copy_state_block_ids(new_block_ids)
-                        ):
-                            req_state_ids[group_index].extend(group_block_ids)
-                continue
+                        req_state_ids[group_index].extend(group_block_ids)
 
-            assert new_block_ids is not None
-            # The scheduler can drop an in-flight output we already appended.
-            state.token_ids = cached_reqs.all_token_ids[req_id]
-            state.block_ids = self._copy_paged_block_ids(new_block_ids)
-            if self._paged_state_group_indices:
-                self._state_block_ids_by_req[req_id] = self._copy_state_block_ids(
-                    new_block_ids
-                )
-            state.generated_tokens = 0
-            self._paged_request_seq_lens.pop(req_id, None)
+    def _collect_prefill_chunk(
+        self,
+        batch: _ExecutionBatch,
+        req_id: str,
+        state: RequestState,
+        computed_tokens: int,
+        scheduled_tokens: int,
+    ) -> None:
+        """Queue the scheduled prefill chunk for an admitted request."""
+        target_len = computed_tokens + scheduled_tokens
+        is_intermediate = target_len < len(state.token_ids)
+        output_idx = batch.add_output(req_id, [])
+        batch.paged_prefill_entries.append(
+            _PendingPrefillEntry(
+                output_idx=output_idx,
+                prefill=PrefillRequest(
+                    req_id=req_id,
+                    token_ids=state.token_ids[computed_tokens:target_len],
+                    sampling_params=state.sampling_params,
+                    pooling_params=state.pooling_params,
+                    block_ids=state.block_ids,
+                    generator=state.generator,
+                    prompt_len=state.prompt_len if not is_intermediate else None,
+                    start_pos=computed_tokens,
+                    full_prompt_token_ids=None,
+                    lora_id=state.lora_id,
+                ),
+                result_mode="intermediate" if is_intermediate else "final",
+            )
+        )
 
     def _collect_cached_requests(
         self,
@@ -2869,34 +2950,12 @@ class MetalModelRunner:
             state = self._request_states[req_id]
 
             if state.generated_tokens == 0:
-                computed_tokens = cached_reqs.num_computed_tokens[idx]
-                scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-                target_len = computed_tokens + scheduled_tokens
-                is_intermediate = target_len < len(state.token_ids)
-
-                output_idx = batch.add_output(req_id, [])
-
-                batch.paged_prefill_entries.append(
-                    _PendingPrefillEntry(
-                        output_idx=output_idx,
-                        prefill=PrefillRequest(
-                            req_id=req_id,
-                            token_ids=state.token_ids[computed_tokens:target_len],
-                            sampling_params=state.sampling_params,
-                            pooling_params=state.pooling_params,
-                            block_ids=state.block_ids,
-                            generator=state.generator,
-                            prompt_len=(
-                                state.prompt_len if not is_intermediate else None
-                            ),
-                            start_pos=computed_tokens,
-                            full_prompt_token_ids=None,
-                            lora_id=state.lora_id,
-                        ),
-                        result_mode=(
-                            "intermediate" if is_intermediate else "cached_final"
-                        ),
-                    )
+                self._collect_prefill_chunk(
+                    batch,
+                    req_id,
+                    state,
+                    cached_reqs.num_computed_tokens[idx],
+                    scheduler_output.num_scheduled_tokens[req_id],
                 )
                 continue
 
@@ -2918,13 +2977,12 @@ class MetalModelRunner:
         sampling metadata reflects the whole prefix, not just this chunk.
         Multimodal requests need it at every chunk including the first —
         ``adapter.get_mrope_input_positions`` must see the whole prompt
-        to compute correct M-RoPE positions for image placeholders, then
-        a later commit slices the chunk-relevant range.  Prompt-logprobs
+        to compute correct M-RoPE positions for image placeholders before
+        slicing the chunk-relevant range. Prompt-logprobs
         requests need it at every chunk too: each chunk's last row scores
         the first token of the *next* chunk, so the targets always reach
-        one past this chunk's own tokens.  All conditions share the same
-        two-source resolution (RequestState first, new_req fallback) and
-        the same contract-bug raises.
+        one past this chunk's own tokens. Admission has already installed
+        the full history in RequestState for every path.
         """
         prefill_pack: list[PrefillRequest] = []
         for entry in batch.paged_prefill_entries:
@@ -2938,42 +2996,16 @@ class MetalModelRunner:
             )
             if needs_full_prompt:
                 state = self._request_states.get(prefill.req_id)
-                if state is not None:
-                    full_prompt = list(state.token_ids)
-                else:
-                    new_req = batch.new_reqs_by_id.get(prefill.req_id)
-                    if new_req is None:
-                        raise RuntimeError(
-                            f"Need full prompt (start_pos={prefill.start_pos}, "
-                            f"mm={self._is_mm_request(prefill.req_id)}) for "
-                            f"request {prefill.req_id!r} but it has no "
-                            f"RequestState and is not in new_reqs. This is a "
-                            f"state tracking bug."
-                        )
-                    prompt_token_ids = new_req.prompt_token_ids
-                    if prompt_token_ids is None:
-                        raise RuntimeError(
-                            f"Need full prompt (start_pos={prefill.start_pos}, "
-                            f"mm={self._is_mm_request(prefill.req_id)}) for "
-                            f"request {prefill.req_id!r} but prompt_token_ids "
-                            f"is missing. This is a scheduler contract bug."
-                        )
-                    full_prompt = list(prompt_token_ids)
+                if state is None:
+                    raise RuntimeError(
+                        f"Need full prompt (start_pos={prefill.start_pos}, "
+                        f"mm={self._is_mm_request(prefill.req_id)}) for "
+                        f"request {prefill.req_id!r} but it has no "
+                        f"RequestState. This is a state tracking bug."
+                    )
+                full_prompt = list(state.token_ids)
 
-            prefill_pack.append(
-                PrefillRequest(
-                    req_id=prefill.req_id,
-                    token_ids=prefill.token_ids,
-                    sampling_params=prefill.sampling_params,
-                    pooling_params=prefill.pooling_params,
-                    block_ids=prefill.block_ids,
-                    generator=prefill.generator,
-                    prompt_len=prefill.prompt_len,
-                    start_pos=prefill.start_pos,
-                    full_prompt_token_ids=full_prompt,
-                    lora_id=prefill.lora_id,
-                )
-            )
+            prefill_pack.append(prefill._replace(full_prompt_token_ids=full_prompt))
 
         return prefill_pack
 
@@ -3003,6 +3035,11 @@ class MetalModelRunner:
 
         missing_req_ids: list[str] = []
         unexpected_empty_req_ids: list[str] = []
+        intermediate_req_ids = {
+            entry.prefill.req_id
+            for entry in batch.paged_prefill_entries
+            if entry.result_mode == "intermediate"
+        }
         for req_id in scheduler_output.num_scheduled_tokens:
             output_idx = batch.req_id_to_index.get(req_id)
             if output_idx is None:
@@ -3015,19 +3052,7 @@ class MetalModelRunner:
             ):
                 continue
 
-            state = self._request_states.get(req_id)
-            is_intermediate_ctx = state is not None and state.generated_tokens == 0
-            if not is_intermediate_ctx:
-                new_req = batch.new_reqs_by_id.get(req_id)
-                if new_req is not None:
-                    prompt_len = len(new_req.prompt_token_ids or [])
-                    computed_tokens = new_req.num_computed_tokens
-                    scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-                    is_intermediate_ctx = (
-                        computed_tokens + scheduled_tokens < prompt_len
-                    )
-
-            if not is_intermediate_ctx:
+            if req_id not in intermediate_req_ids:
                 unexpected_empty_req_ids.append(req_id)
 
         if missing_req_ids or unexpected_empty_req_ids:
@@ -3052,7 +3077,6 @@ class MetalModelRunner:
         evicted_req_ids: set[str],
         *,
         preempted_req_ids: set[str] | None = None,
-        resumed_req_ids: set[str] | None = None,
         materialize_runtime_state: bool = True,
     ) -> None:
         """Reconcile runner metadata and runtime-owned recurrent state."""
@@ -3073,17 +3097,13 @@ class MetalModelRunner:
         # dropped only when the engine finishes the request.
         self._prompt_logprobs_tracker.discard(evicted_req_ids)
 
-        if resumed_req_ids:
-            # A resumed request recomputes from a new prefix boundary; its
-            # first_prefill_start is re-seeded by the next chunk.
-            for req_id in resumed_req_ids:
-                self._mm_bidi_states.pop(req_id, None)
+        if preempted_req_ids:
+            self._awaiting_readmission.update(preempted_req_ids)
+        self._awaiting_readmission -= evicted_req_ids
 
         invalidated = set(evicted_req_ids)
         if preempted_req_ids:
             invalidated.update(preempted_req_ids)
-        if resumed_req_ids:
-            invalidated.update(resumed_req_ids)
 
         # Discard draft KV validity tracking before eviction or recompute.
         if invalidated and self._drafter is not None:
@@ -3148,7 +3168,6 @@ class MetalModelRunner:
         self._reconcile_request_lifecycle(
             evicted_req_ids,
             preempted_req_ids=scheduler_output.preempted_req_ids,
-            resumed_req_ids=scheduler_output.scheduled_cached_reqs.resumed_req_ids,
             materialize_runtime_state=will_fail_fast_before_model_work,
         )
         if missing_cached_state_req_ids:
@@ -3184,11 +3203,8 @@ class MetalModelRunner:
             batch, scheduler_output.scheduled_new_reqs, scheduler_output
         )
 
-        # Non-last PP stages have no sampler, so the request-state lifecycle that
-        # _sample_paged_batch builds from the sampled token never runs for them.
-        # Seed/advance their state from the scheduler's broadcast instead, so the
-        # forward + pipeline_send have live state to work from. No-op on the last
-        # stage and the single-process path.
+        # Non-last PP stages do not sample. Advance admitted histories from
+        # the scheduler's broadcast before collecting cached work.
         if is_non_last_stage(self.pp):
             self._update_pp_stage_states(scheduler_output)
 
@@ -3246,7 +3262,7 @@ class MetalModelRunner:
         token sampling, and request state updates happen — allowing the
         scheduler to run while the GPU was computing the forward pass.
         On pipeline-eligible steps the sync itself is deferred one step:
-        a lazy greedy sample is submitted and an async output is returned.
+        a lazy native sample is submitted and an async output is returned.
         """
         try:
             return self._sample_tokens(grammar_output)
@@ -3304,6 +3320,8 @@ class MetalModelRunner:
         ``execute_model`` sees advanced ``generated_tokens`` / seq lens; the
         token VALUES land later via ``DecodePipeline.resolve`` through direct
         ``RequestState`` references (never through runner dicts).
+        Seeded keys use the pre-increment ``generated_tokens`` count, matching
+        the synchronous path's output length even before token backfill.
         """
         paged_state = self._execute_model_state
         assert paged_state is not None
@@ -3323,15 +3341,15 @@ class MetalModelRunner:
         assert logits is not None
         self._draft_token_ids = None
 
-        tokens = SamplingBatch.native_decode_tokens(
+        tokens = SamplingBatch.native_sample_tokens(
             logits[0, : len(decode_reqs), :],
             [state.sampling_params for _, state in decode_reqs],
             vocab_size=self._vocab_size,
-            next_key=(
-                self._next_native_sample_key
-                if self._native_sample_key is not None
-                else None
+            next_native_rng_key=(
+                self._next_native_sample_key if self._native_sampling_enabled else None
             ),
+            output_lengths=[state.generated_tokens for _, state in decode_reqs],
+            allow_seed=True,
         )
         # Submit now: the token buffer is scheduled right after this step's
         # forward and ahead of the next step's encode, so the deferred

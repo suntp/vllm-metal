@@ -1,10 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The KV offload host pool comes out of the Metal KV budget.
-
-On unified memory the pool is the same physical RAM as the wired cache, so
-``--gpu-memory-utilization`` must bound both. The budget reported to vLLM
-shrinks by the pool, and vLLM sizes a smaller KVCacheConfig from it.
-"""
+"""Host pools share automatic KV budgets but sit outside explicit cache budgets."""
 
 from __future__ import annotations
 
@@ -36,7 +31,9 @@ def _planner(
     worker = MetalWorker.__new__(MetalWorker)
     worker.model_runner = runner  # type: ignore[assignment]
     worker.cache_config = SimpleNamespace(
-        block_size=16, gpu_memory_utilization=0.5, num_gpu_blocks_override=None
+        block_size=16,
+        resolved_gpu_memory_utilization=0.5,
+        num_gpu_blocks_override=None,
     )
     worker.vllm_config = SimpleNamespace(
         cache_config=worker.cache_config,
@@ -98,7 +95,6 @@ def test_offload_off_matches_upstream() -> None:
 
     # 10GB * 0.5 - 1GB weights - 1GB overhead.
     assert plan.kv_budget == 3 * _GB
-    assert plan.num_blocks == 3000
     assert plan.kv_offload_pool == 0
     assert plan.format_breakdown() == (
         "metal_limit=10.00GB, fraction=0.5, usable_metal=5.00GB, "
@@ -118,7 +114,6 @@ def test_pool_comes_out_of_the_reported_budget() -> None:
 
     assert plan.kv_offload_pool == _POOL
     assert plan.kv_budget == without.kv_budget - _POOL
-    assert plan.num_blocks == without.num_blocks - _POOL // _PER_BLOCK
     assert "kv_offload_pool=2.00GB, kv_budget=1.00GB" in plan.format_breakdown()
     assert plan.format_mitigations().startswith(
         "Mitigations: lower --kv-offloading-size; "
@@ -356,8 +351,10 @@ def test_zero_budget_with_auto_fit_reports_the_breakdown(monkeypatch) -> None:
     monkeypatch.setattr(WorkerCachePlanner, "get_model_memory_usage", lambda _: 4 * _GB)
     planner = _planner(_auto_pool(4 * _GB))
     planner._worker.vllm_config.model_config.original_max_model_len = -1
-    with pytest.raises(ValueError, match="not enough Metal memory"):
+    with pytest.raises(ValueError, match="not enough Metal memory") as error:
         planner.determine_available_memory()
+    # The pool resolved to 0, so the advice does not mention offloading.
+    assert "offloading" not in str(error.value)
 
 
 # Re-capping inside the probe. Budget: 10GB * 0.5 - 1GB weights - 1GB
@@ -430,6 +427,27 @@ def test_no_room_error_names_paging(
     assert ("without KV offloading" in message) == without_offloading_helps
 
 
+def test_user_pool_with_no_kv_room_advises_its_size(monkeypatch) -> None:
+    kv_transfer_config = _offload("MetalOffloadingConnector", pool=_AUTO)
+    planner = _planner(kv_transfer_config, max_model_len=_MML)
+    _paging_probe(monkeypatch, free=_RESERVE)
+    with pytest.raises(ValueError) as error:
+        planner.determine_available_memory()
+    assert "Mitigations: lower --kv-offloading-size; close other applications" in (
+        str(error.value)
+    )
+
+
+def test_auto_pool_mitigations_leave_out_the_pool_size() -> None:
+    """Without the probe too, for example when too few KV blocks are left."""
+    plan = _planner(_auto_pool(_POOL))._paged_attention_plan(overhead=_GB)
+    assert plan.kv_offload_pool_auto
+    assert plan.format_mitigations() == (
+        "Mitigations: increase --gpu-memory-utilization (currently 0.5); "
+        "use a smaller or more quantized model."
+    )
+
+
 @pytest.mark.parametrize("past_reserve", [_AUTO, 300_000_000, _AUTO + 500_000_000])
 def test_user_pool_is_never_recapped(monkeypatch, past_reserve) -> None:
     """--kv-offloading-size is the user's choice: the probe shrinks KV only."""
@@ -461,16 +479,29 @@ def test_no_paging_keeps_the_pool(monkeypatch, swap) -> None:
     assert kv_transfer_config.kv_connector_extra_config["cpu_bytes_to_use"] == _AUTO
 
 
-def test_auto_fit_with_only_one_chunk_reports_memory_pressure(monkeypatch) -> None:
-    """A re-cap with no KV room keeps the probe's advice to free memory."""
+@pytest.mark.parametrize("room", [0, _chunk_bytes() // 2, _chunk_bytes()])
+def test_auto_pool_with_no_kv_room_reports_memory_pressure(monkeypatch, room) -> None:
+    """Room for at most one host chunk leaves no KV cache. The error keeps the
+    probe's advice to free memory. The user never set --kv-offloading-size,
+    so it is not advised."""
+    kv_transfer_config = _auto_pool(4 * _GB)
+    planner = _planner(kv_transfer_config, max_model_len=_MML)
+    planner._worker.vllm_config.model_config.original_max_model_len = -1
+    _paging_probe(monkeypatch, free=_RESERVE + room)
+
+    with pytest.raises(ValueError, match="close other applications") as error:
+        planner.determine_available_memory()
+    assert str(error.value).endswith("use a smaller or more quantized model.")
+    assert "offloading" not in str(error.value)
+
+
+def test_auto_pool_recapped_to_one_chunk_is_written_back(monkeypatch) -> None:
     kv_transfer_config = _auto_pool(4 * _GB)
     planner = _planner(kv_transfer_config, max_model_len=_MML)
     planner._worker.vllm_config.model_config.original_max_model_len = -1
     _paging_probe(monkeypatch, free=_RESERVE + _chunk_bytes())
-
-    with pytest.raises(ValueError, match="close other applications"):
+    with pytest.raises(ValueError):
         planner.determine_available_memory()
-
     assert (
         kv_transfer_config.kv_connector_extra_config["cpu_bytes_to_use"]
         == _chunk_bytes()
@@ -496,13 +527,33 @@ def test_turboquant_workspace_stays_out_of_the_room(monkeypatch) -> None:
     workspace = 200_000_000
     monkeypatch.setattr(
         "vllm_metal.v1.cache_policy.get_config",
-        lambda: SimpleNamespace(turboquant=True),
+        lambda: MetalConfig(mlx_device="gpu", turboquant=True),
     )
     kv_transfer_config = _auto_pool(4 * _GB)
     planner = _planner(kv_transfer_config, max_model_len=_MML)
     planner._worker.model_runner.tq_prefill_workspace_bytes = workspace
     past_reserve = 300_000_000
     _paging_probe(monkeypatch, free=_RESERVE + workspace + past_reserve)
+
+    assert planner.determine_available_memory() == past_reserve * 3 // 4
+    assert kv_transfer_config.kv_connector_extra_config["cpu_bytes_to_use"] == (
+        past_reserve // 4
+    )
+
+
+def test_moe_expert_reserve_stays_out_of_the_room(monkeypatch) -> None:
+    """Streamed experts arrive after profiling, so the room excludes the
+    expert reserve just as the probe does."""
+    reserved = 200_000_000
+    monkeypatch.setattr(
+        "vllm_metal.v1.cache_policy.get_config",
+        lambda: MetalConfig(mlx_device="gpu", moe_expert_cache_bytes=reserved),
+    )
+    kv_transfer_config = _auto_pool(4 * _GB)
+    planner = _planner(kv_transfer_config, max_model_len=_MML)
+    planner._worker.model_runner.moe_expert_reserved_bytes = reserved
+    past_reserve = 300_000_000
+    _paging_probe(monkeypatch, free=_RESERVE + reserved + past_reserve)
 
     assert planner.determine_available_memory() == past_reserve * 3 // 4
     assert kv_transfer_config.kv_connector_extra_config["cpu_bytes_to_use"] == (
@@ -545,3 +596,68 @@ def test_recap_holds_for_every_case(monkeypatch) -> None:
         assert chunk <= pool <= pool_before, case
         assert budget >= request, case
         assert budget + pool <= min(past, 3 * _GB), case
+
+
+@pytest.mark.parametrize(
+    "automatic,expected_pool", [(False, _POOL), (True, 750_000_000)]
+)
+def test_explicit_cache_budget_does_not_subtract_offload_host_pool(
+    automatic, expected_pool
+):
+    config = _auto_pool(4 * _GB) if automatic else _offload("MetalOffloadingConnector")
+    planner = _planner(config, max_model_len=16 * 2999)
+    planner._worker.cache_config.kv_cache_memory_bytes = 3 * _GB
+    assert planner.determine_available_memory() == 3 * _GB
+    assert config.kv_connector_extra_config["cpu_bytes_to_use"] == expected_pool
+
+
+def test_block_override_cannot_bypass_explicit_budget_probe(monkeypatch):
+    planner = _planner(None)
+    planner._worker.cache_config.kv_cache_memory_bytes = 3 * _GB
+    planner._worker.cache_config.num_gpu_blocks_override = 1
+    _paging_probe(monkeypatch, free=4 * _GB)
+    with pytest.raises(
+        ValueError, match="Refusing to silently shrink an explicit budget"
+    ):
+        planner.determine_available_memory()
+
+
+def test_explicit_budget_survives_probe_when_the_sample_fits(monkeypatch):
+    planner = _planner(None)
+    planner._worker.cache_config.kv_cache_memory_bytes = 4 * _GB
+    _paging_probe(monkeypatch, free=8 * _GB, swap_out=lambda _: 0)
+    assert planner.determine_available_memory() == 4 * _GB
+
+
+@pytest.mark.parametrize("free_delta", [0, -1])
+@pytest.mark.parametrize("pool_mode", ["none", "explicit", "automatic"])
+def test_explicit_budget_probe_accounts_for_host_pool_and_workspace(
+    monkeypatch, free_delta, pool_mode
+):
+    """Paging may keep the exact byte budget, but cannot trim even one byte."""
+    config = {
+        "none": None,
+        "explicit": _offload("MetalOffloadingConnector"),
+        "automatic": _auto_pool(4 * _GB),
+    }[pool_mode]
+    planner = _planner(config)
+    planner._worker.cache_config.kv_cache_memory_bytes = 3 * _GB
+    workspace = 256 << 20
+    planner._worker.model_runner.tq_prefill_workspace_bytes = workspace
+    monkeypatch.setattr(
+        "vllm_metal.v1.cache_policy.get_config",
+        lambda: MetalConfig(mlx_device="gpu", turboquant=True),
+    )
+    pool = {"none": 0, "explicit": 2 * _GB, "automatic": 750_000_000}[pool_mode]
+    _paging_probe(monkeypatch, free=_RESERVE + 3 * _GB + pool + workspace + free_delta)
+
+    if free_delta < 0:
+        with pytest.raises(ValueError, match="Refusing to silently shrink") as err:
+            planner.determine_available_memory()
+        hint = "or --kv-offloading-size" in str(err.value)
+        assert hint == (pool_mode == "explicit")
+    else:
+        assert planner.determine_available_memory() == 3 * _GB
+    if config is not None:
+        # Explicit cache sizing must not enter the automatic post-probe re-cap.
+        assert config.kv_connector_extra_config["cpu_bytes_to_use"] == pool

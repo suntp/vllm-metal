@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Committed feature ownership is independent of temporary draft acceptance."""
 
+import gc
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -172,6 +173,34 @@ def test_chunked_prefill_then_rejection_overwrites_temporary_kv(accepted, propos
     assert proposer.propose(_prefill(state, _features(15), 0, True)) is not None
 
 
+def test_compiled_draft_follows_storage_recreated_by_sleep(proposer):
+    """Sleep frees the storage the draft shares; wake re-creates it in place."""
+    state = RequestState(
+        token_ids=[1] * 15 + [2],
+        prompt_len=15,
+        sampling_params=SamplingParams(temperature=0),
+        block_ids=[[0], [5, 2, 7, 1]],
+    )
+    storage = proposer.cache.storage
+    assert proposer.propose(_prefill(state, _features(15), 0, True)) is not None
+    gc.collect()
+    active = mx.get_active_memory()
+    storage.release()
+    gc.collect()
+    assert active - mx.get_active_memory() >= storage.nbytes
+    storage.reallocate()
+    for tensor in storage.tensors.values():
+        tensor.fill_(float("nan"))
+    # The engine recomputes the request after wake. Every slot read below must
+    # be written to the new backing by the draft compiled before sleep.
+    proposer.release_requests({"r"})
+    features = _features(15)
+    drafts = proposer.propose(_prefill(state, features, 0, True))
+    expected = _dense_tokens(proposer, mx.array([2]), [f[None] for f in features], 3)
+    assert drafts.draft_token_ids == expected.tolist()
+    _assert_committed(proposer, state.block_ids[1], features)
+
+
 @pytest.mark.parametrize(
     "kind",
     [
@@ -182,6 +211,8 @@ def test_chunked_prefill_then_rejection_overwrites_temporary_kv(accepted, propos
         "context_limit",
         "output_budget",
         "last_output",
+        "eos",
+        "stop_token",
     ],
 )
 def test_non_drafting_rows_still_commit_features(kind, proposer):
@@ -189,10 +220,13 @@ def test_non_drafting_rows_still_commit_features(kind, proposer):
         temperature=0.7 if kind == "sampled" else 0,
         max_tokens={"output_budget": 1, "last_output": 2}.get(kind, 16),
         logprobs=1 if kind == "logprobs" else None,
+        stop_token_ids=[2] if kind == "stop_token" else None,
         structured_outputs=StructuredOutputsParams(choice=["yes", "no"])
         if kind == "grammar"
         else None,
     )
+    if kind == "eos":
+        params.update_from_generation_config({}, eos_token_id=2)
     state = RequestState(
         token_ids=[1] * 15 + [2],
         prompt_len=15,
@@ -266,11 +300,18 @@ def test_exhausted_output_budget_commits_features_without_drafting(
 
 
 @pytest.mark.parametrize("max_tokens", [5, None])
-def test_exhausted_row_does_not_suppress_live_drafts(proposer, monkeypatch, max_tokens):
+@pytest.mark.parametrize("stop_token", [False, True])
+def test_exhausted_row_does_not_suppress_live_drafts(
+    proposer, monkeypatch, max_tokens, stop_token
+):
     finished = RequestState(
         token_ids=[1] * 15 + [2],
         prompt_len=15,
-        sampling_params=SamplingParams(temperature=0, max_tokens=1),
+        sampling_params=SamplingParams(
+            temperature=0,
+            max_tokens=16 if stop_token else 1,
+            stop_token_ids=[2] if stop_token else None,
+        ),
         generated_tokens=1,
         block_ids=[[0], [5, 2, 7, 1]],
     )

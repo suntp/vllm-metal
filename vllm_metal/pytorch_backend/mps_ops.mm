@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-// Host-only launcher for the SAME shaders used by metal/paged_ops.cpp.
+// Host-only launcher for the SAME shaders used by metal/paged_attention.cpp.
 // Encode on PyTorch's stream so projections, KV writes and attention are ordered
 // without a framework bridge, a CPU round trip, or a per-layer GPU wait.
 #include <torch/extension.h>
 #include <ATen/mps/MPSStream.h>
 #include <ATen/native/mps/OperationUtils.h>
+#include <atomic>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 
 #include "../metal/metal_device.h"
@@ -22,6 +25,25 @@ static bool nax_supported() {
       [device supportsFamily:static_cast<MTLGPUFamily>(hardware::kApple10)]);
 }
 
+// Tests inject aligned and unaligned limits through
+// `_override_max_buffer_length_for_test`; -1 restores the device value.
+static std::atomic<int64_t> g_test_max_buffer_length{-1};
+
+static size_t max_buffer_length() {
+  const int64_t override =
+      g_test_max_buffer_length.load(std::memory_order_relaxed);
+  if (override > 0) return static_cast<size_t>(override);
+  return [at::mps::getCurrentMPSStream()->device() maxBufferLength];
+}
+
+static void override_max_buffer_length_for_test(int64_t nbytes) {
+  if (nbytes != -1 && nbytes <= 0)
+    throw std::invalid_argument(
+        "test max buffer length override must be -1 or positive (got " +
+        std::to_string(nbytes) + ")");
+  g_test_max_buffer_length.store(nbytes, std::memory_order_relaxed);
+}
+
 class PagedAttention {
   id<MTLLibrary> library_;
   id<MTLLibrary> nax_library_ = nil;
@@ -35,8 +57,11 @@ class PagedAttention {
     if (it != pipelines_.end()) return it->second;
     auto constants = [[MTLFunctionConstantValues alloc] init];
     bool no = false;
-    for (NSUInteger i : {20, 30, 40, 50, 100, 120})
+    for (NSUInteger i : {20, 30, 40, 50, 100, 120, 130})
       [constants setConstantValue:&no type:MTLDataTypeBool atIndex:i];
+    // NAX prefill: 41 (nax_split_full) = false keeps the original guarded
+    // loop. The split pipeline is only chosen by the MLX launcher.
+    [constants setConstantValue:&no type:MTLDataTypeBool atIndex:41];
     [constants setConstantValue:&split type:MTLDataTypeBool atIndex:10];
     int kbits = 8, vbits = 3;
     [constants setConstantValue:&kbits type:MTLDataTypeInt atIndex:60];
@@ -187,10 +212,10 @@ class PagedAttention {
         if (prefill) {
           grid_y = tokens / (nax ? kernels::kNaxBQ : cfg.BQ) + seqs;
           threads = nax ? kernels::kNaxThreads : cfg.NUM_THREADS;
+          scalar<int>(enc, 30, 0);  // q_block_offset: this launch covers every block.
           if (!nax) {
             [enc setThreadgroupMemoryLength:
                 kernels::tiled_shared_bytes(cfg, head_size, q.element_size()) atIndex:0];
-            scalar<int>(enc, 30, 0);  // q_block_offset: this launch covers every block.
           }
         } else {
           [enc setThreadgroupMemoryLength:kernels::paged_threadgroup_bytes(
@@ -222,6 +247,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_override_detected_gpu_core_count_for_test",
         &hardware::override_detected_gpu_core_count_for_test);
   m.def("nax_supported", &nax_supported);
+  m.def("max_buffer_length", &max_buffer_length);
+  m.def("_override_max_buffer_length_for_test",
+        &override_max_buffer_length_for_test);
   pybind11::class_<PagedAttention>(m, "PagedAttention")
       .def(pybind11::init<const std::string&, const std::string&, int>())
       .def("forward", &PagedAttention::forward);

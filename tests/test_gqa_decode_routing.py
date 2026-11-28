@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""P256/P512 production selection and fallback, verified after native evaluation.
+"""GQA production selection and fallback, verified after native evaluation.
 
 Kernel correctness is covered independently in test_gqa_paged_decode.py.
 Tests inject core counts only when hardware detection is unavailable.
@@ -7,18 +7,23 @@ Tests inject core counts only when hardware detection is unavailable.
 
 from __future__ import annotations
 
+import contextlib
+
 import mlx.core as mx
 import pytest
 
 from tests.gqa_test_utils import (
+    GQA_PARTITION_SIZE,
     _assert_close,
     _assert_fallback,
     _dispatch_family,
+    _mixed_call,
+    _mixed_inputs,
+    _primitive,
     _run_primitive,
 )
 from tests.test_gqa_paged_decode import (
     GQA_GEOMETRIES,
-    GQA_PARTITIONS,
     GQA_SIMD_GROUPS_PER_CORE,
     NUM_QUERY_HEADS,
 )
@@ -30,8 +35,10 @@ def test_native_reports_public_routing_capabilities():
         "gqa_decode": True,
         "gqa_disable": True,
         "decode_routing_metadata": True,
-        "gqa_batch_context_lens": True,
         "gqa_length_plan": True,
+        "gqa_mixed_decode_plan": True,
+        "nax_split_hint": True,
+        "nax_prefill_split_hint": True,
     }
 
 
@@ -66,7 +73,7 @@ def _require_grid(kv_len: int, query_heads: int) -> None:
     cores = get_ops().detected_gpu_core_count()
     if cores <= 0:
         pytest.skip("GPU core count unavailable: GQA conservatively disabled")
-    if (kv_len // min(GQA_PARTITIONS)) * query_heads < GQA_SIMD_GROUPS_PER_CORE * cores:
+    if (kv_len // GQA_PARTITION_SIZE) * query_heads < GQA_SIMD_GROUPS_PER_CORE * cores:
         pytest.skip("This boundary is below the GQA grid guard on this GPU")
 
 
@@ -77,8 +84,7 @@ def _eligible_context(query_heads: int = NUM_QUERY_HEADS, minimum: int = 32768) 
     # Round to whole partitions; this helper only sizes positive-test inputs.
     # Expected shape/length decisions are explicit in the boundary tests.
     partitions = (GQA_SIMD_GROUPS_PER_CORE * cores + query_heads - 1) // query_heads
-    n = max(minimum, partitions * min(GQA_PARTITIONS))
-    return n
+    return max(minimum, partitions * GQA_PARTITION_SIZE)
 
 
 def test_core_count_override_restores_hardware_detection() -> None:
@@ -190,55 +196,35 @@ def test_each_geometry_stays_on_gqa_at_long_context(q, kv, head, block_size, n, 
     _assert_close(out, ref, dtype)
 
 
+# Every unselected geometry is pinned by test_policy_rejects_unmeasured_geometries;
+# these run a representative subset natively: one case per unshipped head dim
+# (64, 96, 256), plus MHA and an unmeasured page size on a shipped geometry.
+# MLX SDPA is the oracle because the fp32 CPU reference dominates at this length.
 @pytest.mark.parametrize(
-    "q,kv,head,n",
+    "q,kv,head,block_size",
     [
-        (16, 4, 256, 32768),  # 16/4/256 is outside default routing.
-        (32, 4, 64, 32768),  # Head dim 64 is not a shipped GQA specialization.
-        (64, 8, 64, 32768),
-        (16, 2, 96, 65536),
-        (32, 4, 256, 65536),  # Unmeasured 32/4/256 stays on the established path.
-        (16, 8, 128, 65536),
-        (16, 16, 128, 65536),  # MHA.
+        (32, 4, 64, 16),  # Head dim 64 is not a shipped GQA specialization.
+        (16, 2, 96, 16),  # Neither is head dim 96.
+        (16, 4, 256, 16),  # 16/4/256 is outside default routing.
+        (16, 16, 128, 16),  # MHA.
+        (32, 8, 128, 8),  # Unmeasured page size on a shipped geometry.
+        (16, 4, 256, 32),
     ],
 )
-def test_unselected_shapes_really_use_fallback(q, kv, head, n):
+def test_unselected_shapes_really_use_fallback(q, kv, head, block_size):
     out, ref = _run_primitive(
-        [n],
+        [32768],
         mx.bfloat16,
         interleaved=True,
         seed=717,
         num_query_heads=q,
         num_kv_heads=kv,
         head_size=head,
+        block_size=block_size,
+        native_reference=True,
     )
     _assert_fallback()
     _assert_close(out, ref, mx.bfloat16)
-
-
-@pytest.mark.parametrize(
-    "q,kv,head,block_size",
-    [
-        (32, 8, 128, 8),
-        (32, 8, 128, 32),
-        (16, 2, 256, 8),
-        (16, 4, 256, 32),
-        (24, 4, 256, 32),
-    ],
-)
-def test_unmeasured_kernel_page_sizes_use_fallback(q, kv, head, block_size):
-    out, ref = _run_primitive(
-        [32768],
-        mx.float16,
-        interleaved=True,
-        seed=718,
-        block_size=block_size,
-        num_query_heads=q,
-        num_kv_heads=kv,
-        head_size=head,
-    )
-    _assert_fallback()
-    _assert_close(out, ref, mx.float16)
 
 
 @pytest.mark.parametrize("num_decode_requests", [-1, 2])
@@ -283,30 +269,152 @@ def test_prefill_and_mixed_batches_stay_off_gqa(query_lens):
     _assert_close(out, ref, mx.float16)
 
 
-@pytest.mark.parametrize("disabled", [False, True])
-@pytest.mark.parametrize("prefill_kernel", ["tiled", "nax"])
-def test_split_mixed_decode_stays_on_upstream_path(prefill_kernel, disabled, request):
-    """Splitting one decode row out of a mixed batch must not enable GQA."""
-    if prefill_kernel == "tiled":
-        request.getfixturevalue("force_tiled_prefill")
-        expected_family = "mixed_prefill_decode"
-    else:
-        request.getfixturevalue("nax_prefill")
-        expected_family = "mixed_nax_prefill_decode"
-    out, ref = _run_primitive(
-        [8192, 128],
-        mx.float16,
-        interleaved=True,
-        seed=720,
-        query_lens=[1, 32],
-        num_decode_requests=1,
-        num_decode_tokens=1,
-        max_decode_context_len=8192,
-        gqa_disabled=disabled,
+@pytest.fixture(params=["tiled", "nax"])
+def mixed_family(request):
+    fixture, family = {
+        "tiled": ("force_tiled_prefill", "mixed_prefill_decode"),
+        "nax": ("nax_prefill", "mixed_nax_prefill_decode"),
+    }[request.param]
+    request.getfixturevalue(fixture)
+    return family
+
+
+@contextlib.contextmanager
+def _gpu_cores(count: int):
+    """Keep admission independent of the runner's core count."""
+    get_ops()._override_detected_gpu_core_count_for_test(count)
+    try:
+        yield
+    finally:
+        _restore_test_gpu_cores()
+
+
+def _assert_mixed_matches_standalone(inputs, lengths, family, partition, **routing):
+    """Check routing and row ownership against the independently tested kernels."""
+    ops = get_ops()
+    rows = len(lengths)
+    mixed = _mixed_call(inputs, **routing)
+    assert _dispatch_family() == family
+    assert ops.last_nax_heads_per_threadgroup() == int(
+        family == "mixed_nax_prefill_decode"
     )
-    assert _dispatch_family() == expected_family
-    assert get_ops().last_gqa_partition_size() == 0
-    _assert_close(out, ref, mx.float16)
+    assert ops.last_gqa_partition_size() == partition
+    assert ops.last_gqa_num_requests() == (rows if partition else 0)
+    pure = _primitive(
+        inputs["query"][:rows],
+        inputs["key_cache"],
+        inputs["value_cache"],
+        inputs["block_tables"][:rows],
+        inputs["seq_lens"][:rows],
+        inputs["block_size"],
+        max(lengths),
+        lengths,
+        gqa_disabled=partition == 0,
+    )
+    mx.eval(pure)
+    if partition:
+        assert _dispatch_family() == "gqa_decode"
+    else:
+        _assert_fallback()
+    assert ops.last_gqa_partition_size() == partition
+    whole = _mixed_call(
+        inputs, num_decode_requests=0, num_decode_tokens=0, max_decode_context_len=0
+    )
+    assert _dispatch_family() == (
+        "nax_prefill" if family == "mixed_nax_prefill_decode" else "tiled_prefill"
+    )
+    assert mx.array_equal(mixed[:rows], pure).item()
+    assert mx.array_equal(mixed[rows:], whole[rows:]).item()
+
+
+@pytest.mark.parametrize(
+    "lengths,dtype",
+    [([4096], mx.float16), ([4096, 4353], mx.bfloat16)],
+    ids=["single", "ragged"],
+)
+def test_mixed_decode_prefix_uses_gqa(mixed_family, lengths, dtype):
+    # At eight cores, one 4K row already clears the work budget.
+    inputs = _mixed_inputs(lengths, dtype=dtype)
+    plan = get_ops().gqa_decode_length_plan(lengths)
+    with _gpu_cores(8):
+        _assert_mixed_matches_standalone(
+            inputs, lengths, mixed_family, 256, gqa_length_plan=plan
+        )
+
+
+@pytest.mark.parametrize(
+    "geometry,cache_block,dtype",
+    [
+        ((24, 4, 256, 16), 784, mx.float16),
+        ((24, 4, 256, 32), 800, mx.bfloat16),
+        ((16, 2, 256, 32), 1056, mx.bfloat16),
+    ],
+    ids=["block16", "block32-800", "block32"],
+)
+def test_mixed_decode_prefix_reads_translated_pages(
+    mixed_family, geometry, cache_block, dtype
+):
+    lengths = [4096, 4097]
+    inputs = _mixed_inputs(
+        lengths, geometry=geometry, dtype=dtype, cache_block=cache_block
+    )
+    plan = get_ops().gqa_decode_length_plan(lengths)
+    with _gpu_cores(8):
+        _assert_mixed_matches_standalone(
+            inputs, lengths, mixed_family, 256, gqa_length_plan=plan
+        )
+
+
+def test_long_prefill_does_not_admit_short_decode_prefix(mixed_family):
+    # At 20 cores, 4K is below the GQA gate while an incorrectly counted 8K clears it.
+    lengths = [4096]
+    inputs = _mixed_inputs(lengths, prefill_kv=8192)
+    plan = get_ops().gqa_decode_length_plan(lengths)
+    with _gpu_cores(20):
+        _assert_mixed_matches_standalone(
+            inputs, lengths, mixed_family, 0, gqa_length_plan=plan
+        )
+
+
+def test_mixed_prefix_plan_ignores_allocation_bound(mixed_family):
+    lengths = [4096]
+    inputs = _mixed_inputs(lengths)
+    bound = 4 * 1024 * 1024
+    tables = inputs["block_tables"]
+    inputs["block_tables"] = mx.pad(
+        tables, ((0, 0), (0, bound // inputs["block_size"] - tables.shape[1]))
+    )
+    plan = get_ops().gqa_decode_length_plan(lengths)
+    with _gpu_cores(8):
+        _assert_mixed_matches_standalone(
+            inputs, lengths, mixed_family, 256, max_seq_len=bound, gqa_length_plan=plan
+        )
+
+
+@pytest.mark.parametrize(
+    "lengths,disabled",
+    [([4096], False), ([4096, 4353], True)],
+    ids=["missing-plan", "disabled-with-plan"],
+)
+def test_mixed_decode_prefix_retains_per_token(mixed_family, lengths, disabled):
+    inputs = _mixed_inputs(lengths)
+    routing = (
+        {"gqa_length_plan": get_ops().gqa_decode_length_plan(lengths)}
+        if disabled
+        else {}
+    )
+    with _gpu_cores(8):
+        _assert_mixed_matches_standalone(
+            inputs, lengths, mixed_family, 0, gqa_disabled=disabled, **routing
+        )
+
+
+@pytest.mark.parametrize("plan_lengths", [[2, 2, 2], [2, 3]], ids=["count", "length"])
+def test_mixed_prefix_plan_must_match_decode_rows(plan_lengths):
+    inputs = _mixed_inputs([2, 2])
+    plan = get_ops().gqa_decode_length_plan(plan_lengths)
+    with pytest.raises(ValueError, match="leading ordinary decode rows"):
+        _mixed_call(inputs, max_seq_len=3, gqa_length_plan=plan)
 
 
 def test_spec_window_does_not_switch_kernel_family() -> None:
@@ -337,8 +445,8 @@ def test_special_attention_features_use_fallback(feature):
     _assert_close(out, ref, mx.float16)
 
 
-def test_turboquant_uses_fallback_with_dequantized_reference() -> None:
-    out, ref = _run_primitive(
+def _run_long_turboquant_decode(*, gqa_disabled: bool) -> tuple[mx.array, mx.array]:
+    return _run_primitive(
         [65536],
         mx.float16,
         interleaved=False,
@@ -346,9 +454,48 @@ def test_turboquant_uses_fallback_with_dequantized_reference() -> None:
         num_query_heads=16,
         num_kv_heads=2,
         turboquant=True,
+        gqa_disabled=gqa_disabled,
     )
+
+
+def test_turboquant_takes_p256_with_dequantized_reference() -> None:
+    """TurboQuant decode takes the GQA producer."""
+    out, ref = _run_long_turboquant_decode(gqa_disabled=False)
+    assert _dispatch_family() == "gqa_decode"
+    assert get_ops().last_gqa_partition_size() == 256
+    _assert_close(out, ref, mx.float16)
+
+
+def test_turboquant_kill_switch_keeps_fallback() -> None:
+    out, ref = _run_long_turboquant_decode(gqa_disabled=True)
     _assert_fallback()
     _assert_close(out, ref, mx.float16)
+
+
+@pytest.mark.parametrize("kv_len,admitted", [(3839, False), (3840, True)])
+def test_turboquant_shares_the_work_budget(kv_len, admitted) -> None:
+    """Seven cores need 33 * 7 = 231: 15 full P256 partitions * 16 heads pass, 14 do not."""
+    ops = get_ops()
+    ops._override_detected_gpu_core_count_for_test(7)
+    try:
+        out, ref = _run_primitive(
+            [kv_len],
+            mx.float16,
+            interleaved=True,
+            seed=13,
+            num_query_heads=16,
+            num_kv_heads=2,
+            turboquant=True,
+            num_decode_requests=1,
+        )
+        if admitted:
+            assert _dispatch_family() == "gqa_decode"
+            assert ops.last_gqa_partition_size() == 256
+        else:
+            _assert_fallback()
+        _assert_close(out, ref, mx.float16)
+    finally:
+        _restore_test_gpu_cores()
 
 
 def test_matching_float32_uses_fallback() -> None:
@@ -402,11 +549,11 @@ _ADMISSION_AT_CORE_COUNT = {
         for cores, minimum in _ADMISSION_AT_CORE_COUNT[geometry[0]].items()
     ],
 )
-def test_shape_and_device_performance_gate(q, kv, head, block, cores, minimum):
+def test_partition_threshold_by_core_count(q, kv, head, block, cores, minimum):
     ops = get_ops()
-    assert not ops.gqa_decode_shape_eligible(q, kv, head, minimum - 1, cores, block)
-    assert ops.gqa_decode_shape_eligible(q, kv, head, minimum, cores, block)
-    assert ops.gqa_decode_shape_eligible(q, kv, head, minimum + 1, cores, block)
+    assert ops.gqa_decode_partition_size(q, kv, head, minimum - 1, cores, block) == 0
+    assert ops.gqa_decode_partition_size(q, kv, head, minimum, cores, block) == 256
+    assert ops.gqa_decode_partition_size(q, kv, head, minimum + 1, cores, block) == 256
 
 
 @pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
@@ -414,13 +561,13 @@ def test_shape_and_device_performance_gate(q, kv, head, block, cores, minimum):
 def test_unknown_core_count_or_empty_length_is_not_eligible(
     q, kv, head, block, n, cores
 ):
-    assert not get_ops().gqa_decode_shape_eligible(q, kv, head, n, cores, block)
+    assert get_ops().gqa_decode_partition_size(q, kv, head, n, cores, block) == 0
 
 
 @pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
 @pytest.mark.parametrize("n", [131072, 131073, 262145, 524289, 1048576])
 def test_policy_has_no_fixed_long_context_ceiling(q, kv, head, block, n):
-    assert get_ops().gqa_decode_partition_size(q, kv, head, n, 40, block) == 512
+    assert get_ops().gqa_decode_partition_size(q, kv, head, n, 40, block) == 256
 
 
 @pytest.mark.parametrize(
@@ -436,42 +583,25 @@ def test_policy_has_no_fixed_long_context_ceiling(q, kv, head, block, n):
         (8, 1, 128, 16),
         (18, 4, 128, 16),
         (16, 0, 128, 16),
+        (32, 8, 128, 8),
         (32, 8, 128, 32),
-        (24, 4, 256, 32),
+        (16, 2, 256, 8),
+        (16, 4, 256, 32),
     ],
 )
 def test_policy_rejects_unmeasured_geometries(q, kv, head, block):
-    assert not get_ops().gqa_decode_shape_eligible(q, kv, head, 65536, 40, block)
     assert get_ops().gqa_decode_partition_size(q, kv, head, 65536, 40, block) == 0
 
 
 @pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
-def test_default_partition_thresholds(q, kv, head, block):
-    thresholds = {32: [10752, 21504], 24: [14080, 28160], 16: [21248, 42496]}[q]
-    ops = get_ops()
-    for previous, part, threshold in zip([0, 256], [256, 512], thresholds, strict=True):
-        assert (
-            ops.gqa_decode_partition_size(q, kv, head, threshold - 1, 40, block)
-            == previous
-        )
-        assert ops.gqa_decode_partition_size(q, kv, head, threshold, 40, block) == part
-        assert (
-            ops.gqa_decode_partition_size(q, kv, head, threshold + 1, 40, block) == part
-        )
-
-
-@pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
-@pytest.mark.parametrize("part", GQA_PARTITIONS)
 @pytest.mark.parametrize("offset", [-1, 0])
-def test_default_partition_executes_and_matches_oracle(
-    q, kv, head, block, part, offset
-):
+def test_default_partition_executes_and_matches_oracle(q, kv, head, block, offset):
     # Both dtypes and partial tails are covered by the forced-kernel suite.
     ops = get_ops()
     cores = ops.detected_gpu_core_count()
     if cores <= 0:
         pytest.skip("GPU core count unavailable")
-    threshold = part * ((GQA_SIMD_GROUPS_PER_CORE * cores + q - 1) // q)
+    threshold = GQA_PARTITION_SIZE * ((GQA_SIMD_GROUPS_PER_CORE * cores + q - 1) // q)
     out, ref = _run_primitive(
         [threshold + offset],
         mx.bfloat16,
@@ -483,7 +613,7 @@ def test_default_partition_executes_and_matches_oracle(
         block_size=block,
         num_decode_requests=1,
     )
-    expected = part if offset >= 0 else (0 if part == 256 else part // 2)
+    expected = GQA_PARTITION_SIZE if offset >= 0 else 0
     if expected:
         assert _dispatch_family() == "gqa_decode"
     else:
