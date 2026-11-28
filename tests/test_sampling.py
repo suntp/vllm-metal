@@ -30,6 +30,10 @@ from vllm_metal.v1.sampling_batch import (
     sample_decode_tokens,
     sample_from_logits,
 )
+from vllm_metal.v1.sampling_policy import (
+    params_allow_native_greedy,
+    params_allow_native_random,
+)
 
 VOCAB_SIZE = 1024
 MAX_NUM_PROMPT_TOKENS = 64
@@ -351,17 +355,17 @@ class TestSamplerDevicePolicy:
         assert generator.device.type == "cpu"
 
     @pytest.mark.parametrize(
-        "overrides",
+        ("overrides", "native"),
         [
-            None,
-            {"repetition_penalty": 1.1},
-            {"logprobs": 1},
-            {"logprob_token_ids": [1, 2]},
-            {"presence_penalty": 0.5},
-            {"allowed_token_ids": [1, 2]},
+            (None, False),
+            ({"repetition_penalty": 1.1}, False),
+            ({"logprobs": 1}, False),
+            ({"logprob_token_ids": [1, 2]}, False),
+            ({"presence_penalty": 0.5}, False),
+            ({"allowed_token_ids": [1, 2]}, True),
         ],
     )
-    def test_bridged_logits_reach_sampler_on_cpu(self, overrides) -> None:
+    def test_sampling_routes_to_native_or_cpu(self, overrides, native) -> None:
         logits = mx.array([[0.0, 1.0, 4.0, 2.0]], dtype=mx.float32)
         batch = SamplingBatch(
             [SamplingParams(temperature=0.8, top_k=2, **(overrides or {}))],
@@ -382,9 +386,9 @@ class TestSamplerDevicePolicy:
             logits, batch, SpySampler(), next_native_rng_key=next_native_rng_key
         )
 
-        assert [d.type for d in seen_devices] == ["cpu"]
+        assert [d.type for d in seen_devices] == ([] if native else ["cpu"])
         assert 0 <= result.token_ids[0] < 4
-        assert runner._native_sampling_step == 0
+        assert runner._native_sampling_step == int(native)
 
 
 class TestV1SamplingBatch:
@@ -433,12 +437,12 @@ class TestV1SamplingBatch:
 
     @pytest.mark.parametrize("prompt_logprobs", [0, 1])
     def test_native_random_allows_prompt_logprobs(self, prompt_logprobs) -> None:
-        assert SamplingBatch.params_allow_native_random(
+        assert params_allow_native_random(
             [SamplingParams(temperature=0.8, prompt_logprobs=prompt_logprobs)]
         )
 
     def test_native_random_rejects_structured_outputs(self) -> None:
-        assert not SamplingBatch.params_allow_native_random(
+        assert not params_allow_native_random(
             [
                 SamplingParams(
                     temperature=0.8,
@@ -733,17 +737,17 @@ class TestV1SamplingBatch:
     def test_logits_processor_controls_leave_native_random(
         self, params: SamplingParams
     ) -> None:
-        assert not SamplingBatch.params_allow_native_random([params])
+        assert not params_allow_native_random([params])
 
     def test_min_tokens_leaves_native_paths_only_until_reached(self) -> None:
         params = [
             SamplingParams(temperature=0.0, min_tokens=2),
             SamplingParams(temperature=0.0),
         ]
-        assert not SamplingBatch.params_allow_native_greedy(params, [1, 0])
-        assert not SamplingBatch.params_allow_native_random(params, [1, 0])
-        assert SamplingBatch.params_allow_native_greedy(params, [2, 0])
-        assert SamplingBatch.params_allow_native_random(params, [2, 0])
+        assert not params_allow_native_greedy(params, [1, 0])
+        assert not params_allow_native_random(params, [1, 0])
+        assert params_allow_native_greedy(params, [2, 0])
+        assert params_allow_native_random(params, [2, 0])
         assert not SamplingBatch(
             params, [[1], [1]], [[5], []], vocab_size=VOCAB_SIZE
         ).can_use_native_greedy()
@@ -778,7 +782,7 @@ class TestV1SamplingBatch:
         assert sample([2, 2]) == 0
 
     def test_allowed_token_ids_constrains_greedy_sampling(self) -> None:
-        """Greedy with allowed_token_ids must fall back and the constraint works."""
+        """Greedy sampling must honor allowed_token_ids."""
         logits = mx.array([[10.0, 1.0, 5.0, 1.0]], dtype=mx.float32)
         batch = SamplingBatch(
             [SamplingParams(temperature=0.0, allowed_token_ids=[2, 3])],
@@ -844,7 +848,7 @@ class TestV1SamplingBatch:
         probs = [0.5, 0.4, 0.1]
         logits = mx.array([[float(np.log(p)) for p in probs]], dtype=mx.float32)
         params = [SamplingParams(temperature=1.0, top_p=0.55, min_p=0.25)]
-        assert SamplingBatch.params_allow_native_random(params)
+        assert params_allow_native_random(params)
 
         keys = iter([mx.random.key(seed) for seed in range(64)])
         sampled = {
@@ -868,7 +872,7 @@ class TestV1SamplingBatch:
         for seed in range(40):
             logits = mx.array([[4.0, 2.0, 0.0, -2.0]], dtype=mx.float32)
             sp = SamplingParams(temperature=2.0, min_p=0.3, seed=seed)
-            assert not SamplingBatch.params_allow_native_random([sp])
+            assert not params_allow_native_random([sp])
             batch = SamplingBatch(
                 [sp],
                 [[1]],
@@ -883,7 +887,7 @@ class TestV1SamplingBatch:
         assert sampled == {0, 1}
 
     def test_bad_words_blocks_greedy_token(self) -> None:
-        """Greedy + bad_words_token_ids must fall back and block the banned token."""
+        """Greedy sampling must block the banned token."""
         logits = mx.array([[10.0, 1.0, 5.0, 1.0]], dtype=mx.float32)
         sp = SamplingParams(temperature=0.0)
         sp._bad_words_token_ids = [[0]]  # ban token 0 (the highest logit)
