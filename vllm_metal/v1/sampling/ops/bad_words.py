@@ -1,12 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Vendored verbatim from vllm b46907cce0f7 (== v0.33.0), Apache-2.0:
+# Vendored from vllm b46907cce0f7 (== v0.33.0), Apache-2.0:
 # vllm/v1/sample/ops/bad_words.py,
-# which vllm-project/vllm#63373 removes. No local modifications.
+# which vllm-project/vllm#63373 removes. The suffix matcher is shared with MLX.
+
+from collections.abc import Iterator
 
 import torch
 
 _SMALLEST_LOGIT = float("-inf")
+
+
+def matching_bad_word_token_ids(
+    bad_words_token_ids: list[list[int]],
+    past_tokens_ids: list[int],
+) -> Iterator[int]:
+    """Yield the final token of each bad word whose prefix matches the suffix."""
+    for bad_word_ids in bad_words_token_ids:
+        if len(bad_word_ids) > len(past_tokens_ids) + 1:
+            continue
+
+        prefix_length = len(bad_word_ids) - 1
+        actual_prefix = past_tokens_ids[-prefix_length:] if prefix_length > 0 else []
+        if actual_prefix == bad_word_ids[:prefix_length]:
+            yield bad_word_ids[-1]
 
 
 def _apply_bad_words_single_batch(
@@ -14,20 +31,9 @@ def _apply_bad_words_single_batch(
     bad_words_token_ids: list[list[int]],
     past_tokens_ids: list[int],
 ) -> None:
-    for bad_word_ids in bad_words_token_ids:
-        if len(bad_word_ids) > len(past_tokens_ids) + 1:
-            continue
-
-        prefix_length = len(bad_word_ids) - 1
-        last_token_id = bad_word_ids[-1]
-        actual_prefix = past_tokens_ids[-prefix_length:] if prefix_length > 0 else []
-        expected_prefix = bad_word_ids[:prefix_length]
-
-        assert len(actual_prefix) == len(expected_prefix)
-
-        if actual_prefix == expected_prefix:
-            # Assign to slice to avoid cpu->gpu sync.
-            logits[last_token_id : last_token_id + 1] = _SMALLEST_LOGIT
+    for token_id in matching_bad_word_token_ids(bad_words_token_ids, past_tokens_ids):
+        # Assign to slice to avoid cpu->gpu sync.
+        logits[token_id : token_id + 1] = _SMALLEST_LOGIT
 
 
 def apply_bad_words(

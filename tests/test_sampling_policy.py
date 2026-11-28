@@ -295,6 +295,30 @@ class TestSamplingPolicyMatrix:
         # MPS speculation reads the temperature exactly, unlike the gates.
         assert unsupported_request_controls(greedy, speculative=True) == ["temperature"]
 
+    @pytest.mark.parametrize(
+        ("options", "sync_allowed"),
+        [
+            ({}, True),
+            ({"presence_penalty": 0.5}, False),
+            ({"logprobs": 1}, False),
+            ({"min_tokens": 1}, False),
+            ({"logit_bias": {1: 1.0}}, False),
+            ({"structured_outputs": StructuredOutputsParams(choice=["yes"])}, False),
+        ],
+    )
+    def test_constraints_opt_in_only_lifts_the_synchronous_mask_gate(
+        self, options, sync_allowed
+    ) -> None:
+        params = [_sp(temperature=0.0, allowed_token_ids=[1, 2], **options)]
+        assert not params_allow_native_greedy(params)
+        assert not params_allow_native_random(params)
+        assert (
+            params_allow_native_greedy(params, allow_constraints=True) is sync_allowed
+        )
+        assert (
+            params_allow_native_random(params, allow_constraints=True) is sync_allowed
+        )
+
     def test_length_mismatch_raises_only_without_a_pending_row(self) -> None:
         """The min-tokens reduction short-circuits before zip-strict can
         validate a trailing extra length — the pre-policy gate behavior."""
