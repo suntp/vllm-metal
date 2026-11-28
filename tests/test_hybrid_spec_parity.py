@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from copy import deepcopy
+from unittest.mock import Mock
 
 import pytest
 
@@ -8,7 +9,20 @@ from tools.hybrid_spec_parity import (
     SAMPLING_KWARGS,
     build_restore_prompt,
     compare_arms,
+    run_child,
 )
+
+
+def test_hybrid_mtp_loads_split_weights_through_metal(monkeypatch):
+    llm = Mock(side_effect=RuntimeError("captured engine config"))
+    monkeypatch.setattr("vllm.LLM", llm)
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    with pytest.raises(RuntimeError, match="captured engine config"):
+        run_child("target", True, False, None, method="mtp", draft_model="split")
+    kwargs = llm.call_args.kwargs
+    assert kwargs["model"] == "target"
+    assert "model" not in kwargs["speculative_config"]
+    assert kwargs["additional_config"] == {"qwen_mtp_drafter": "split"}
 
 
 def _arms(block_size=160):

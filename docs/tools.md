@@ -39,7 +39,20 @@ python -m tools.check_parity \
   --top-k 5 --batch-size 1 4 --max-tokens 32 --output-dir dspark-parity
 ```
 
-`--method dflash` and `--method draft_model` select the other draft types.
+`--method dflash` and `--method draft_model` select external draft models.
+For a Qwen3.5-family target with bundled MTP weights, use `--method mtp`.
+Both commands below keep the target as the vLLM model and pass the split
+weights to the Metal proposer.
+
+```bash
+python tools/check_parity.py --model /path/to/target --method mtp \
+  --additional-config '{"qwen_mtp_drafter":"/path/to/split-drafter"}' \
+  --num-draft-tokens 3 --batch-size 1 4 --top-k 5
+python tools/hybrid_spec_parity.py --model /path/to/target --method mtp \
+  --draft-model /path/to/split-drafter
+```
+
+Both tools apply the split checkpoint only to the speculative worker.
 Use a trained target/draft pair and its supported width. Speculative checks use
 all 40 shared prompts by default, with the same `--prompt` override as ordinary
 parity. Top-k defaults to 5 for speculative checks; use `--top-k` to change

@@ -124,6 +124,7 @@ from vllm_metal.v1.proposer import (
     MetalProposer,
     ProposeContext,
 )
+from vllm_metal.v1.qwen_mtp_proposer import QwenMTPProposer, is_qwen_mtp
 from vllm_metal.v1.sampling import Sampler
 from vllm_metal.v1.sampling_batch import (
     SamplingBatch,
@@ -747,7 +748,9 @@ class MetalModelRunner:
             self._model_lifecycle.install_pooling_backend()
 
         spec = self.vllm_config.speculative_config
-        if spec is not None and spec.method in ("dflash", "dspark"):
+        if is_qwen_mtp(spec):
+            self._drafter = QwenMTPProposer.build(self)
+        elif spec is not None and spec.method in ("dflash", "dspark"):
             from vllm_metal.v1.dflash_proposer import DFlashProposer
             from vllm_metal.v1.dspark_proposer import DSparkProposer
 
@@ -1371,6 +1374,11 @@ class MetalModelRunner:
             return
         if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
             self._drafter = Gemma4MTPProposer(self)
+        elif is_qwen_mtp(spec):
+            if not isinstance(self._drafter, QwenMTPProposer):
+                raise RuntimeError(
+                    "Qwen MTP drafter was not loaded before KV profiling"
+                )
         elif spec.method in ("dflash", "dspark"):
             from vllm_metal.v1.block_draft_proposer import BlockDraftProposer
 
@@ -1396,7 +1404,8 @@ class MetalModelRunner:
         else:
             raise NotImplementedError(
                 f"Speculative method {spec.method!r} is not supported on Metal "
-                "(supported: Gemma4 MTP, draft_model, ngram, dflash, dspark)."
+                "(supported: Gemma4 MTP, Qwen3.5 MTP, draft_model, ngram, dflash, "
+                "dspark)."
             )
 
     def get_draft_model_stats(self) -> dict[str, int] | None:
@@ -1674,27 +1683,41 @@ class MetalModelRunner:
             elif use_mm_forward:
                 assert adapter is not None
                 selects = self._mm_forward_selects_rows(adapter)
+                collect_mm_hidden = collect_target_hidden_states and isinstance(
+                    self._drafter, QwenMTPProposer
+                )
+                if collect_mm_hidden and not selects:
+                    raise NotImplementedError(
+                        "Multimodal Qwen MTP requires a backbone with a verified "
+                        "output-head projection on Metal."
+                    )
                 if selects and not needs_prompt_logprob_rows:
                     logits_layout = self._paged_logits_layout(
                         cu_seqlens,
                         num_decode_segments=len(decode_segments),
                     )
+                hidden_states_only = (
+                    collect_mm_hidden or logits_layout.indices is not None
+                )
                 model_output, mm_prefill_deltas = self._run_mm_paged_forward(
                     input_ids,
                     offset_caches,
                     prefill_reqs,
                     decode_segments,
-                    hidden_states_only=logits_layout.indices is not None,
+                    hidden_states_only=hidden_states_only,
                 )
-                if logits_layout.indices is None:
-                    logits = self._extract_logits(model_output)
-                else:
+                if hidden_states_only:
                     logits = self._model_adapter.project_logits(
                         self._forward_model,
                         model_output,
                         logits_indices=logits_layout.indices,
                     )
-                target_hidden_states = None
+                    if collect_mm_hidden:
+                        target_hidden_states = model_output.reshape(
+                            -1, model_output.shape[-1]
+                        )
+                else:
+                    logits = self._extract_logits(model_output)
                 del model_output
             elif self.pp is not None and self.pp.size > 1:
                 # Pipeline-parallel stage. The PP-aware wrapper owns the forward
@@ -2499,33 +2522,21 @@ class MetalModelRunner:
         caller-supplied positions on mm segments and falls back to the
         int-offset arange path on text segments.
 
-        Any speculative-decode segment in the batch is rejected up
-        front: ``prepare_grouped`` may keep a ``num_query_tokens > 1``
-        verification window as one ``cu_seqlens`` segment, but this
-        method's M-RoPE position handling has only been exercised with
-        single-token decode segments. Supplying and validating per-row
-        positions for a multi-token verification window is untracked
-        territory, including text-only spec decode that shares the batch
-        with an mm prefill, since the whole batch routes through this
-        method. Lifting the restriction is tracked as a follow-up to RFC
-        #319.
+        Qwen MTP verifies one merged window per request. Each window takes
+        one position array spanning its anchor and all scheduled draft rows.
         """
         adapter = self._multimodal_adapter
         assert adapter is not None and adapter.forward_ready
         encoder_cache = self.encoder_cache
         assert encoder_cache is not None
 
-        for segment in decode_segments:
-            if segment.num_query_tokens > 1:
-                raise NotImplementedError(
-                    "Speculative decode is not supported on the multimodal "
-                    "paged path yet: M-RoPE positions for a multi-token "
-                    "verification window have never been supplied or "
-                    "validated on this path, and every segment in the batch "
-                    "routes through it, including text-only spec decode "
-                    "sharing the batch with an mm prefill. Tracked as a "
-                    "follow-up to RFC #319."
-                )
+        if any(segment.num_query_tokens > 1 for segment in decode_segments) and not (
+            isinstance(self._drafter, QwenMTPProposer) and self.merge_verify_windows
+        ):
+            raise NotImplementedError(
+                "Speculative decode on the multimodal paged path requires "
+                "Qwen MTP with merged verification windows."
+            )
 
         # Full-prompt M-RoPE positions per mm prefill request.
         mm_request_meta: dict[

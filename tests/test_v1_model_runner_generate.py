@@ -40,6 +40,7 @@ from vllm_metal.distributed.pipeline import PipelineGroup
 from vllm_metal.v1.draft_model_proposer import DraftModelProposer
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
 from vllm_metal.v1.proposer import Gemma4MTPProposer
+from vllm_metal.v1.qwen_mtp_proposer import QwenMTPProposer
 from vllm_metal.v1.sampling import Sampler
 from vllm_metal.v1.spec_decode import PagedDecodeSegment
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
@@ -147,18 +148,22 @@ def test_gemma4_mtp_config_installs_gemma4_proposer() -> None:
     assert isinstance(runner._drafter, Gemma4MTPProposer)
 
 
-def test_draft_model_loads_before_cache_binding(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("method", "proposer_type"),
+    [("draft_model", DraftModelProposer), ("mtp", QwenMTPProposer)],
+)
+def test_drafter_loads_once_before_kv_planning(
+    monkeypatch: pytest.MonkeyPatch, method, proposer_type
 ) -> None:
-    proposer = Mock(spec=DraftModelProposer)
+    proposer = Mock(spec=proposer_type)
     build = Mock(return_value=proposer)
-    monkeypatch.setattr(
-        "vllm_metal.v1.draft_model_proposer.DraftModelProposer.build", build
-    )
+    monkeypatch.setattr(proposer_type, "build", build)
     spec = SimpleNamespace(
-        method="draft_model",
-        uses_draft_model=lambda: True,
-        draft_model_config=SimpleNamespace(max_model_len=128),
+        method=method,
+        uses_draft_model=lambda: method == "draft_model",
+        draft_model_config=SimpleNamespace(
+            max_model_len=128, hf_config=SimpleNamespace(model_type="qwen3_5_mtp")
+        ),
     )
     runner = make_stub_runner(
         model_config=SimpleNamespace(runner_type="generate", hf_config=None),
@@ -174,13 +179,11 @@ def test_draft_model_loads_before_cache_binding(
     runner.load_model()
 
     assert runner._drafter is proposer
-    build.assert_called_once()
-    proposer.bind_paged_cache.assert_not_called()
-
-    # install_drafter leaves the draft bind to _initialize_upstream_storage,
-    # which hands the proposer the target's shared KV storage.
     runner.install_drafter()
-    proposer.bind_paged_cache.assert_not_called()
+    build.assert_called_once()
+    assert runner._drafter is proposer
+    if method == "draft_model":
+        proposer.bind_paged_cache.assert_not_called()
 
 
 class TestDrafterReleaseOnLifecycle:

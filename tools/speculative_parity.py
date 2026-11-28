@@ -18,11 +18,12 @@ import sys
 from pathlib import Path
 
 from tools.attention_bench_utils import source_file_hashes
-from tools.check_parity import mlx_generate
+from tools.check_parity import local_checkpoint, mlx_generate
 from tools.parity_prompts import PROMPTS
 from tools.parity_utils import parity_report
 from vllm_metal.config import (
     DSPARK_DRAFT_QUANTIZATION_KEY,
+    QWEN_MTP_DRAFTER_KEY,
 )
 
 
@@ -47,6 +48,12 @@ def run_engine(args):
     )
     if spec is not None and args.dspark_draft_topk is not None:
         spec["dspark_draft_topk"] = args.dspark_draft_topk
+    additional = dict(getattr(args, "additional_config", None) or {})
+    if spec is None:
+        additional.pop(QWEN_MTP_DRAFTER_KEY, None)
+        additional.pop(DSPARK_DRAFT_QUANTIZATION_KEY, None)
+    elif args.dspark_draft_quantization is not None:
+        additional[DSPARK_DRAFT_QUANTIZATION_KEY] = args.dspark_draft_quantization
     llm = LLM(
         model=args.target,
         max_model_len=1024,
@@ -58,11 +65,7 @@ def run_engine(args):
         enable_prefix_caching=False,
         async_scheduling=False,
         speculative_config=spec,
-        additional_config=(
-            {DSPARK_DRAFT_QUANTIZATION_KEY: args.dspark_draft_quantization}
-            if spec is not None and args.dspark_draft_quantization is not None
-            else {}
-        ),
+        additional_config=additional,
     )
     runner = llm.llm_engine.model_executor.driver_worker.model_runner
     sample = runner._sample_paged_batch
@@ -183,6 +186,13 @@ def run_engine(args):
 
 
 def validate_args(args, parser):
+    additional = args.additional_config or {}
+    if QWEN_MTP_DRAFTER_KEY in additional:
+        source = additional[QWEN_MTP_DRAFTER_KEY]
+        if args.method != "mtp" or not isinstance(source, str) or not source.strip():
+            parser.error(
+                "qwen_mtp_drafter requires --method mtp and a checkpoint path or repo ID"
+            )
     if args.dspark_draft_quantization is not None and args.method != "dspark":
         parser.error("--dspark-draft-quantization requires --method dspark")
     if args.dspark_draft_topk is not None and (
@@ -196,6 +206,8 @@ def validate_args(args, parser):
             "dflash": "z-lab/Qwen3-4B-DFlash-b16",
             "dspark": "deepseek-ai/dspark_qwen3_4b_block7",
             "draft_model": "Qwen/Qwen3-0.6B",
+            # Qwen3.5 MTP drafts with the target's own mtp.* layer.
+            "mtp": args.target,
         }[args.method]
     if args.worker not in (None, "native", "target", args.method, "replay"):
         parser.error("Draft worker must match --method")
@@ -245,14 +257,14 @@ def run(args) -> bool:
         run_engine(args)
         return True
     args.output_dir.mkdir(parents=True, exist_ok=False)
-    from huggingface_hub import snapshot_download
-
     # Resolve once so every worker loads the same checkpoint revision.
     for name in ("target", "draft"):
-        path = Path(getattr(args, name))
-        if not path.is_dir():
-            path = Path(snapshot_download(getattr(args, name)))
-        setattr(args, name, str(path.resolve()))
+        setattr(args, name, str(Path(local_checkpoint(getattr(args, name))).resolve()))
+    additional = dict(args.additional_config or {})
+    if QWEN_MTP_DRAFTER_KEY in additional:
+        additional[QWEN_MTP_DRAFTER_KEY] = local_checkpoint(
+            additional[QWEN_MTP_DRAFTER_KEY]
+        )
     root = Path(__file__).resolve().parents[1]
     sources = sorted(
         p
@@ -270,6 +282,7 @@ def run(args) -> bool:
                 "num_draft_tokens": args.num_draft_tokens,
                 "dspark_draft_topk": args.dspark_draft_topk,
                 "dspark_draft_quantization": args.dspark_draft_quantization,
+                "additional_config": additional,
                 "max_tokens": args.max_tokens,
                 "top_k": args.top_k,
                 "batch_sizes": args.batch_size,
@@ -300,6 +313,11 @@ def run(args) -> bool:
                     "-m",
                     "tools.check_parity",
                     *sys.argv[1:],
+                    *(
+                        ["--additional-config", json.dumps(additional)]
+                        if additional
+                        else []
+                    ),
                     "--model",
                     args.target,
                     "--draft",

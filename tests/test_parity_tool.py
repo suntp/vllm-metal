@@ -4,6 +4,7 @@ import io
 import json
 from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -362,6 +363,44 @@ class TestParityTool:
         assert f"{option[0]} cannot be combined with --method" in (
             capsys.readouterr().err
         )
+
+    @pytest.mark.parametrize("worker", ["target", "mtp"])
+    def test_only_mtp_worker_receives_split_weights(
+        self, monkeypatch, tmp_path, worker
+    ):
+        llm = Mock(side_effect=RuntimeError("captured engine config"))
+        monkeypatch.setattr("vllm.LLM", llm)
+        monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+        monkeypatch.setenv("MLX_ENABLE_TF32", "0")
+        (tmp_path / "native.json").write_text("[]")
+        additional = {"qwen_mtp_drafter": "split", "shared_option": 42}
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "check_parity.py",
+                "--model",
+                "target",
+                "--method",
+                "mtp",
+                "--worker",
+                worker,
+                "--output-dir",
+                str(tmp_path),
+                "--additional-config",
+                json.dumps(additional),
+            ],
+        )
+
+        with pytest.raises(RuntimeError, match="captured engine config"):
+            main()
+
+        kwargs = llm.call_args.kwargs
+        if worker == "mtp":
+            assert kwargs["speculative_config"]["model"] == "target"
+            assert kwargs["additional_config"] == additional
+        else:
+            assert kwargs["speculative_config"] is None
+            assert kwargs["additional_config"] == {"shared_option": 42}
 
 
 @pytest.mark.parametrize(
