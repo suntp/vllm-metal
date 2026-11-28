@@ -29,16 +29,17 @@ These methods currently have these Metal-specific constraints:
 - Scheduling must be synchronous. The Metal platform disables async scheduling
   when speculative decoding is configured.
 - Pipeline parallelism is not supported with speculative decoding.
-- Multi-token verification is not supported on the multimodal paged path,
-  including text speculative decode sharing a batch with multimodal prefill.
+- Qwen3.5-family MTP supports mixed image and text batches on the native MLX
+  multimodal path when the adapter can reproduce the target output head. Other
+  speculative methods require text-only batches for multi-token verification.
 - Heterogeneous draft vocabularies are not supported.
 - `long_prefill_token_threshold`, when set, must be at least
   `1 + num_speculative_tokens`.
 
 ## Hybrid GDN targets
 
-N-gram speculation supports the text-only execution path on hybrid GDN targets
-(Qwen3.5/Qwen3.8-style linear-attention hybrids):
+Hybrid GDN targets (Qwen3.5/Qwen3.8-style linear-attention hybrids) support
+text-only n-gram speculation and the Qwen family's native MTP layer.
 
 - The verification forward runs the draft span through the same paged kernels
   as plain decode — full-attention layers take the extra query rows, and the
@@ -70,11 +71,7 @@ N-gram speculation supports the text-only execution path on hybrid GDN targets
   end-to-end serving throughput on representative workloads and concurrency
   before enabling it.
 
-Draft-model and MTP methods on hybrid targets remain unsupported until their
-proposers are validated with the state staging and boundary caps. Unsupported
-hybrid speculative pairings — a non-ngram method, or a non-GDN hybrid state
-family (mamba2, KDA, shortconv) — are rejected at startup, not at the first
-verification.
+The MLX backend rejects other hybrid speculative pairings at startup.
 
 ## Gemma4 MTP
 
