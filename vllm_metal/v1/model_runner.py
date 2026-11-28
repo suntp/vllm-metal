@@ -1372,7 +1372,9 @@ class MetalModelRunner:
             self._drafter = Gemma4MTPProposer(self)
         elif is_qwen_mtp(spec):
             if not isinstance(self._drafter, QwenMTPProposer):
-                raise RuntimeError("Qwen MTP drafter was not loaded before KV profiling")
+                raise RuntimeError(
+                    "Qwen MTP drafter was not loaded before KV profiling"
+                )
         elif spec.method in ("dflash", "dspark"):
             from vllm_metal.v1.block_draft_proposer import BlockDraftProposer
 

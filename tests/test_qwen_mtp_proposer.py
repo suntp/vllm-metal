@@ -12,6 +12,7 @@ from mlx_vlm.speculative.drafters.qwen3_5_mtp.config import Qwen3_5MTPConfig
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.qwen3_5_mtp import (
     Qwen3_5MTPDraftModel,
 )
+from vllm import SamplingParams
 
 from vllm_metal.config import QWEN_MTP_DRAFTER_KEY
 from vllm_metal.v1.proposer import ProposeContext
@@ -20,7 +21,7 @@ from vllm_metal.v1.qwen_mtp_proposer import (
     drafter_source,
     is_qwen_mtp,
 )
-from vllm_metal.v1.spec_decode import PagedDecodeSegment
+from vllm_metal.v1.spec_decode import PagedDecodeSegment, SpeculativeDecodeController
 
 HIDDEN = 32
 VOCAB = 64
@@ -62,42 +63,15 @@ def _drafter() -> Qwen3_5MTPDraftModel:
     return drafter
 
 
-class _Controller:
-    """Greedy eligibility stand-in: every request may draft unless listed."""
-
-    def __init__(self, blocked: set[str] | None = None) -> None:
-        self.blocked = blocked or set()
-
-    def can_draft_greedy(self, req_id, request_state, sampled_ids) -> bool:
-        return req_id not in self.blocked
-
-    def draft_eligible_requests(
-        self,
-        decode_reqs,
-        decode_token_ids,
-        prefill_reqs,
-        prefill_token_ids,
-        prefill_result_modes,
-        request_states,
-    ):
-        eligible = [
-            (req_id, state)
-            for (req_id, state), sampled in zip(
-                decode_reqs, decode_token_ids, strict=True
-            )
-            if sampled and req_id not in self.blocked
-        ]
-        eligible += [
-            (prefill.req_id, request_states[prefill.req_id])
-            for prefill, mode in zip(prefill_reqs, prefill_result_modes, strict=True)
-            if mode != "intermediate" and prefill.req_id not in self.blocked
-        ]
-        return eligible
+def _proposer(drafter):
+    return QwenMTPProposer(drafter=drafter, controller=SpeculativeDecodeController())
 
 
-def _request_state(max_tokens=None, generated_tokens=0):
+def _request_state(max_tokens=None, generated_tokens=0, *, min_tokens=0, temperature=0):
     return SimpleNamespace(
-        sampling_params=SimpleNamespace(max_tokens=max_tokens),
+        sampling_params=SamplingParams(
+            temperature=temperature, min_tokens=min_tokens, max_tokens=max_tokens
+        ),
         generated_tokens=generated_tokens,
     )
 
@@ -134,7 +108,9 @@ def _prefill_ctx(
     )
 
 
-def _verify_ctx(req_id, last_token, drafts, sampled, start_pos, rows):
+def _verify_ctx(
+    req_id, last_token, drafts, sampled, start_pos, rows, *, request_state=None
+):
     segment = PagedDecodeSegment(
         req_id=req_id,
         input_token_ids=(last_token, *drafts),
@@ -144,7 +120,7 @@ def _verify_ctx(req_id, last_token, drafts, sampled, start_pos, rows):
         cache_start_pos=start_pos,
         block_ids=((0,),),
     )
-    request_state = _request_state()
+    request_state = request_state or _request_state()
     return ProposeContext(
         target_hidden_states=rows,
         decode_reqs=[(req_id, request_state)],
@@ -179,7 +155,7 @@ def test_incremental_cache_matches_single_pass(drafter, accepted) -> None:
     hidden = mx.random.normal((len(prompt) + K + 1, HIDDEN))
     first = 17
 
-    incremental = QwenMTPProposer(drafter=drafter, controller=_Controller())
+    incremental = _proposer(drafter)
     split = 5
     assert (
         incremental.propose(
@@ -204,7 +180,7 @@ def test_incremental_cache_matches_single_pass(drafter, accepted) -> None:
     )["r"]
 
     committed = [*prompt, first, *drafts[:accepted]]
-    single = QwenMTPProposer(drafter=drafter, controller=_Controller())
+    single = _proposer(drafter)
     expected = _drafts(
         single.propose(
             _prefill_ctx("r", committed, 0, hidden[: len(committed)], correction)
@@ -212,12 +188,79 @@ def test_incremental_cache_matches_single_pass(drafter, accepted) -> None:
     )["r"]
 
     assert after_verify == expected
+    _assert_same_cache(incremental, single)
+
+
+def _assert_same_cache(actual, expected):
     for got, want in zip(
-        incremental._states["r"].cache, single._states["r"].cache, strict=True
+        actual._states["r"].cache, expected._states["r"].cache, strict=True
     ):
         assert got.offset == want.offset
         for a, b in zip(got.state, want.state, strict=True):
             assert mx.allclose(a, b, atol=1e-5)
+
+
+@pytest.mark.parametrize("miss", ["min_tokens", "missing_hidden"])
+def test_decode_admits_from_first_eligible_target_row(drafter, miss):
+    hidden = mx.random.normal((4, HIDDEN))
+    state = _request_state(
+        generated_tokens=1, min_tokens=4 if miss == "min_tokens" else 0
+    )
+    proposer = _proposer(drafter)
+    prompt_rows = None if miss == "missing_hidden" else hidden
+    assert (
+        proposer.propose(
+            _prefill_ctx("r", [1, 2, 3, 4], 0, prompt_rows, 5, request_state=state)
+        )
+        is None
+    )
+    position = 4
+    while state.generated_tokens < state.sampling_params.min_tokens - 1:
+        state.generated_tokens += 1
+        assert (
+            proposer.propose(
+                _verify_ctx("r", 5, [], [5], position, hidden[:1], request_state=state)
+            )
+            is None
+        )
+        position += 1
+
+    state.generated_tokens += 1
+    actual = proposer.propose(
+        _verify_ctx("r", 5, [], [6], position, hidden[:1], request_state=state)
+    )
+    fresh = _proposer(drafter)
+    expected = fresh.propose(_prefill_ctx("r", [5], position, hidden[:1], 6))
+    assert len(_drafts(actual)["r"]) == K
+    assert _drafts(actual) == _drafts(expected)
+    _assert_same_cache(proposer, fresh)
+
+
+@pytest.mark.parametrize("start_pos", [0, 9])
+def test_discontinuous_prefill_restarts_drafter(drafter, start_pos):
+    hidden = mx.random.normal((3, HIDDEN))
+    proposer = _proposer(drafter)
+    proposer.propose(_prefill_ctx("r", [1, 2, 3], 0, hidden, 0, final=False))
+    resumed = _prefill_ctx("r", [7, 8], start_pos, hidden[:2], 9)
+    fresh = _proposer(drafter)
+    assert _drafts(proposer.propose(resumed)) == _drafts(fresh.propose(resumed))
+    _assert_same_cache(proposer, fresh)
+
+
+def test_decode_restarts_after_missing_verify_rows(drafter):
+    proposer = _proposer(drafter)
+    rows = mx.random.normal((3, HIDDEN))
+    drafts = _drafts(proposer.propose(_prefill_ctx("r", [1, 2, 3], 0, rows, 4)))["r"]
+    assert (
+        proposer.propose(_verify_ctx("r", 4, drafts, [drafts[0], 5], 3, None)) is None
+    )
+
+    actual = proposer.propose(_verify_ctx("r", 5, [], [6], 5, rows[:1]))
+    fresh = _proposer(drafter)
+    assert _drafts(actual) == _drafts(
+        fresh.propose(_prefill_ctx("r", [5], 5, rows[:1], 6))
+    )
+    _assert_same_cache(proposer, fresh)
 
 
 @pytest.mark.parametrize(
@@ -232,7 +275,7 @@ def test_incremental_cache_matches_single_pass(drafter, accepted) -> None:
 def test_draft_length_respects_caps(
     drafter, draft_caps, max_tokens, generated, expected
 ) -> None:
-    proposer = QwenMTPProposer(drafter=drafter, controller=_Controller())
+    proposer = _proposer(drafter)
     out = proposer.propose(
         _prefill_ctx(
             "r",
@@ -258,7 +301,7 @@ def test_batched_drafts_match_single_request_drafts(drafter) -> None:
 
     expected = {}
     for req_id, prompt in prompts.items():
-        alone = QwenMTPProposer(drafter=drafter, controller=_Controller())
+        alone = _proposer(drafter)
         expected |= _drafts(
             alone.propose(
                 _prefill_ctx(
@@ -276,7 +319,7 @@ def test_batched_drafts_match_single_request_drafts(drafter) -> None:
     cu = [0]
     for req_id in req_ids:
         cu.append(cu[-1] + len(prompts[req_id]))
-    together = QwenMTPProposer(drafter=drafter, controller=_Controller())
+    together = _proposer(drafter)
     out = together.propose(
         ProposeContext(
             target_hidden_states=mx.concatenate([hidden[r] for r in req_ids]),
@@ -302,8 +345,17 @@ def test_batched_drafts_match_single_request_drafts(drafter) -> None:
 
 
 def test_ineligible_request_keeps_no_drafter_cache(drafter) -> None:
-    proposer = QwenMTPProposer(drafter=drafter, controller=_Controller({"r"}))
-    out = proposer.propose(_prefill_ctx("r", [1, 2, 3], 0, mx.zeros((3, HIDDEN)), 4))
+    proposer = _proposer(drafter)
+    out = proposer.propose(
+        _prefill_ctx(
+            "r",
+            [1, 2, 3],
+            0,
+            mx.zeros((3, HIDDEN)),
+            4,
+            request_state=_request_state(temperature=1),
+        )
+    )
     assert out is None
     assert "r" not in proposer._states
 
@@ -311,8 +363,8 @@ def test_ineligible_request_keeps_no_drafter_cache(drafter) -> None:
 def test_finished_request_id_starts_fresh(drafter) -> None:
     """vLLM can reuse a finished id in the same step; the new request must
     not inherit the old drafter cache."""
-    proposer = QwenMTPProposer(drafter=drafter, controller=_Controller())
-    fresh = QwenMTPProposer(drafter=drafter, controller=_Controller())
+    proposer = _proposer(drafter)
+    fresh = _proposer(drafter)
     proposer.propose(_prefill_ctx("r", [1, 2, 3], 0, mx.zeros((3, HIDDEN)), 4))
     reused = proposer.propose(
         _prefill_ctx("r", [7, 8], 0, mx.zeros((2, HIDDEN)), 9, finished={"r"})

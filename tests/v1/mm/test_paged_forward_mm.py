@@ -19,6 +19,7 @@ from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLVisionEncodeResult
 from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_runner import PrefillRequest, RequestState
+from vllm_metal.v1.qwen_mtp_proposer import QwenMTPProposer
 from vllm_metal.v1.spec_decode import PagedDecodeSegment
 
 
@@ -579,12 +580,7 @@ class TestMmDecodeSegmentPositions:
         assert call["visual_pos_masks"].tolist() == [[False]]
 
     def test_spec_decode_for_mm_request_is_rejected(self) -> None:
-        # A multi-token verification window is one merged cu_seqlens
-        # segment now, but M-RoPE positions for a verify window have
-        # never been supplied or validated on the mm paged path.  Until
-        # that lands (RFC #319 follow-up), spec decode on the mm paged
-        # path must fail fast instead of running the window with
-        # unvalidated positions.
+        # Only Qwen MTP has a qualified multimodal verification path.
         adapter = _MmAdapter()
         runner = _runner(adapter)
         state = RequestState(
@@ -617,13 +613,7 @@ class TestMmDecodeSegmentPositions:
         assert adapter.call_lm_calls == []
 
     def test_text_spec_decode_alongside_mm_prefill_is_rejected(self) -> None:
-        # Mixed batch: an mm prefill forces the runner onto
-        # ``_run_mm_paged_forward``, and a text-only request with
-        # ``num_query_tokens > 1`` rides along.  The window is one merged
-        # segment, but the mm path has never supplied or validated M-RoPE
-        # positions for a multi-token verify window (RFC #319 follow-up),
-        # so the guard must trigger on the segment regardless of
-        # mm-vs-text origin.
+        # The same restriction covers text verifies packed with an image.
         adapter = _MmAdapter()
         runner = _runner(adapter)
         features = [_feature("img-0", offset=0, length=2)]
@@ -1020,7 +1010,7 @@ class _HiddenStatesAdapter(_MmAdapter):
 
     def __init__(self) -> None:
         super().__init__()
-        self.hidden_calls: list[mx.array] = []
+        self.hidden_positions: list[mx.array] = []
 
     def text_model(self) -> Any:
         return SimpleNamespace(
@@ -1028,9 +1018,9 @@ class _HiddenStatesAdapter(_MmAdapter):
         )
 
     def call_lm_hidden_states(
-        self, input_ids: mx.array, *args: Any, **kwargs: Any
+        self, input_ids: mx.array, inputs_embeds, cache, position_ids, **kwargs
     ) -> mx.array:
-        self.hidden_calls.append(input_ids)
+        self.hidden_positions.append(position_ids)
         seq_len = input_ids.shape[1]
         rows = mx.arange(seq_len, dtype=mx.float32)[None, :, None]
         return mx.broadcast_to(rows, (1, seq_len, self.hidden_size))
@@ -1082,7 +1072,7 @@ class TestMmSelectiveLogits:
         )
 
         state = runner._execute_model_state
-        assert len(getattr(adapter, "hidden_calls", [])) == int(selects)
+        assert len(getattr(adapter, "hidden_positions", [])) == int(selects)
         assert len(adapter.call_lm_calls) == int(not selects)
         if selects:
             assert state.logits_cu_seqlens == [0, 1]
@@ -1090,3 +1080,48 @@ class TestMmSelectiveLogits:
         else:
             assert state.logits_cu_seqlens == [0, 4]
             assert state.logits.shape == (1, 4, adapter.vocab_size)
+
+    @pytest.mark.parametrize("prompt_logprobs", [False, True])
+    def test_qwen_mtp_keeps_all_hidden_rows_in_a_mixed_verify_window(
+        self, monkeypatch, prompt_logprobs
+    ):
+        monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", "1")
+        adapter = _HiddenStatesAdapter()
+        runner = _runner(adapter)
+        runner._selective_logits_supported = True
+        runner._drafter = QwenMTPProposer(
+            drafter=None, controller=runner._spec_decode_controller
+        )
+        state = RequestState(
+            token_ids=[1] * 6,
+            prompt_len=5,
+            sampling_params=SamplingParams(),
+            mrope_position_delta=-3,
+        )
+        runner._request_states["image"] = state
+        segment = PagedDecodeSegment(
+            req_id="image",
+            input_token_ids=(1, 2, 3),
+            start_row=0,
+            num_query_tokens=3,
+            draft_token_ids=(2, 3),
+            cache_start_pos=5,
+            block_ids=((0,),),
+        )
+        runner._spec_decode_controller.build_decode_segments.return_value = (segment,)
+        if prompt_logprobs:
+            runner._prompt_logprobs_tracker.register("text", 1)
+        text = _mm_prefill(
+            "text", token_ids=[7, 8, 9], prompt_len=3, full_prompt=[7, 8, 9]
+        )
+
+        runner._start_paged_forward(
+            MagicMock(), [text], [("image", state)], _scheduler_output()
+        )
+
+        forward = runner._execute_model_state
+        assert adapter.hidden_positions[0].tolist() == [[[2, 3, 4, 0, 1, 2]]] * 3
+        assert forward.target_hidden_states[:, 0].tolist() == list(range(6))
+        assert forward.logits[0, :, 0].tolist() == (
+            list(range(6)) if prompt_logprobs else [0, 1, 2, 5]
+        )
