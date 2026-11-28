@@ -22,9 +22,8 @@ request-local KV cache for it; nothing is scheduler-owned. An entry pairs token
 
 Verification, GDN state staging and rollback are the shared hybrid path
 (``gdn_spec``); drafts respect ``ProposeContext.draft_caps`` so align-mode
-prefix-cache checkpoints stay exact. On a prefix-cache hit the drafter cache
-starts at the first uncached token: acceptance can be lower until the drafter
-has seen enough context, output is unaffected.
+prefix-cache checkpoints stay exact. After a prefix-cache hit or late admission
+the drafter starts at the first available target row.
 """
 
 from __future__ import annotations
@@ -146,12 +145,14 @@ class QwenMTPProposer(NoOwnKVProposer):
         seeds: list[tuple[str, _RequestDraftState, mx.array]] = []
         touched: list[_RequestDraftState] = []
 
-        for (req_id, _), segment, sampled in zip(
+        for (req_id, request), segment, sampled in zip(
             ctx.decode_reqs, ctx.decode_segments, ctx.decode_token_ids, strict=True
         ):
-            state = self._states.get(req_id)
-            if state is None or not sampled:
+            if not sampled or not self._controller.can_draft_greedy(
+                req_id, request, sampled
+            ):
                 continue
+            state = self._state_at(req_id, segment.cache_start_pos, prefill=False)
             rows = hidden[
                 segment.start_row : segment.start_row + segment.num_query_tokens
             ]
@@ -168,19 +169,16 @@ class QwenMTPProposer(NoOwnKVProposer):
                 strict=True,
             )
         ):
-            state = self._states.get(prefill.req_id)
-            if state is None:
-                if not self._admit(prefill.req_id, ctx):
-                    continue
-                state = _RequestDraftState(
-                    cache=self._drafter.make_cache(),
-                    next_position=prefill.start_pos,
-                )
-                self._states[prefill.req_id] = state
+            final = mode != "intermediate"
+            request = ctx.request_states.get(prefill.req_id)
+            if request is None or not self._controller.can_draft_greedy(
+                prefill.req_id, request, (sampled_token,) if final else ()
+            ):
+                continue
+            state = self._state_at(prefill.req_id, prefill.start_pos, prefill=True)
             rows = hidden[
                 ctx.cu_seqlens[num_decode + i] : ctx.cu_seqlens[num_decode + i + 1]
             ]
-            final = mode != "intermediate"
             out = self._ingest_prompt_chunk(
                 state, prefill.token_ids, rows, int(sampled_token) if final else None
             )
@@ -210,13 +208,21 @@ class QwenMTPProposer(NoOwnKVProposer):
 
     # -- drafter cache ---------------------------------------------------------
 
-    def _admit(self, req_id: str, ctx: ProposeContext) -> bool:
-        # Requests that cannot be drafted at admission (sampling, penalties)
-        # never get a drafter cache.
-        request_state = ctx.request_states.get(req_id)
-        return request_state is not None and self._controller.can_draft_greedy(
-            req_id, request_state, ()
-        )
+    def _state_at(
+        self, req_id: str, position: int, *, prefill: bool
+    ) -> _RequestDraftState:
+        state = self._states.get(req_id)
+        if state is not None:
+            if prefill and state.pending_hidden is not None:
+                # The last hidden row awaits the first token of this chunk.
+                if position == state.next_position + 1:
+                    return state
+            elif not prefill and state.pending_hidden is None:
+                if position == state.next_position - state.round_appended:
+                    return state
+        state = _RequestDraftState(self._drafter.make_cache(), position)
+        self._states[req_id] = state
+        return state
 
     def _ingest_verified(
         self,
@@ -298,22 +304,9 @@ class QwenMTPProposer(NoOwnKVProposer):
         seeds: Sequence[tuple[str, _RequestDraftState, mx.array]],
         ctx: ProposeContext,
     ) -> dict[str, mx.array]:
-        eligible = {
-            req_id
-            for req_id, _ in self._controller.draft_eligible_requests(
-                ctx.decode_reqs,
-                ctx.decode_token_ids,
-                ctx.prefill_reqs,
-                ctx.prefill_token_ids,
-                ctx.prefill_result_modes,
-                ctx.request_states,
-            )
-        }
         rows: list[tuple[str, _RequestDraftState, int]] = []
         hidden: list[mx.array] = []
         for req_id, state, seed_hidden in seeds:
-            if req_id not in eligible:
-                continue
             k = self._draft_length(req_id, ctx)
             if k > 0:
                 rows.append((req_id, state, k))
