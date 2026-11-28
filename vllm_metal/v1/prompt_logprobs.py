@@ -7,13 +7,10 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 import mlx.core as mx
-import torch
 from vllm.v1.outputs import LogprobsTensors
 
-from vllm_metal.tensor_bridge import mlx_to_torch
-from vllm_metal.v1.sampling import Sampler
-
-_LOGITS_LOGPROBS_MODES = ("raw_logits", "processed_logits")
+from vllm_metal.v1.native_logprobs import gather_native_logprobs
+from vllm_metal.v1.sampling_policy import returns_logits
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,8 +157,7 @@ def gather_prompt_logprobs(
 ) -> LogprobsTensors:
     """Score ``target_token_ids`` against ``logits_rows`` (one row per target).
 
-    Uses vLLM's own ``Sampler.compute_logprobs`` / ``gather_logprobs`` so the
-    returned tensors carry the same layout as the sampled-token logprobs:
+    Scores on MLX and exports the gathered rows in vLLM's layout:
     column 0 is the target token, the rest are the top-``num_logprobs``
     alternatives, and ``selected_token_ranks`` holds the target's 1-based rank.
     """
@@ -170,12 +166,9 @@ def gather_prompt_logprobs(
             "logits_rows must be (num_targets, vocab); got shape "
             f"{tuple(logits_rows.shape)} for {len(target_token_ids)} targets"
         )
-    mx.eval(logits_rows)
-    logits = mlx_to_torch(logits_rows.astype(mx.float32), device="cpu")
-    scores = (
-        logits
-        if logprobs_mode in _LOGITS_LOGPROBS_MODES
-        else Sampler.compute_logprobs(logits)
-    )
-    targets = torch.tensor(target_token_ids, dtype=torch.int64)
-    return Sampler.gather_logprobs(scores, num_logprobs, targets)
+    return gather_native_logprobs(
+        logits_rows,
+        mx.array(target_token_ids, dtype=mx.int32),
+        num_logprobs,
+        logits_mode=returns_logits(logprobs_mode),
+    ).to_tensors()

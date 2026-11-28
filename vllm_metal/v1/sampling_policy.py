@@ -63,6 +63,11 @@ def needs_full_vocab_sample_logprobs(params: SamplingParams) -> bool:
     return params.logprobs == -1
 
 
+def returns_logits(logprobs_mode: str) -> bool:
+    """Whether this score mode returns logits without normalization."""
+    return logprobs_mode in ("raw_logits", "processed_logits")
+
+
 def has_token_constraints(params: SamplingParams) -> bool:
     """Whether the row carries hard token constraints.
 
@@ -90,6 +95,12 @@ def _allows_history_processors(
         (allow_constraints or not constrained)
         and (allow_penalties or not penalized)
         and (not (constrained or penalized) or not has_structured_outputs(params))
+    )
+
+
+def _allows_sample_logprobs(params: SamplingParams, allow_logprobs: bool) -> bool:
+    return not needs_sample_logprobs(params) or (
+        allow_logprobs and not needs_full_vocab_sample_logprobs(params)
     )
 
 
@@ -130,19 +141,20 @@ def params_allow_native_greedy(
     *,
     allow_constraints: bool = False,
     allow_penalties: bool = False,
+    allow_logprobs: bool = False,
 ) -> bool:
     """Whether MLX argmax matches *sampling_params_list* exactly.
 
-    Greedy temperature with no candidate filters (top-k/top-p), sample
-    logprobs, logit bias or pending min-tokens mask. Synchronous callers can
-    opt into token constraints and penalties with resolved histories.
-    ``None`` counts every row as having generated nothing.
+    Greedy temperature with no candidate filters (top-k/top-p), logit bias
+    or pending min-tokens mask. Synchronous callers can opt into score
+    gathering and history processors. ``None`` counts every row as having
+    generated nothing.
     """
     return not any_min_tokens_pending(sampling_params_list, output_lengths) and all(
         is_greedy_temperature(params)
         and params.top_k <= 0
         and params.top_p == 1.0
-        and not needs_sample_logprobs(params)
+        and _allows_sample_logprobs(params, allow_logprobs)
         and _allows_history_processors(params, allow_constraints, allow_penalties)
         and not has_logit_bias(params)
         for params in sampling_params_list
@@ -156,6 +168,7 @@ def params_allow_native_random(
     allow_seed: bool = False,
     allow_constraints: bool = False,
     allow_penalties: bool = False,
+    allow_logprobs: bool = False,
 ) -> bool:
     """Whether the native MLX sampler supports *sampling_params_list*.
 
@@ -163,16 +176,15 @@ def params_allow_native_random(
     mask is built per row, so rows may mix greedy (temperature 0) with
     random sampling and differ in top-k/top-p/min-p. Seeded rows need
     ``allow_seed`` (their keys are derived from the seed and output
-    position). Requests with sample logprobs, structured outputs, or
-    ``logit_bias`` stay on the torch path. Synchronous callers can opt into
-    token constraints and penalties with resolved histories. An empty batch
-    has no rows to draw for, so it is never eligible.
+    position). Requests with structured outputs or ``logit_bias`` stay on
+    the torch path. Synchronous callers can opt into score gathering and
+    history processors. An empty batch has no rows to draw for.
     """
     if not sampling_params_list:
         return False
     return not any_min_tokens_pending(sampling_params_list, output_lengths) and all(
         (allow_seed or params.seed is None)
-        and not needs_sample_logprobs(params)
+        and _allows_sample_logprobs(params, allow_logprobs)
         and not has_structured_outputs(params)
         and _allows_history_processors(params, allow_constraints, allow_penalties)
         and not has_logit_bias(params)
@@ -213,8 +225,7 @@ def unsupported_request_controls(
     length exists to make it pending-aware. The MPS sampler has no penalty
     processors, so all three penalties are listed; repetition_penalty is
     exempted with ``allow_repetition_penalty`` for Omni models, which apply
-    it in model code (the MLX backend instead serves penalized requests
-    through the torch fallback sampler).
+    it in model code.
     """
     controls = [
         name

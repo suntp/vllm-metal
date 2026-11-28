@@ -54,7 +54,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.outputs import DraftTokenIds, LogprobsLists, ModelRunnerOutput
 
 from vllm_metal.attention.context import clear_context, get_context, prepare_grouped
-from vllm_metal.v1.prompt_logprobs import _LOGITS_LOGPROBS_MODES
+from vllm_metal.v1.sampling_policy import returns_logits
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -449,7 +449,7 @@ class DiffusionGemmaRuntime:
         self._runner = runner
         self.settings = DiffusionSettings.from_vllm_config(runner.vllm_config)
         self._vocab_size = runner.model_config.get_vocab_size()
-        self._logits_mode = runner.model_config.logprobs_mode in _LOGITS_LOGPROBS_MODES
+        self._logits_mode = returns_logits(runner.model_config.logprobs_mode)
         self._requests: dict[str, _DiffusionRequest] = {}
 
     def _new_request(self, params: SamplingParams) -> _DiffusionRequest:

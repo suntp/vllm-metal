@@ -359,8 +359,9 @@ class TestSamplerDevicePolicy:
         [
             (None, False),
             ({"repetition_penalty": 1.1}, True),
-            ({"logprobs": 1}, False),
-            ({"logprob_token_ids": [1, 2]}, False),
+            ({"logprobs": 1}, True),
+            ({"logprob_token_ids": [1, 2]}, True),
+            ({"logprobs": 1, "logit_bias": {1: -1.0}}, False),
             ({"presence_penalty": 0.5}, True),
             ({"allowed_token_ids": [1, 2]}, True),
         ],
@@ -1176,7 +1177,7 @@ class TestV1SamplingBatch:
         assert metadata.max_num_logprobs is None
         assert metadata.logprob_token_ids == {0: [0, 3], 1: []}
 
-    def test_mixed_topk_logprobs_preserve_batch_tie_breaking(self) -> None:
+    def test_mixed_topk_logprobs_preserve_scores_across_ties(self) -> None:
         batch = SamplingBatch(
             [
                 SamplingParams(temperature=0.0, logprob_token_ids=[0]),
@@ -1201,7 +1202,9 @@ class TestV1SamplingBatch:
         assert result.logprobs is not None
         token_ids = result.logprobs.logprob_token_ids
         assert token_ids[0, 1:2].tolist() == [0]
-        assert token_ids[1, 1:3].tolist() == [5, 7]
+        assert token_ids[1, 1] == 5
+        assert token_ids[1, 2] in (3, 6, 7)
+        assert result.logprobs.logprobs[1, 1] > result.logprobs.logprobs[1, 2]
         assert token_ids[2, 1:6].tolist() == [7, 6, 5, 4, 3]
 
     def test_model_runner_output_keeps_logprobs_slot_alignment(self) -> None:
