@@ -10,8 +10,7 @@ import mlx.core as mx
 from vllm.v1.outputs import LogprobsTensors
 
 from vllm_metal.v1.native_logprobs import gather_native_logprobs
-
-_LOGITS_LOGPROBS_MODES = ("raw_logits", "processed_logits")
+from vllm_metal.v1.sampling_policy import returns_logits
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,8 +157,7 @@ def gather_prompt_logprobs(
 ) -> LogprobsTensors:
     """Score ``target_token_ids`` against ``logits_rows`` (one row per target).
 
-    Scores on MLX and exports only the gathered result. The tensors carry
-    the same layout as the sampled-token logprobs:
+    Scores on MLX and exports the gathered rows in vLLM's layout:
     column 0 is the target token, the rest are the top-``num_logprobs``
     alternatives, and ``selected_token_ranks`` holds the target's 1-based rank.
     """
@@ -172,5 +170,5 @@ def gather_prompt_logprobs(
         logits_rows,
         mx.array(target_token_ids, dtype=mx.int32),
         num_logprobs,
-        logits_mode=logprobs_mode in _LOGITS_LOGPROBS_MODES,
+        logits_mode=returns_logits(logprobs_mode),
     ).to_tensors()

@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -39,10 +38,7 @@ from vllm_metal.attention.impls.sdpa_wrapper import SDPAPagedAttentionWrapper
 from vllm_metal.attention.runtime.sdpa import (
     SDPAPagedAttentionRuntime,
 )
-from vllm_metal.config import (
-    PAGED_ATTENTION_MIN_BLOCKS,
-    MetalConfig,
-)
+from vllm_metal.config import MetalConfig
 from vllm_metal.metal import get_ops
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
 from vllm_metal.v1.model_adapter import DefaultModelAdapter
@@ -237,124 +233,6 @@ def merged_full_attention_config() -> tuple[KVCacheConfig, tuple[str, ...]]:
     return config_from_vllm_groups(groups, 3), names
 
 
-class TestMetalPagedKVCachePerLayer:
-    """MetalPagedKVCache with heterogeneous per-layer shapes."""
-
-    def test_heterogeneous_shapes_allocate_correctly(self) -> None:
-        """Each layer's cache tensor matches its requested shape."""
-        kv_heads = [16, 4]
-        head_dims = [256, 512]
-        num_blocks = 4
-        block_size = 16
-
-        cache = MetalPagedKVCache(
-            num_layers=2,
-            num_kv_heads=kv_heads[0],
-            head_dim=head_dims[0],
-            num_blocks=num_blocks,
-            block_size=block_size,
-            dtype=mx.bfloat16,
-            kv_heads_per_layer=kv_heads,
-            head_dim_per_layer=head_dims,
-        )
-
-        assert cache.key_caches[0].shape == (num_blocks, block_size, 16, 256)
-        assert cache.key_caches[1].shape == (num_blocks, block_size, 4, 512)
-        assert cache.value_caches[0].shape == (num_blocks, block_size, 16, 256)
-        assert cache.value_caches[1].shape == (num_blocks, block_size, 4, 512)
-
-    def test_uniform_per_layer_matches_scalar(self) -> None:
-        """Uniform per-layer lists produce identical shapes to scalar params."""
-        num_layers = 4
-        num_kv_heads = 8
-        head_dim = 128
-        num_blocks = 2
-        block_size = 16
-
-        scalar_cache = MetalPagedKVCache(
-            num_layers=num_layers,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            num_blocks=num_blocks,
-            block_size=block_size,
-        )
-        per_layer_cache = MetalPagedKVCache(
-            num_layers=num_layers,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            num_blocks=num_blocks,
-            block_size=block_size,
-            kv_heads_per_layer=[num_kv_heads] * num_layers,
-            head_dim_per_layer=[head_dim] * num_layers,
-        )
-
-        for i in range(num_layers):
-            assert (
-                scalar_cache.key_caches[i].shape == per_layer_cache.key_caches[i].shape
-            )
-
-    def test_length_mismatch_raises(self) -> None:
-        """Mismatched list lengths are caught early."""
-        with pytest.raises(ValueError, match="kv_heads_per_layer length"):
-            MetalPagedKVCache(
-                num_layers=2,
-                num_kv_heads=8,
-                head_dim=128,
-                num_blocks=1,
-                block_size=16,
-                kv_heads_per_layer=[8, 8, 8],
-            )
-
-    def test_heterogeneous_dense_log_reports_per_layer_bytes(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """E4B-shaped unique layers log 2.8 MB, not the old all-512 4.7 MB."""
-        head_dims = [512 if (index + 1) % 6 == 0 else 256 for index in range(24)]
-        with caplog.at_level(logging.INFO):
-            MetalPagedKVCache(
-                num_layers=24,
-                num_kv_heads=2,
-                head_dim=512,
-                num_blocks=3,
-                block_size=16,
-                dtype=mx.bfloat16,
-                kv_heads_per_layer=[2] * 24,
-                head_dim_per_layer=head_dims,
-            )
-        messages = [
-            record.message
-            for record in caplog.records
-            if record.message.startswith("KV cache:")
-        ]
-        assert len(messages) == 1, messages
-        assert "KV cache: 2.8 MB" in messages[0]
-        assert "4.7 MB" not in messages[0]
-
-
-class TestSDPARuntimePerLayer:
-    """SDPAPagedAttentionRuntime passes per-layer shapes to cache."""
-
-    def test_backend_propagates_per_layer_shapes(self) -> None:
-        kv_heads = [16, 4]
-        head_dims = [256, 512]
-
-        backend = SDPAPagedAttentionRuntime(
-            num_layers=2,
-            num_kv_heads=kv_heads[0],
-            head_dim=head_dims[0],
-            block_size=16,
-            dtype=mx.bfloat16,
-            kv_heads_per_layer=kv_heads,
-            head_dim_per_layer=head_dims,
-        )
-        backend.initialize(num_blocks=4)
-
-        cache = backend._cache
-        assert cache is not None
-        assert cache.key_caches[0].shape[-2:] == (16, 256)
-        assert cache.key_caches[1].shape[-2:] == (4, 512)
-
-
 class TestCachePolicyPerLayerBytes:
     """Block-size-bytes and one-sequence-bytes with per-layer shapes."""
 
@@ -449,7 +327,7 @@ class TestCachePolicyPerLayerBytes:
         with pytest.raises(
             NotImplementedError, match="Per-layer KV shapes with hybrid models"
         ):
-            runner.build_paged_attention_runtime(block_size=self._BLOCK_SIZE)
+            runner.validate_paged_attention_support()
 
     def test_turboquant_per_layer_shapes_raise_early(
         self, monkeypatch: pytest.MonkeyPatch
@@ -572,13 +450,7 @@ class TestUpstreamAttentionStorage:
             kv_cache_dtype=mx.bfloat16,
             cache_config=SimpleNamespace(block_size=32),
         )
-        backend = SDPAPagedAttentionRuntime(
-            num_layers=4,
-            num_kv_heads=4,
-            head_dim=512,
-            block_size=32,
-            dtype=mx.bfloat16,
-        )
+        backend = SDPAPagedAttentionRuntime(block_size=32, dtype=mx.bfloat16)
         monkeypatch.setattr(
             runner._cache_policy, "_build_sdpa_backend", lambda **_: backend
         )
@@ -612,7 +484,7 @@ class TestUpstreamAttentionStorage:
             kv_heads_per_layer=[16, 16, 4, 4],
             head_dim_per_layer=[256, 256, 512, 512],
         )
-        backend = runner.build_paged_attention_runtime(block_size=16)
+        backend = runner._cache_policy._build_sdpa_backend(block_size=16)
         monkeypatch.setattr(
             runner._cache_policy, "_build_sdpa_backend", lambda **_: backend
         )
@@ -743,10 +615,11 @@ class TestUpstreamAttentionStorage:
         planner = WorkerCachePlanner(worker)
         monkeypatch.setattr(runner, "profile_run", lambda: 0)
         monkeypatch.setattr(planner, "get_model_memory_usage", lambda: 0)
+        budget_blocks = 16
         monkeypatch.setattr(
             planner,
             "_metal_limit_bytes",
-            lambda: dense_block_bytes * PAGED_ATTENTION_MIN_BLOCKS,
+            lambda: dense_block_bytes * budget_blocks,
         )
 
         available = planner.determine_available_memory()

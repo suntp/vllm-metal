@@ -45,13 +45,12 @@ from vllm.v1.outputs import (
     LogprobsTensors,
     ModelRunnerOutput,
 )
-from vllm.v1.sample.logits_processor import LOGITSPROCS_GROUP
-from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu.kv_connector import (
     NO_OP_KV_CONNECTOR,
     ActiveKVConnector,
     KVConnector,
 )
+from vllm.v1.worker.gpu.sample.logits_processor.loader import LOGITSPROCS_GROUP
 
 from vllm_metal import envs
 from vllm_metal.attention.context import (
@@ -125,6 +124,7 @@ from vllm_metal.v1.proposer import (
     MetalProposer,
     ProposeContext,
 )
+from vllm_metal.v1.sampling import Sampler
 from vllm_metal.v1.sampling_batch import (
     SamplingBatch,
     create_request_generator,
@@ -132,6 +132,10 @@ from vllm_metal.v1.sampling_batch import (
     sample_decode_tokens,
     sample_from_logits,
     sample_prefill_tokens,
+)
+from vllm_metal.v1.sampling_policy import (
+    params_allow_native_greedy,
+    params_allow_native_random,
 )
 from vllm_metal.v1.spec_decode import (
     PagedDecodeSegment,
@@ -149,7 +153,6 @@ logger = init_logger(__name__)
 
 SchedulerMemoryReportingMode: TypeAlias = Literal[
     "stt_nominal",
-    "paged_attention_capacity",
     "paged_attention_layout_budget",
     "pooling_no_kv",
 ]
@@ -279,7 +282,6 @@ class _ExecutionBatch:
         """Build ``ModelRunnerOutput`` from this completed batch."""
         return ModelRunnerOutput(
             req_ids=self.req_ids,
-            req_id_to_index=self.req_id_to_index,
             sampled_token_ids=self.sampled_tokens,
             logprobs=self.merged_logprobs(),
             prompt_logprobs_dict=dict(self.prompt_logprobs_dict),
@@ -1018,8 +1020,7 @@ class MetalModelRunner:
 
         Called by the worker after ``initialize_kv_cache`` when a KV connector
         is configured. Only the SDPA and MLA runtimes' ``KVCacheStorage`` is
-        registered. Hybrid and count-based (draft model) caches have no layout
-        the connector can address.
+        registered. Hybrid caches have no layout the connector can address.
         """
         from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
         from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
@@ -1304,12 +1305,6 @@ class MetalModelRunner:
             return None
         return mx.arange(rows - max_sampled_rows, rows, dtype=mx.int32)
 
-    def build_paged_attention_runtime(
-        self, *, block_size: int
-    ) -> PagedAttentionRuntime:
-        """Build the paged-attention backend for the loaded model."""
-        return self._cache_policy.build_paged_attention_runtime(block_size=block_size)
-
     @property
     def paged_attention_runtime(self) -> PagedAttentionRuntime | None:
         """Return the installed paged-attention backend, if any."""
@@ -1369,7 +1364,7 @@ class MetalModelRunner:
             block_size=block_size,
         )
 
-    def install_drafter(self, *, num_blocks: int, block_size: int) -> None:
+    def install_drafter(self) -> None:
         """Install or bind the configured drafter after cache planning."""
         spec = self.vllm_config.speculative_config
         if spec is None:
@@ -1387,17 +1382,13 @@ class MetalModelRunner:
                     f"{spec.method} was not loaded and bound to scheduler KV"
                 )
         elif spec.uses_draft_model():
-            drafter = cast(DraftModelProposer, self._drafter)
-            drafter.bind_paged_cache(
-                num_blocks=num_blocks,
-                block_size=block_size,
-                dtype=cast(mx.Dtype, self.kv_cache_dtype),
-            )
+            # Bound to the shared KV storage by _initialize_upstream_storage,
+            # immediately before this call.
+            pass
         elif spec.method == "ngram":
             from vllm_metal.v1.ngram_proposer import NgramProposer
 
-            # N-gram drafts from token history alone — no model, no KV cache, so
-            # num_blocks/block_size are unused here.
+            # N-gram drafts from token history alone.
             self._drafter = NgramProposer.build(
                 vllm_config=self.vllm_config,
                 controller=self._spec_decode_controller,
@@ -1590,7 +1581,11 @@ class MetalModelRunner:
             self._paged_group_block_sizes,
             merge_verify_windows=self.merge_verify_windows,
             tq_prefill_workspace_bytes=self.tq_prefill_workspace_bytes,
-            all_rows_consumed=needs_prompt_logprob_rows,
+            # LoRA routing covers every packed row, so pruning rows (Gemma 4
+            # YOCO) would leave the adapter layers with fewer rows than routes.
+            all_rows_consumed=(
+                needs_prompt_logprob_rows or self._lora.step_uses_adapter
+            ),
         )
         try:
             ctx = get_context()
@@ -1637,7 +1632,7 @@ class MetalModelRunner:
                 )
 
             # ---- forward (lazy graph + async submit) ----
-            offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
+            offset_caches = [OffsetCache(0, index=i) for i in range(self.num_layers)]
             # On a pipeline-eligible step with a pending deferred sample, the
             # decode inputs are the previous step's lazy tokens (device
             # gather) — the host list still ends in placeholders there.
@@ -1660,6 +1655,18 @@ class MetalModelRunner:
                     DecoderPoolingBackend,
                     self._pooling_backend,
                 )
+                # A checkpoint whose model config is not causal (d3's
+                # noncausal_full_attention) scores the prompt with the whole
+                # input in view: one bidirectional block per prefill segment.
+                # Linear (GDN) layers keep their recurrence, so only
+                # full-attention layers take the block.
+                hf_config = getattr(self.model_config, "hf_config", None)
+                if ctx is not None and not getattr(hf_config, "is_causal", True):
+                    ctx.bidi_layer_kinds = frozenset({"full"})
+                    ctx.segment_bidi_ranges = [
+                        [(pr.start_pos, pr.start_pos + len(pr.token_ids))]
+                        for pr in prefill_reqs
+                    ]
                 pooling_hidden_states = decoder_pooling_backend.forward_packed(
                     input_ids,
                     offset_caches,
@@ -1854,14 +1861,12 @@ class MetalModelRunner:
         sampling = SamplingShape(
             native_greedy=(
                 not states_missing
-                and SamplingBatch.params_allow_native_greedy(
-                    decode_params, decode_output_lengths
-                )
+                and params_allow_native_greedy(decode_params, decode_output_lengths)
             ),
             native_random=(
                 self._native_sampling_enabled
                 and not states_missing
-                and SamplingBatch.params_allow_native_random(
+                and params_allow_native_random(
                     decode_params, decode_output_lengths, allow_seed=True
                 )
             ),
@@ -1993,11 +1998,11 @@ class MetalModelRunner:
 
         # ---- sample tokens ----
         vocab_size = self._vocab_size
+        # Draft rows use the greedy verifier below. Only plain decode rows
+        # and completed prefills can use the native sampling key.
         next_native_rng_key = (
             self._next_native_sample_key
             if self._native_sampling_enabled
-            and self.vllm_config.speculative_config is None
-            and self._drafter is None
             and grammar_output is None
             and not scheduler_output.has_structured_output_requests
             else None
@@ -2791,10 +2796,6 @@ class MetalModelRunner:
 
         mrope_position_delta = None
         if req_id in self._awaiting_readmission:
-            if new_req.prefill_token_ids is None:
-                raise RuntimeError(
-                    f"Readmitted request {req_id!r} is missing prefill_token_ids."
-                )
             # Preemption retains the old state for in-flight sampling. Only
             # readmission replaces its history with the scheduler's snapshot.
             preempted = self._request_states[req_id]
@@ -2806,11 +2807,8 @@ class MetalModelRunner:
         else:
             generator = create_request_generator(sampling_params)
 
-        token_ids = new_req.prefill_token_ids
-        if token_ids is None:
-            token_ids = new_req.prompt_token_ids or []
         state = RequestState(
-            token_ids=list(token_ids),
+            token_ids=list(new_req.prefill_token_ids),
             prompt_len=new_req.prompt_len,
             sampling_params=sampling_params,
             pooling_params=new_req.pooling_params,

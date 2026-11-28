@@ -16,11 +16,12 @@ from mlx_vlm.utils import load_model as mlx_vlm_load_model
 from vllm.logger import init_logger
 
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
+from vllm_metal.attention.patching import find_num_loops
 from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
 from vllm_metal.compat import (
     apply_compat_patches,
-    embedding_load_scope,
     ensure_lfm2_vl_torch_outputs,
+    headless_load_scope,
 )
 from vllm_metal.compiled_mlp import CompiledMLPBlocks
 from vllm_metal.config import get_config
@@ -30,6 +31,7 @@ from vllm_metal.multimodal.gemma4 import Gemma4VisionSidecar
 from vllm_metal.quant.awq_loader import AWQQuantLoader
 from vllm_metal.tensor_bridge import TORCH_TO_MLX_DTYPE
 from vllm_metal.utils import get_model_download_path, resolve_mlx_lm_model_path
+from vllm_metal.v1.cache_policy import uses_metal_offloading
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
 from vllm_metal.v1.mlx_lm_paths import (
     mlx_lm_compatible_model_path as _mlx_lm_compatible_model_path,
@@ -39,6 +41,7 @@ from vllm_metal.v1.model_adapter import ModelAdapter
 from vllm_metal.v1.pooling.backends.decoder.factory import (
     build_decoder_pooling_backend,
 )
+from vllm_metal.v1.pooling.backends.decoder.models.d3 import D3_ARCH
 from vllm_metal.v1.pooling.backends.decoder.runtime import (
     is_embed_pooling_architecture,
 )
@@ -184,6 +187,8 @@ class ModelLifecycle:
     ) -> None:
         self._runner = runner
         self._model_adapter = model_adapter
+        # Set by ``_load_mlx_lm_text_model``; ``None`` for GGUF/AWQ/VLM loads.
+        self._resolved_model_path: Path | None = None
 
     def load(self) -> None:
         """Load the configured model and install runner runtime state."""
@@ -194,17 +199,30 @@ class ModelLifecycle:
             return
 
         request = GenerationLoadRequest.from_runner(self._runner, self._model_adapter)
-        # The headless lm_head shim is embedding-only: embedding pooling never
-        # calls logits. Pooling classify (Qwen3 reranker) reads lm_head, and
-        # generation loads must fail strict load on a headless checkpoint
-        # instead of the first forward pass.
-        with embedding_load_scope(
+        # Poolers that score hidden states never read lm_head: embeddings, and
+        # d3's code readout, whose larger checkpoints ship no head tensor at
+        # all. Pooling classify (Qwen3 reranker) reads lm_head logits, and
+        # generation needs the head, so those loads keep failing strict load on
+        # a headless checkpoint instead of the first forward pass.
+        architectures = getattr(request.hf_config, "architectures", None) or ()
+        with headless_load_scope(
             enabled=self._runner._is_pooling
-            and is_embed_pooling_architecture(
-                getattr(request.hf_config, "architectures", None) or ()
+            and (
+                is_embed_pooling_architecture(architectures) or D3_ARCH in architectures
             )
         ):
             loaded_model = self._load_generation(request)
+
+        # The uni executor loads the weights before constructing its disk tiers.
+        # A Hub GGUF selector has resolved to the exact file used by the loader.
+        config = self._runner.vllm_config
+        if uses_metal_offloading(config):
+            assert config.kv_transfer_config is not None
+            extra = config.kv_transfer_config.kv_connector_extra_config
+            for tier in extra.get("secondary_tiers") or ():
+                tier["gguf_weights_path"] = (
+                    request.gguf_source.weights_path if request.gguf_source else None
+                )
 
         self._install_generation_model(loaded_model, request)
 
@@ -221,6 +239,7 @@ class ModelLifecycle:
         runner._pooling_backend = build_decoder_pooling_backend(
             runner._forward_model,
             runner.model_config,
+            checkpoint_dir=self._resolved_model_path,
         )
 
     def install_decode_dispatch(self) -> None:
@@ -239,9 +258,11 @@ class ModelLifecycle:
     def resolve_model_dims(self) -> None:
         """Resolve loaded model args into runner attention/cache dimensions."""
         args = self._runner.model_args
-        default_head_dim = self._install_runner_attention_dims(args)
+        num_loops = find_num_loops(self._runner.model)
+        default_head_dim = self._install_runner_attention_dims(args, num_loops)
         self._install_yoco_cache_mapping(args)
         self._install_per_layer_attention_metadata(args, default_head_dim)
+        self._reject_unsupported_looped_configs(num_loops)
         self._reject_pipeline_parallel_with_per_layer_metadata()
         self._install_hybrid_state_plan(args)
 
@@ -380,7 +401,12 @@ class ModelLifecycle:
         awq_loader = (
             None
             if is_gguf or use_mlx_vlm
-            else AWQQuantLoader.for_model(model_name, revision=revision)
+            else AWQQuantLoader.for_model(
+                model_name,
+                revision=revision,
+                token=model_config.hf_token,
+                cache_dir=self._runner.vllm_config.load_config.download_dir,
+            )
         )
 
         expert_cache_bytes = get_config().moe_expert_cache_bytes
@@ -410,8 +436,9 @@ class ModelLifecycle:
             model = self._load_awq_text_model(
                 model_name,
                 awq_loader,
-                target_dtype,
                 revision=revision,
+                token=model_config.hf_token,
+                cache_dir=self._runner.vllm_config.load_config.download_dir,
             )
 
         else:
@@ -419,11 +446,13 @@ class ModelLifecycle:
             model = self._load_mlx_lm_text_model(
                 model_name,
                 lazy=lazy_weights or bool(expert_cache_bytes),
+                token=model_config.hf_token,
+                cache_dir=self._runner.vllm_config.load_config.download_dir,
                 revision=revision,
             )
             if expert_cache_bytes:
                 self._runner._expert_store = ExpertStore.install(
-                    model, model_name, revision, expert_cache_bytes
+                    model, str(self._resolved_model_path), revision, expert_cache_bytes
                 )
 
         loaded_from = (
@@ -456,15 +485,17 @@ class ModelLifecycle:
         self,
         model_name: str,
         awq_loader: AWQQuantLoader,
-        target_dtype: Any,
         *,
         revision: str | None = None,
+        token: str | bool | None = None,
+        cache_dir: str | None = None,
     ) -> Any:
         with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
             return awq_loader.load(
                 str(compatible_model_name),
-                target_dtype=target_dtype,
                 revision=revision,
+                token=token,
+                cache_dir=cache_dir,
             )
 
     def _load_mlx_lm_text_model(
@@ -473,12 +504,19 @@ class ModelLifecycle:
         *,
         lazy: bool = False,
         revision: str | None = None,
+        token: str | bool | None = None,
+        cache_dir: str | None = None,
     ) -> Any:
-        with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
-            model_path = resolve_mlx_lm_model_path(
-                str(compatible_model_name), revision=revision
-            )
-            model, _ = mlx_lm_load_model(model_path, lazy=lazy)
+        model_path = resolve_mlx_lm_model_path(
+            model_name, revision=revision, token=token, cache_dir=cache_dir
+        )
+        # Pooling backends read checkpoint files next to the weights
+        # (d3's readout), so remember the directory the loader actually used:
+        # re-resolving it from the config string needs the Hub and rejects any
+        # snapshot that is missing a file the loader never asked for.
+        self._resolved_model_path = model_path
+        with _mlx_lm_compatible_model_path(model_path) as compatible_model_name:
+            model, _ = mlx_lm_load_model(compatible_model_name, lazy=lazy)
         return model
 
     def _install_generation_model(
@@ -510,9 +548,12 @@ class ModelLifecycle:
         runner._vocab_size = int(loaded_model.model_args["vocab_size"])
         logger.debug("Model args: %s", loaded_model.model_args)
 
-    def _install_runner_attention_dims(self, args: dict[str, Any]) -> int | None:
+    def _install_runner_attention_dims(
+        self, args: dict[str, Any], num_loops: int = 1
+    ) -> int | None:
         """Install runner-wide attention dims and return the default head_dim."""
-        num_layers = args.get("num_hidden_layers") or args.get("n_layers")
+        base_num_layers = args.get("num_hidden_layers") or args.get("n_layers")
+        num_layers = int(base_num_layers) * num_loops if base_num_layers else None
         num_attention_heads = args.get("num_attention_heads")
         num_kv_heads = (
             args.get("num_key_value_heads")
@@ -550,6 +591,27 @@ class ModelLifecycle:
                 args.get("qk_rope_head_dim", MLA_DEFAULT_QK_ROPE_HEAD_DIM)
             )
         return int(default_head_dim) if default_head_dim is not None else None
+
+    def _reject_unsupported_looped_configs(self, num_loops: int) -> None:
+        if num_loops <= 1:
+            return
+        runner = self._runner
+        if runner.pp is not None and runner.pp.size > 1:
+            raise NotImplementedError(
+                "Pipeline parallelism does not support weight-tied looped models "
+                f"(num_loops={num_loops})."
+            )
+        if (
+            runner._yoco_cache_mapping is not None
+            or runner.is_hybrid
+            or runner.is_mla
+            or runner.kv_heads_per_layer is not None
+            or runner.head_dim_per_layer is not None
+        ):
+            raise NotImplementedError(
+                "Weight-tied looped models (num_loops > 1) are supported only "
+                "for uniform SDPA attention."
+            )
 
     def _install_yoco_cache_mapping(self, args: dict[str, Any]) -> None:
         """Install YOCO layer-to-cache mapping when the model uses shared KV."""

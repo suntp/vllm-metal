@@ -31,6 +31,12 @@ from vllm_metal.v1.model_lifecycle import (  # noqa: E402
     LoadedGenerationModel,
     ModelLifecycle,
 )
+from vllm_metal.v1.pooling.backends.decoder.factory import (  # noqa: E402
+    build_decoder_pooling_backend,
+)
+from vllm_metal.v1.pooling.backends.decoder.models.d3 import (  # noqa: E402
+    D3ReadoutPooler,
+)
 from vllm_metal.v1.pooling.backends.decoder.models.qwen3 import (  # noqa: E402
     Qwen3RerankerPooler,
 )
@@ -316,15 +322,7 @@ def _make_runner(
         model_config=model_config or _pooling_model_config(),
         tokenizer=tokenizer,
         _paged_attention_runtime=(
-            SDPAPagedAttentionRuntime(
-                num_layers=1,
-                num_kv_heads=1,
-                head_dim=4,
-                block_size=4,
-                dtype=mx.float32,
-            )
-            if paged
-            else None
+            SDPAPagedAttentionRuntime(block_size=4, dtype=mx.float32) if paged else None
         ),
         _paged_block_size=4,
         num_layers=1,
@@ -347,6 +345,7 @@ def _new_req(
     return NewRequestData(
         req_id=req_id,
         prompt_token_ids=token_ids,
+        prefill_token_ids=token_ids,
         mm_features=[],
         sampling_params=None,
         pooling_params=pooling_params or _pooling_params(task),
@@ -360,9 +359,7 @@ def _new_req(
 def _cached_req_data(req_ids: list[str], num_computed_tokens: list[int]):
     return SimpleNamespace(
         req_ids=req_ids,
-        resumed_req_ids=set(),
         new_token_ids=[],
-        all_token_ids={},
         new_block_ids=[None] * len(req_ids),
         num_computed_tokens=num_computed_tokens,
         num_output_tokens=[0] * len(req_ids),
@@ -398,7 +395,6 @@ def _scheduler_output(
         kv_cache_block_copies=None,
         new_block_ids_to_zero=None,
         scheduled_encoder_inputs={},
-        num_common_prefix_blocks=[],
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
         preempted_req_ids=set(),
@@ -1670,3 +1666,162 @@ class TestMetalPoolingProfileWarmup:
         assert sequence_model.calls == 1
         runner._extract_logits.assert_not_called()
         set_cache_limit.assert_called_once_with(80)
+
+
+class TestD3ReadoutPooler:
+    def _model_config(self, readout_dir, **overrides):
+        readout = mx.array(
+            [[1.0, 0.0], [0.0, 2.0], [0.5, 0.5]],
+            dtype=mx.float32,
+        )
+        mx.save_safetensors(
+            str(readout_dir / "readout.safetensors"), {"weight": readout}
+        )
+        hf_config = _hf_config(
+            architectures=["D3ForSequenceClassification"],
+            decision_config={
+                "codes": ["A", "B", "C"],
+                "attention_mode": "noncausal_full_attention",
+            },
+        )
+        values = {
+            "model": str(readout_dir),
+            "hf_config": hf_config,
+            "pooler_config": _pooler_config(task="classify", use_activation=False),
+        }
+        values.update(overrides)
+        return _pooling_model_config(**values)
+
+    def test_scores_last_token_against_the_readout(self, tmp_path) -> None:
+        pooler = D3ReadoutPooler(self._model_config(tmp_path))
+        span = DecoderPoolingSpan(
+            start_row=0,
+            num_tokens=2,
+            is_complete=True,
+            pooling_params=_pooling_params(task="classify", use_activation=False),
+        )
+
+        assert pooler.is_supported()
+        logits = pooler.pool_one(
+            mx.array([[[9.0, 9.0], [1.0, 2.0]]], dtype=mx.float32),
+            span,
+        )
+
+        assert logits.tolist() == pytest.approx([1.0, 4.0, 1.5])
+
+    @pytest.mark.parametrize("use_activation", [False, True])
+    def test_use_activation_follows_upstream_classify(
+        self, tmp_path, use_activation
+    ) -> None:
+        """/v1/systemone sends False and softmaxes over one question's codes;
+        True is upstream PoolerClassify over the whole code space."""
+        config = self._model_config(tmp_path)
+        config.pooler_config.logit_mean = 1.0
+        config.pooler_config.logit_sigma = 2.0
+        pooler = D3ReadoutPooler(config)
+        span = DecoderPoolingSpan(
+            start_row=0,
+            num_tokens=2,
+            is_complete=True,
+            pooling_params=_pooling_params(
+                task="classify", use_activation=use_activation
+            ),
+        )
+
+        logits = pooler.pool_one(
+            mx.array([[[9.0, 9.0], [1.0, 2.0]]], dtype=mx.float32),
+            span,
+        )
+
+        if use_activation:
+            assert logits.tolist() == pytest.approx(
+                mx.softmax(mx.array([0.0, 1.5, 0.25])).tolist()
+            )
+            assert float(logits.sum()) == pytest.approx(1.0, abs=1e-6)
+        else:
+            assert logits.tolist() == pytest.approx([0.0, 1.5, 0.25])
+
+    def test_pooler_config_activation_applies_when_params_are_silent(
+        self, tmp_path
+    ) -> None:
+        config = self._model_config(
+            tmp_path, pooler_config=_pooler_config(task="classify", use_activation=True)
+        )
+        span = DecoderPoolingSpan(
+            start_row=0,
+            num_tokens=2,
+            is_complete=True,
+            pooling_params=_pooling_params(task="classify"),
+        )
+
+        logits = D3ReadoutPooler(config).pool_one(
+            mx.array([[[9.0, 9.0], [1.0, 2.0]]], dtype=mx.float32),
+            span,
+        )
+
+        assert float(logits.sum()) == pytest.approx(1.0, abs=1e-6)
+
+    def test_checkpoint_dir_skips_hub_resolution(self, tmp_path, monkeypatch) -> None:
+        """The loader already resolved the dir; the pooler must not ask the Hub."""
+        config = self._model_config(tmp_path, model="vllm-sr/d3-nano")
+
+        def _refuse(*args, **kwargs):
+            raise AssertionError("checkpoint_dir must skip Hub resolution")
+
+        monkeypatch.setattr(
+            "vllm_metal.v1.model_adapter._local_checkpoint_dir", _refuse
+        )
+
+        assert D3ReadoutPooler(config, checkpoint_dir=tmp_path).is_supported()
+
+    def test_unresolvable_checkpoint_dir_is_unsupported(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        config = self._model_config(tmp_path, model="vllm-sr/d3-nano")
+        monkeypatch.setattr(
+            "vllm_metal.v1.model_adapter._local_checkpoint_dir", lambda *a, **k: None
+        )
+
+        assert not D3ReadoutPooler(config).is_supported()
+
+    def test_missing_readout_is_unsupported(self, tmp_path) -> None:
+        config = self._model_config(tmp_path)
+        (tmp_path / "readout.safetensors").unlink()
+
+        assert not D3ReadoutPooler(config).is_supported()
+
+    def test_factory_refuses_a_d3_checkpoint_without_its_readout(
+        self, tmp_path
+    ) -> None:
+        """A server that starts without the readout answers 501 on every
+        decision request; the load must fail instead."""
+        config = self._model_config(tmp_path)
+        (tmp_path / "readout.safetensors").unlink()
+
+        with pytest.raises(ValueError, match="readout.safetensors"):
+            build_decoder_pooling_backend(_PoolingModel(), config)
+
+    def test_other_architectures_leave_d3_disabled(self, tmp_path) -> None:
+        config = self._model_config(
+            tmp_path,
+            hf_config=_hf_config(architectures=["Qwen3ForCausalLM"]),
+        )
+
+        assert not D3ReadoutPooler(config).is_supported()
+
+    def test_non_d3_pooling_never_reads_the_readout(self, tmp_path, monkeypatch):
+        """A Qwen3 pooling load must not touch the readout: the d3 file reader
+        only runs once the checkpoint declares the d3 contract."""
+
+        def _refuse(*args, **kwargs):
+            raise AssertionError("readout read for a non-d3 checkpoint")
+
+        config = _pooling_model_config(
+            model=str(tmp_path),
+            hf_config=_hf_config(architectures=["Qwen3ForCausalLM"]),
+        )
+        monkeypatch.setattr(D3ReadoutPooler, "_readout", _refuse)
+
+        backend = build_decoder_pooling_backend(_PoolingModel(), config)
+
+        assert backend.supported_tasks() == ("embed",)

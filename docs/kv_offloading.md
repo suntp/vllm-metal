@@ -35,15 +35,20 @@ Keys for an `fs` tier:
 | `max_size_gib` | 10% of the volume | Disk cap in GiB. `0` means no cap. If unset and the disk has less free space than 10% of the volume, startup fails. |
 
 Without `--kv-offloading-size`, the pool defaults to the KV of two
-`--max-model-len` requests, rounded up to whole blocks. A full pool does not lose
-a block, the scheduler retries the store on the next step; two requests is the
-smallest pool with no retries at concurrency 4 in the #1037 measurements. The
-default is capped at a quarter of the KV budget (after weights and
-activations), or one host chunk if that is larger, and leaves room for one
-`--max-model-len` request. With `--max-model-len -1`,
+`--max-model-len` requests, rounded up to whole blocks. A store that does not fit
+is retried on the next step; two requests is the smallest pool with no retries
+at concurrency 4 in the #1037 measurements. The default is capped at a quarter
+of the KV budget (after weights and activations), or one host chunk if that is
+larger, and leaves room for one `--max-model-len` request. With `--max-model-len -1`,
 `--num-gpu-blocks-override` or `--kv-cache-memory-bytes` no request is
 reserved. The startup log says when the pool is changed. Pass the flag to size
 it yourself.
+
+A pool smaller than one `--max-model-len` request logs a warning at startup
+with the size to use. The default pool can be that small when the KV budget
+caps it. Prompts longer than the pool may not be stored, and with a disk tier
+a request that restores a longer prompt can stall. Related:
+[vllm#62931](https://github.com/vllm-project/vllm/issues/62931).
 
 By default the host pool comes out of `--gpu-memory-utilization` (see
 [Configuration](configuration.md#kv-cache-memory-settings)), which is the total
@@ -83,6 +88,11 @@ Block files are named by content hash. With the default
 so a restarted server finds the blocks written before. Stores are not shared
 with vLLM on other platforms.
 
+When restarting with a different GGUF quantization, you can keep the same
+tokenizer and disk directory. Each weight file has its own KV blocks.
+After upgrading from the old layout, the first request for each prefix
+recomputes its blocks. Old files still count toward the disk cap and can be evicted.
+
 With `xxhash` or `xxhash_cbor` the seed is random per process, so a restarted
 server cannot find earlier blocks unless `PYTHONHASHSEED` is set; the server
 warns at startup. Every server sharing a store must use the same value.
@@ -103,8 +113,9 @@ the tier would publish nothing.
   never deleted. The cap is per process, so give each server its own
   `root_dir`. A Time Machine local snapshot can hold deleted block files until
   macOS reclaims the space, which it does when the disk runs low.
-- **Changed weights.** The store is keyed by model name and dtype, not by
-  weights. Delete `root_dir` after replacing a checkpoint under the same name.
+- **Changed weights.** GGUF cache identity uses the resolved file path and
+  filesystem metadata, including the change time. For other checkpoints, use
+  a fresh `root_dir` when replacing weights under the same model name.
 - **Permissions.** The store directory is created `0700`, which keeps other
   users out of the block files. Prompt content can be recovered from them.
 - **Backups.** Blocks go under a `.noindex` directory so Spotlight skips them.
