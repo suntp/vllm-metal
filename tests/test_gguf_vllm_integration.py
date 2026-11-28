@@ -27,7 +27,9 @@ from huggingface_hub import HfApi, RepoFile
 from huggingface_hub import constants as hf_constants
 from huggingface_hub.errors import IncompleteSnapshotError
 from safetensors.numpy import save_file
+from vllm import SamplingParams
 from vllm.engine.arg_utils import EngineArgs
+from vllm.exceptions import VLLMValidationError
 
 from vllm_metal.gguf import source as gguf_source
 from vllm_metal.gguf import vllm_integration
@@ -353,6 +355,73 @@ def test_explicit_gguf_on_quantized_checkpoint_fails_at_load_source(
         "GGUF model_config must carry a local .gguf path or remote "
         "repo_id:quant reference in model_weights; got ''."
     )
+
+
+@pytest.fixture()
+def gemma3_gguf(tmp_path):
+    """A real tiny Gemma 3 .gguf with 256 embedding rows, and its text config."""
+    loader_tests = pytest.importorskip("tests.test_gguf_loader")
+    gguf_path, _, _ = loader_tests._build_gemma3_fixture(
+        tmp_path, quant_type=loader_tests.QT.F32
+    )
+    return gguf_path, loader_tests._GEMMA3_TEXT_CONFIG
+
+
+def _gemma3_config_dir(tmp_path: Path, text_config: dict, *, multimodal: bool) -> str:
+    """A text or 4B+ multimodal config whose vocab_size exceeds the file's rows."""
+    text_config = {**text_config, "vocab_size": 320}
+    if multimodal:
+        config = {
+            "model_type": "gemma3",
+            "architectures": ["Gemma3ForConditionalGeneration"],
+            "text_config": text_config,
+        }
+    else:
+        config = {**text_config, "architectures": ["Gemma3ForCausalLM"]}
+    directory = tmp_path / "gemma3-config"
+    directory.mkdir()
+    (directory / "config.json").write_text(json.dumps(config))
+    return str(directory)
+
+
+@pytest.mark.parametrize("multimodal", [False, True], ids=["text", "multimodal"])
+@pytest.mark.parametrize(
+    ("params", "message"),
+    [
+        ({"logit_bias": {256: 1.0}}, r"\[256\] in logit_bias .* Vocabulary size: 256"),
+        ({"allowed_token_ids": [1, 256]}, "allowed_token_ids contains out-of-vocab"),
+    ],
+    ids=["logit_bias", "allowed_token_ids"],
+)
+def test_gemma3_gguf_rejects_token_ids_past_the_file_vocab(
+    tmp_path, gemma3_gguf, multimodal, params, message
+) -> None:
+    # The model has only the file's 256 rows; without the override vLLM checks
+    # these ids against the config and the sampler indexes past the logits.
+    gguf_path, text_config = gemma3_gguf
+    config_dir = _gemma3_config_dir(tmp_path, text_config, multimodal=multimodal)
+
+    model_config = _engine_args(
+        model=gguf_path, tokenizer=config_dir
+    ).create_model_config()
+
+    assert model_config.get_vocab_size() == 256
+    with pytest.raises(VLLMValidationError, match=message):
+        SamplingParams(**params).verify(model_config, None, None, None)
+
+
+def test_gemma3_gguf_keeps_the_users_hf_overrides(tmp_path, gemma3_gguf) -> None:
+    gguf_path, text_config = gemma3_gguf
+    config_dir = _gemma3_config_dir(tmp_path, text_config, multimodal=True)
+
+    model_config = _engine_args(
+        model=gguf_path,
+        tokenizer=config_dir,
+        hf_overrides={"text_config": {"rms_norm_eps": 1e-5}},
+    ).create_model_config()
+
+    assert model_config.get_vocab_size() == 256
+    assert model_config.hf_text_config.rms_norm_eps == 1e-5
 
 
 @pytest.mark.parametrize("offline", [False, True])
@@ -707,6 +776,11 @@ def test_remote_load_source_repins_the_config_repo_revision_offline(
             ["mmproj-model-Q8_0.gguf"],
             "No 'Q8_0' GGUF file found in remote repository 'Qwen/Qwen3-0.6B-GGUF'.",
         ),
+        # Nor is a speculative draft, even when it is the only match.
+        (
+            ["mtp-model-Q8_0.gguf"],
+            "No 'Q8_0' GGUF file found in remote repository 'Qwen/Qwen3-0.6B-GGUF'.",
+        ),
     ],
 )
 def test_remote_load_source_rejects_unsupported_remote_matches(
@@ -773,7 +847,6 @@ def test_remote_load_source_rejects_unsupported_tag_before_download(
 @pytest.mark.parametrize(
     ("model_type", "architecture"),
     [
-        ("qwen3_moe", "Qwen3MoeForCausalLM"),
         ("phi3", "Phi3ForCausalLM"),
         ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
         ("qwen3_5_text", "Qwen3_5ForCausalLM"),
@@ -856,14 +929,20 @@ def test_remote_load_source_admits_mistral_repo_config(tmp_path, monkeypatch) ->
 
 @pytest.mark.parametrize("offline", [False, True])
 @pytest.mark.parametrize("tag", ["F16", "F32", "BF16"])
-def test_remote_plain_type_tags_resolve_past_projector_siblings(
+def test_remote_plain_type_tags_resolve_past_projector_and_draft_siblings(
     tmp_path, monkeypatch, tag, offline
 ) -> None:
     monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", offline)
     snapshot = tmp_path / "weights"
-    snapshot.mkdir()
+    (snapshot / "MTP").mkdir(parents=True)
     gguf_name = f"model-{tag}.gguf"
-    repo_files = [gguf_name, f"mmproj-{tag}.gguf", f"mmproj-model-{tag.lower()}.gguf"]
+    repo_files = [
+        gguf_name,
+        f"mmproj-{tag}.gguf",
+        f"mmproj-model-{tag.lower()}.gguf",
+        f"MTP/mtp-model-{tag}.gguf",
+        f"dflash-model-{tag}.gguf",
+    ]
     for filename in repo_files:
         (snapshot / filename).write_text("dummy")
     monkeypatch.setattr(
@@ -884,6 +963,29 @@ def test_remote_plain_type_tags_resolve_past_projector_siblings(
     )
 
     assert resolved == str(snapshot / gguf_name)
+
+
+@pytest.mark.parametrize("model_name", ["model-Q8_0-MTP.gguf", "model-MTP-Q8_0.gguf"])
+def test_remote_tag_selects_embedded_mtp_model_over_draft_sibling(
+    tmp_path, monkeypatch, model_name
+) -> None:
+    snapshot = tmp_path / "weights"
+    monkeypatch.setattr(
+        gguf_source,
+        "HfApi",
+        lambda: SimpleNamespace(
+            resolve_revision=_echo_revision,
+            list_repo_files=lambda **_: [model_name, "mtp-model-Q8_0.gguf"],
+        ),
+    )
+    monkeypatch.setattr(gguf_source, "snapshot_download", lambda **_: str(snapshot))
+    reference = gguf_source.RemoteGGUFReference(repo_id="org/model", quant_type="Q8_0")
+
+    resolved = reference.resolve(
+        cache_dir=None, revision=None, ignore_patterns=None, token=None
+    )
+
+    assert resolved == str(snapshot / model_name)
 
 
 @pytest.mark.parametrize(

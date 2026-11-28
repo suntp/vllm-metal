@@ -35,11 +35,7 @@ def _make_paged_runner(num_layers: int = 2) -> mr.MetalModelRunner:
         model_args={"vocab_size": 32000},
         model=MagicMock(),
         _paged_attention_runtime=SDPAPagedAttentionRuntime(
-            num_layers=num_layers,
-            num_kv_heads=1,
-            head_dim=4,
-            block_size=4,
-            dtype=mx.float32,
+            block_size=4, dtype=mx.float32
         ),
         _paged_block_size=4,
         num_layers=num_layers,
@@ -67,9 +63,7 @@ def _make_scheduler_output(
         scheduled_cached_reqs=CachedRequestData(
             req_ids=[],
             new_block_ids=[],
-            resumed_req_ids=set(),
             new_token_ids=[],
-            all_token_ids={},
             num_computed_tokens=[],
             num_output_tokens=[],
         ),
@@ -77,7 +71,6 @@ def _make_scheduler_output(
         total_num_scheduled_tokens=sum(num_scheduled.values()),
         scheduled_spec_decode_tokens={},
         scheduled_encoder_inputs={},
-        num_common_prefix_blocks=[],
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
         preempted_req_ids=set(),
@@ -97,6 +90,7 @@ def _make_new_req(
     return NewRequestData(
         req_id=req_id,
         prompt_token_ids=prompt_token_ids,
+        prefill_token_ids=prompt_token_ids,
         mm_features=[],
         sampling_params=_greedy_sp(),
         pooling_params=None,
@@ -297,9 +291,7 @@ def _make_cached_scheduler_output(
         scheduled_cached_reqs=CachedRequestData(
             req_ids=req_ids,
             new_block_ids=new_block_ids,
-            resumed_req_ids=set(),
             new_token_ids=[],
-            all_token_ids={},
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=[0] * len(req_ids),
         ),
@@ -307,7 +299,6 @@ def _make_cached_scheduler_output(
         total_num_scheduled_tokens=sum(num_scheduled.values()),
         scheduled_spec_decode_tokens={},
         scheduled_encoder_inputs={},
-        num_common_prefix_blocks=[],
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
         preempted_req_ids=set(),
@@ -348,9 +339,7 @@ class TestMixedDecodeAndPrefixHitPrefill:
             scheduled_cached_reqs=CachedRequestData(
                 req_ids=["req-A"],
                 new_block_ids=[None],
-                resumed_req_ids=set(),
                 new_token_ids=[],
-                all_token_ids={},
                 num_computed_tokens=[len(prompt_a)],
                 num_output_tokens=[0],
             ),
@@ -358,7 +347,6 @@ class TestMixedDecodeAndPrefixHitPrefill:
             total_num_scheduled_tokens=1 + suffix_len_b,
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
             preempted_req_ids=set(),
@@ -393,7 +381,7 @@ class TestMixedDecodeAndPrefixHitPrefill:
 class TestCachedRequestContinuation:
     """Verify the cached/intermediate-chunk path works with prefix offsets."""
 
-    def test_cached_final_chunk_with_offset(self):
+    def test_final_prefill_chunk_with_offset(self):
         """Final chunk (computed + scheduled == prompt_len) with offset:
         token is kept and state transitions to decode phase."""
         runner = _make_paged_runner()

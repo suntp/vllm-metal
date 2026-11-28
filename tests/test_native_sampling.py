@@ -8,7 +8,19 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
 from tests.stub_runner import make_stub_runner
-from vllm_metal.v1.sampling_batch import SamplingBatch, native_sampling_key
+from vllm_metal.v1 import sampling_batch
+from vllm_metal.v1.native_constraints import apply_native_constraints
+from vllm_metal.v1.native_penalties import apply_native_penalties
+from vllm_metal.v1.sampling import Sampler
+from vllm_metal.v1.sampling_batch import (
+    SamplingBatch,
+    native_sampling_key,
+    sample_from_logits,
+)
+from vllm_metal.v1.sampling_policy import (
+    params_allow_native_greedy,
+    params_allow_native_random,
+)
 
 VOCAB_SIZE = 512
 BATCH_SIZE = 4
@@ -49,12 +61,10 @@ class TestNativeRandomEligibility:
             _random_params(temperature=1.0),
         ]
 
-        assert SamplingBatch.params_allow_native_random(params)
+        assert params_allow_native_random(params)
 
     def test_empty_specific_token_list_is_eligible(self) -> None:
-        assert SamplingBatch.params_allow_native_random(
-            [_random_params(logprob_token_ids=[])]
-        )
+        assert params_allow_native_random([_random_params(logprob_token_ids=[])])
 
     @pytest.mark.parametrize(
         ("label", "params_list"),
@@ -83,7 +93,7 @@ class TestNativeRandomEligibility:
     ) -> None:
         """Masks are per row: one request must never push the whole batch
         onto the torch sampler (that serialises every decode step)."""
-        assert SamplingBatch.params_allow_native_random(params_list)
+        assert params_allow_native_random(params_list)
 
     @pytest.mark.parametrize(
         ("label", "params_list"),
@@ -106,21 +116,19 @@ class TestNativeRandomEligibility:
             ("min tokens still pending", [_random_params(min_tokens=2)]),
         ],
     )
-    def test_default_gate_rejects_extended_sampling_options(
-        self, label, params_list
-    ) -> None:
-        assert not SamplingBatch.params_allow_native_random(params_list)
+    def test_ineligible_batches_fall_back(self, label, params_list) -> None:
+        assert not params_allow_native_random(params_list)
 
-    def test_bad_words_keep_deferred_decode_disabled(self) -> None:
+    def test_bad_words_fall_back(self) -> None:
         params = _random_params()
         params._bad_words_token_ids = [[99]]
 
-        assert not SamplingBatch.params_allow_native_random([params])
+        assert not params_allow_native_random([params])
 
     def test_min_tokens_returns_to_native_random_once_reached(self) -> None:
         params = [_random_params(min_tokens=2), _random_params()]
-        assert not SamplingBatch.params_allow_native_random(params, [1, 0])
-        assert SamplingBatch.params_allow_native_random(params, [2, 0])
+        assert not params_allow_native_random(params, [1, 0])
+        assert params_allow_native_random(params, [2, 0])
 
 
 class TestTopKTopPMaskParity:
@@ -277,7 +285,7 @@ class TestMlxRandomTokens:
             _random_params(temperature=1.5, top_k=4, top_p=1.0),
             _random_params(temperature=2.0, top_k=0, top_p=1.0),
         ]
-        assert SamplingBatch.params_allow_native_random(params)
+        assert params_allow_native_random(params)
 
         greedy_row, narrow_row, wide_row = set(), set(), set()
         key = mx.random.key(1)
@@ -478,8 +486,8 @@ class TestSeededNativeSampling:
 
     def test_seeded_rows_are_eligible_only_with_allow_seed(self) -> None:
         params = [_random_params(seed=7), _random_params()]
-        assert not SamplingBatch.params_allow_native_random(params)
-        assert SamplingBatch.params_allow_native_random(params, allow_seed=True)
+        assert not params_allow_native_random(params)
+        assert params_allow_native_random(params, allow_seed=True)
 
     def test_row_key_is_pure_and_position_dependent(self) -> None:
         a = native_sampling_key(7, 3)
@@ -556,7 +564,7 @@ class TestSeededNativeSampling:
         mx.eval(base, mixed)
         assert [base.tolist()[i] for i in (0, 2)] == [mixed.tolist()[i] for i in (0, 2)]
 
-    def test_deferred_call_without_allow_seed_rejects_seeded_rows(self) -> None:
+    def test_native_call_without_allow_seed_rejects_seeded_rows(self) -> None:
         logits = mx.zeros((1, VOCAB_SIZE))
         with pytest.raises(RuntimeError, match="gate desync"):
             SamplingBatch.native_sample_tokens(
@@ -620,14 +628,15 @@ def test_mps_sampler_matches_upstream_with_padding(run_in_spawn_process):
 
 
 def _check_mps_sampler_against_upstream():
-    from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+    from vllm.v1.worker.gpu.sample import sampler
 
-    from vllm_metal.pytorch_backend.bindings import register_kernel_overrides
+    from vllm_metal.pytorch_backend.bindings import install, register_kernel_overrides
 
     register_kernel_overrides()
+    install()
     for logits, seeds, positions, temperatures, expected in _sampling_golden_cases():
         mps_logits = torch.nn.functional.pad(logits.to("mps"), (1, 2), value=1000.0)
-        mps_ids = gumbel_sample(
+        mps_ids = sampler.gumbel_sample(
             mps_logits[:, 1:-2],
             torch.arange(len(seeds), dtype=torch.int32, device="mps"),
             torch.tensor(temperatures, device="mps"),
@@ -654,13 +663,109 @@ def test_broadcast_logits_use_per_row_candidate_ids():
     assert tokens.tolist() == [0, 2]
 
 
+class TestNativeConstraints:
+    @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+    def test_mask_matches_vendored_sampler_for_mixed_rows(self, dtype):
+        params = [
+            SamplingParams(allowed_token_ids=[0, 1, 2, 2, 3]),
+            SamplingParams(),
+            SamplingParams(),
+            SamplingParams(),
+        ]
+        for sp in params[:3]:
+            sp._bad_words_token_ids = [[4], [1, 2], [2, 1, 3], [1, 2, 1, 0]]
+        raw = [[0.0, 1.0, 2.0, 3.0, 4.0]] * 4
+        outputs = [[1], [2, 1], [1, 2, 1], []]
+        batch = SamplingBatch(params, [[1, 2, 1]] * 4, outputs, vocab_size=5)
+        expected = Sampler().apply_logits_processors(
+            torch.tensor(raw), batch.make_sampling_metadata(), False
+        )
+        logits = mx.array(raw, dtype=dtype)
+        masked = apply_native_constraints(logits, params, outputs)
+
+        assert masked is not None
+        assert masked.dtype == dtype
+        assert masked.tolist() == expected.tolist()
+        # Pin the suffix result independently of the shared Torch matcher.
+        assert mx.isinf(masked).tolist() == [
+            [False, False, True, False, True],
+            [False, False, True, True, True],
+            [True, False, True, True, True],
+            [False, False, False, False, False],
+        ]
+        assert logits.tolist() == raw
+
+    @pytest.mark.parametrize("temperature", [0.0, 0.8])
+    def test_sync_uses_current_output_suffix_and_real_vocab(
+        self, monkeypatch, temperature
+    ):
+        sp = SamplingParams(
+            temperature=temperature, allowed_token_ids=[1, 2], top_k=1, seed=7
+        )
+        sp._bad_words_token_ids = [[0, 2]]
+        sampler = Sampler()
+        monkeypatch.setattr(
+            sampler, "forward", lambda *_: pytest.fail("unexpected Torch fallback")
+        )
+        for history, expected in [([], 2), ([0], 1), ([0, 1], 2)]:
+            batch = SamplingBatch([sp], [[0]], [history], vocab_size=4)
+            result = sample_from_logits(
+                mx.array([[10.0, 1.0, 3.0, 4.0, 100.0]]),
+                batch,
+                sampler,
+                next_native_rng_key=lambda: pytest.fail(
+                    "seeded row used the engine key"
+                ),
+            )
+            assert result.token_ids == [expected]
+        assert not params_allow_native_greedy([sp], [1])
+        assert not params_allow_native_random([sp], [1], allow_seed=True)
+
+    @pytest.mark.parametrize(
+        ("allowed", "bad_words", "history"),
+        [
+            ([1], [[1]], []),
+            (None, [[0], [1]], []),
+            ([0, 1], [[0, 1]], [-1]),
+        ],
+        ids=["allowlist-exhausted", "vocab-exhausted", "pending-history"],
+    )
+    def test_constraint_fallback_does_not_consume_native_rng(
+        self, monkeypatch, allowed, bad_words, history
+    ):
+        params = SamplingParams(temperature=0.8, allowed_token_ids=allowed)
+        params._bad_words_token_ids = bad_words
+        batch = SamplingBatch([params], [[0]], [history], vocab_size=2)
+        logits = mx.array([[2.0, 1.0]])
+        sampler = Sampler()
+        forward = sampler.forward
+        seen_devices = []
+
+        def record(logits_torch, metadata):
+            seen_devices.append(logits_torch.device.type)
+            return forward(logits_torch, metadata)
+
+        monkeypatch.setattr(sampler, "forward", record)
+        sample_from_logits(
+            logits,
+            batch,
+            sampler,
+            next_native_rng_key=lambda: pytest.fail("fallback consumed the engine key"),
+        )
+        assert seen_devices == ["cpu"]
+
+    @pytest.mark.parametrize(
+        ("allowed", "bad_words"), [([-1], []), ([2], []), (None, [[2]])]
+    )
+    def test_invalid_indices_stay_out_of_the_mlx_scatter(self, allowed, bad_words):
+        params = SamplingParams(allowed_token_ids=allowed)
+        params._bad_words_token_ids = bad_words
+        assert apply_native_constraints(mx.array([[0.0, 1.0]]), [params], [[]]) is None
+
+
 class TestNativePenalties:
     @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
-    def test_counts_signs_and_prompt_membership_match_vllm(self, dtype):
-        from vllm.v1.sample.sampler import Sampler
-
-        from vllm_metal.v1.native_penalties import apply_native_penalties
-
+    def test_counts_signs_and_prompt_membership_match_torch(self, dtype):
         params = [
             SamplingParams(
                 repetition_penalty=1.5, frequency_penalty=0.5, presence_penalty=-0.25
@@ -672,7 +777,7 @@ class TestNativePenalties:
             SamplingParams(frequency_penalty=0.25),
         ]
         prompts = [[0, 0, 2], [1, 3], [], [0] * 20]
-        outputs = [[1, 1, 1, 2], [2, 2, 4], [], [4] * 257]
+        outputs = [[1, 1, 1, 2], [2, 2, 4], [-1], [4] * 257]
         raw = [[4.0, 3.0, -2.0, 0.0, -1.0, float("-inf")]] * 4
         batch = SamplingBatch(params, prompts, outputs, vocab_size=6)
         expected = Sampler.apply_penalties(
@@ -680,15 +785,19 @@ class TestNativePenalties:
         )
         logits = mx.array(raw, dtype=dtype)
         actual = apply_native_penalties(logits, params, prompts, outputs)
+
+        assert actual is not None
+        assert actual.dtype == mx.float32
         torch.testing.assert_close(torch.tensor(actual.tolist()), expected)
-        assert logits.tolist() == raw  # Raw scores remain available to callers.
+        assert actual[0, 0].item() == pytest.approx(4 / 1.5)
+        assert actual[0, 1].item() == pytest.approx(0.75)
+        assert actual[3, 4].item() == pytest.approx(-65.25)
+        assert logits.tolist() == raw
 
     @pytest.mark.parametrize("random_row", [False, True])
-    def test_sync_sampling_uses_penalties_without_torch(self, monkeypatch, random_row):
-        from vllm.v1.sample.sampler import Sampler
-
-        from vllm_metal.v1.sampling_batch import sample_from_logits
-
+    def test_sync_penalties_keep_seed_and_mixed_row_alignment(
+        self, monkeypatch, random_row
+    ):
         params = [
             SamplingParams(temperature=0, repetition_penalty=2),
             SamplingParams(
@@ -701,27 +810,97 @@ class TestNativePenalties:
         batch = SamplingBatch(params, [[0], [0]], [[], [0, 0]], vocab_size=3)
         sampler = Sampler()
         monkeypatch.setattr(
-            sampler, "forward", lambda *_: pytest.fail("torch fallback")
+            sampler, "forward", lambda *_: pytest.fail("unexpected Torch fallback")
         )
-        logits = mx.array([[4.0, 3.0, 0.0], [4.0, 3.0, 0.0]])
+        logits = mx.array([[4.0, 3.0, 0.0, 99.0], [4.0, 3.0, 0.0, 99.0]])
         result = sample_from_logits(
-            logits, batch, sampler, next_native_rng_key=lambda: mx.random.key(2)
+            logits,
+            batch,
+            sampler,
+            next_native_rng_key=lambda: pytest.fail("seeded row used the engine key"),
         )
         assert result.token_ids == [1, 1]
-        assert not SamplingBatch.params_allow_native_greedy(
-            params, batch.output_lengths
-        )
-        assert not SamplingBatch.params_allow_native_random(
+        assert not params_allow_native_greedy(params, batch.output_lengths)
+        assert not params_allow_native_random(
             params, batch.output_lengths, allow_seed=True
         )
 
-    def test_penalty_history_is_required_by_lazy_sampler(self):
-        params = [SamplingParams(temperature=0, presence_penalty=1)]
-        with pytest.raises(RuntimeError, match="gate desync"):
-            SamplingBatch.native_sample_tokens(
-                mx.array([[1.0, 2.0]]),
-                params,
-                vocab_size=2,
-                next_native_rng_key=None,
-                output_lengths=[1],
+    @pytest.mark.parametrize("temperature", [0.0, 0.8])
+    def test_sync_applies_masks_before_penalties(self, monkeypatch, temperature):
+        sp = SamplingParams(
+            temperature=temperature,
+            top_k=1,
+            seed=17,
+            allowed_token_ids=[0, 1, 2, 3],
+            repetition_penalty=2,
+            frequency_penalty=0.5,
+            presence_penalty=0.25,
+        )
+        sp._bad_words_token_ids = [[1, 0]]
+        logits = mx.array([[10.0, -4.0, 6.0, 4.0, 9.0, 100.0]])
+        batch = SamplingBatch([sp], [[2]], [[1]], vocab_size=5)
+        sampler = Sampler()
+        monkeypatch.setattr(
+            sampler, "forward", lambda *_: pytest.fail("unexpected Torch fallback")
+        )
+
+        def check_masked_scores(scores, *args):
+            assert scores.tolist() == [[-mx.inf, -4.0, 6.0, 4.0, -mx.inf]]
+            return apply_native_penalties(scores, *args)
+
+        monkeypatch.setattr(
+            sampling_batch, "apply_native_penalties", check_masked_scores
+        )
+        result = sample_from_logits(
+            logits, batch, sampler, next_native_rng_key=lambda: mx.random.key(0)
+        )
+        assert result.token_ids == [3]
+
+    @pytest.mark.parametrize(
+        "exhausted", [False, True], ids=["pending-output", "exhausted-mask"]
+    )
+    def test_ineligible_processors_fall_back_with_original_logits(
+        self, monkeypatch, exhausted
+    ):
+        params = SamplingParams(
+            temperature=0.8, presence_penalty=0.5, allowed_token_ids=[1]
+        )
+        outputs = [[-1]]
+        if exhausted:
+            params._bad_words_token_ids = [[1]]
+            outputs = [[]]
+            monkeypatch.setattr(
+                sampling_batch,
+                "apply_native_penalties",
+                lambda *_: pytest.fail("penalties reached an exhausted mask"),
             )
+        batch = SamplingBatch([params], [[0]], outputs, vocab_size=2)
+        logits = mx.array([[2.0, 1.0]])
+        sampler = Sampler()
+        forward = sampler.forward
+        seen = []
+
+        def record(scores, metadata):
+            seen.append(scores.tolist())
+            return forward(scores, metadata)
+
+        monkeypatch.setattr(sampler, "forward", record)
+        sample_from_logits(
+            logits,
+            batch,
+            sampler,
+            next_native_rng_key=lambda: pytest.fail("fallback advanced native RNG"),
+        )
+        assert seen == [[[2.0, 1.0]]]
+
+    @pytest.mark.parametrize(
+        ("prompt", "output"),
+        [([2], []), ([], [2]), ([3], [])],
+        ids=["prompt-at-boundary", "output-at-boundary", "prompt-beyond-boundary"],
+    )
+    def test_out_of_vocab_history_stays_out_of_scatter(self, prompt, output):
+        params = [SamplingParams(repetition_penalty=1.2)]
+        assert (
+            apply_native_penalties(mx.array([[0.0, 1.0]]), params, [prompt], [output])
+            is None
+        )

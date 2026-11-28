@@ -1,10 +1,10 @@
 # GGUF
 
-vllm-metal supports dense decoder and Qwen3.5 GGUF checkpoints through the MLX
-runtime. A GGUF file carries weights only, so it needs a Hugging Face config and
-tokenizer source. That source can be a quantized checkpoint, such as an
-mlx-community 4-bit, FP8, or AWQ repository; vllm-metal reads only its config
-and tokenizer.
+vllm-metal supports dense decoder (including Gemma 3), Qwen3 MoE, and Qwen3.5
+GGUF checkpoints through the MLX runtime. A GGUF file carries weights only, so
+it needs a Hugging Face config and tokenizer source. That source can be a
+quantized checkpoint, such as an mlx-community 4-bit, FP8, or AWQ repository;
+vllm-metal reads only its config and tokenizer.
 
 ## Local weights
 
@@ -46,17 +46,20 @@ missing, ambiguous, or shard-only matches also fail before model load.
 
 ## Current scope
 
-- Supported model families: Qwen2, Qwen3, Llama, Mistral, and Qwen3.5
-  (`qwen35`).
+- Supported model families: Qwen2, Qwen3, Qwen3 MoE (`qwen3moe`), Llama,
+  Mistral, Qwen3.5 (`qwen35`), and Gemma 3 (`gemma3`).
+- Gemma 3 serves text only. Point `--tokenizer` at the 1B text config or a 4B+
+  `Gemma3ForConditionalGeneration` repository, such as `google/gemma-3-4b-it`.
 - Qwen3.5 serves text only and images are refused. Point `--tokenizer` at the
   `Qwen3_5ForConditionalGeneration` repository, such as `Qwen/Qwen3.5-9B`.
   vllm-metal does not load `mmproj` files. Files that embed a
   multi-token-prediction block, such as unsloth's `-MTP-GGUF` repos, load
   with that block skipped. MTP speculative decoding is not supported.
 - Supported qtypes: Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K,
-  Q6_K, IQ4_NL, IQ4_XS, and IQ3_S, plus plain F32/F16/BF16 tensors, mixed
-  freely within one file, so llama.cpp's Q4_K_M, Q5_K_M and IQ3_M exports,
-  bartowski's Q4_K_L, and unsloth's UD-Q4_K_XL load. Remote reference tags
+  Q6_K, IQ4_NL, IQ4_XS, IQ3_S, and IQ3_XXS, plus plain F32/F16/BF16 tensors,
+  mixed freely within one file, so llama.cpp's Q4_K_M, Q5_K_M, IQ3_M and IQ3_XS
+  exports, bartowski's Q4_K_L, and unsloth's UD-Q4_K_XL load. Most IQ3_XXS
+  exports also carry IQ2_S tensors, so they do not load. Remote reference tags
   accept Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K and Q2_K_S/M/L, Q3_K and
   Q3_K_S/M/L, Q4_K_S/M/L, Q5_K_S/M/L, Q6_K, Q6_K_L, IQ4_NL, IQ4_XS, IQ3_S,
   IQ3_M, and the plain types.
@@ -64,11 +67,14 @@ missing, ambiguous, or shard-only matches also fail before model load.
   a mostly-IQ4 file uses more than the same model's Q4_K_M. IQ3_S weights
   also need more memory than their file size, so an IQ3_M file uses about as
   much as the same model's Q4_K_M.
-- Q2_K/Q3_K/Q6_K weights stay in their GGUF blocks and run on custom Metal
-  kernels. Small batches use a fused kernel on the packed blocks, and larger
-  ones, such as a prefill, dequantize a transient dense copy of the weight
-  for one GEMM and free it afterwards.
-- A tied model's unused `output.weight` is skipped whatever its qtype.
-- Unsupported: IQ1, IQ2, IQ3_XXS and T-quants, MoE, SSM or hybrid models
-  other than Qwen3.5, vision input, sharded GGUF files, and LoRA
-  (`--enable-lora`).
+- Q2_K/Q3_K/Q6_K/IQ3_XXS weights stay in their GGUF blocks and run on custom
+  Metal kernels. Small batches use a fused kernel on the packed blocks, and
+  larger ones, such as a prefill, dequantize a transient dense copy of the
+  weight for one GEMM and free it afterwards.
+- When a tied model's file also carries `output.weight`, logits use it, as
+  llama.cpp does: llama-quantize stores that table at the output qtype (for
+  example Q6_K) even when `token_embd` uses a lower one. An `output.weight` in
+  a qtype the loader cannot run is skipped and the head stays tied.
+- Unsupported: IQ1, IQ2 and T-quants, MoE models other than Qwen3
+  MoE, SSM or hybrid models other than Qwen3.5, vision input, sharded GGUF
+  files, and LoRA (`--enable-lora`).

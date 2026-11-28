@@ -7,6 +7,7 @@ For Omni additions, follow the [model ownership and layout](docs/pytorch-mps.md#
 
 - Address real problems backed by a reproducer, measurements, or a concrete user need. Avoid fixes justified only by hypothetical failures.
 - State the motivation clearly in the PR description: the current behavior, the affected use case, and why the issue matters in practice.
+- When creating an issue, always use available templates from `.github/ISSUE_TEMPLATE/`, following its structure and required fields.
 
 ## Duplicate-work checks
 
@@ -20,6 +21,10 @@ gh pr list --repo vllm-project/vllm-metal --state open --search "<issue_number> 
 
 Do not open a duplicate PR. Explain any materially different approach in the PR description.
 
+## Pull requests
+
+- Leave the human checklist items unchecked. The author must check them manually on GitHub.
+
 ## Coding style
 
 - Match existing code style.
@@ -31,7 +36,7 @@ Do not open a duplicate PR. Explain any materially different approach in the PR 
 
 ## Validation
 
-Run checks relevant to the change. Report the commands, results, and any checks you could not run in the PR description.
+Run relevant checks and report key results. For experiments, put reproduction details in a collapsible section.
 
 Extend related test suites. Test observable behavior rather than locking in implementation details.
 
