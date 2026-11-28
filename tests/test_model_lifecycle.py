@@ -229,6 +229,16 @@ def _make_lifecycle(
 
 
 class TestModelLifecycle:
+    def test_cache_dimensions_come_from_nested_language_config(self):
+        lifecycle, _ = _make_lifecycle()
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                lm_config=SimpleNamespace(**_TEXT_MODEL_ARGS),
+                audio_encoder_config=SimpleNamespace(hidden_size=1024),
+            )
+        )
+        assert lifecycle._extract_model_args(model, is_vlm=True) == _TEXT_MODEL_ARGS
+
     @pytest.mark.parametrize("revision", [None, "release-tag", "a" * 40])
     @pytest.mark.parametrize(
         "backend", ["text", "vlm", "lfm3", "awq", "pooling", "offload"]
@@ -251,6 +261,7 @@ class TestModelLifecycle:
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(
                 model="org/model",
+                hf_token="test-token",
                 revision=revision,
                 is_multimodal_model=backend == "vlm",
                 hf_config=SimpleNamespace(model_type="lfm3")
@@ -258,6 +269,8 @@ class TestModelLifecycle:
                 else None,
             )
         )
+        runner.vllm_config.load_config.download_dir = "/model-cache"
+        hub = {"token": "test-token", "cache_dir": "/model-cache"}
         runner._is_pooling = backend == "pooling"
         resolve_path = Mock(return_value="resolved/model")
         monkeypatch.setattr(model_lifecycle, "get_model_download_path", resolve_path)
@@ -283,22 +296,26 @@ class TestModelLifecycle:
         )
         resolve_path.assert_called_once_with("org/model", revision=revision)
         if backend == "awq":
-            loader.assert_called_once_with(
-                "resolved/model", target_dtype=mx.float16, revision=revision
-            )
+            loader.assert_called_once_with("resolved/model", revision=revision, **hub)
         else:
-            download.assert_called_once_with("resolved/model", revision=revision)
+            download.assert_called_once_with(
+                "resolved/model",
+                revision=revision,
+                **({} if backend in {"vlm", "lfm3"} else hub),
+            )
             selected_loader = loader if backend in {"vlm", "lfm3"} else weights_loader
             selected_loader.assert_called_once_with(
                 Path("cached-model"), lazy=backend == "offload"
             )
         if backend == "offload":
             install_experts.assert_called_once_with(
-                model, "resolved/model", revision, 4096
+                model, "cached-model", revision, 4096
             )
             assert runner._expert_store is install_experts.return_value
         if backend not in {"vlm", "lfm3"}:
-            detect_awq.assert_called_once_with("resolved/model", revision=revision)
+            detect_awq.assert_called_once_with(
+                "resolved/model", revision=revision, **hub
+            )
 
     def test_private_mlx_lm_compatible_model_path_adapts_indexed_custom_shards(
         self, tmp_path: Path
@@ -638,7 +655,7 @@ class TestModelLifecycle:
 
         class _StubAWQLoader:
             @classmethod
-            def for_model(cls, _model_name: str, *, revision: str | None) -> None:
+            def for_model(cls, _model_name: str, **_kwargs: object) -> None:
                 return None
 
         def _load_text(
@@ -1041,23 +1058,12 @@ class TestModelLifecycle:
         class _StubAWQLoader:
             @classmethod
             def for_model(
-                cls, _model_name: str, *, revision: str | None
+                cls, _model_name: str, **_kwargs: object
             ) -> _StubAWQLoader | None:
                 return cls() if is_awq else None
 
-            def load(
-                self,
-                model_path: str,
-                *,
-                target_dtype: object,
-                revision: str | None,
-            ) -> object:
-                awq_load_calls.append(
-                    {
-                        "model_path": model_path,
-                        "target_dtype": target_dtype,
-                    }
-                )
+            def load(self, model_path: str, **_kwargs: object) -> object:
+                awq_load_calls.append({"model_path": model_path})
                 return fake_model
 
         def _fake_mlx_lm_load(*args: object, **kwargs: object) -> tuple[object, object]:
@@ -1084,12 +1090,7 @@ class TestModelLifecycle:
                 "generic mlx_lm.load must NOT be called when AWQQuantLoader "
                 "owns the load path"
             )
-            call = awq_load_calls[0]
-            assert call["model_path"] == "stub-model"
-            assert call["target_dtype"] is not None, (
-                "lifecycle must derive target_dtype from "
-                "runner.model_config.dtype and thread it to the loader"
-            )
+            assert awq_load_calls[0]["model_path"] == "stub-model"
         else:
             assert awq_load_calls == [], (
                 "AWQQuantLoader.load must NOT be called for a non-AWQ checkpoint"
@@ -1100,6 +1101,35 @@ class TestModelLifecycle:
             kwargs = mlx_lm_load_calls[0]["kwargs"]
             assert isinstance(kwargs, dict)
             assert "model_config" not in kwargs
+
+    def test_awq_load_keeps_float16_under_bfloat16_runner(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Casting the other params to the runner dtype would promote the
+        float16 quantized layer's output to float32."""
+        awq_config = {
+            "quant_method": "awq",
+            "bits": 4,
+            "group_size": 128,
+            "zero_point": True,
+            "version": "gemm",
+        }
+        (tmp_path / "config.json").write_text(
+            json.dumps({"quantization_config": awq_config})
+        )
+        model = nn.Sequential(nn.Embedding(4, 64), nn.QuantizedLinear(64, 4))
+        model.set_dtype(mx.float16)
+        monkeypatch.setattr(
+            "vllm_metal.quant.awq_loader.mlx_lm_load_model",
+            lambda *_args, **_kwargs: (model, {}),
+        )
+        lifecycle, _ = _make_lifecycle(
+            model_config=_runner_model_config(dtype=torch.bfloat16)
+        )
+
+        loaded = lifecycle._load_generation_model(str(tmp_path), is_vlm=False)
+
+        assert loaded(mx.array([[0]])).dtype == mx.float16
 
     def test_load_routes_gguf_to_owner_on_quantization_detection(
         self,
@@ -1191,7 +1221,7 @@ class TestModelLifecycle:
 
         class _StubAWQLoader:
             @classmethod
-            def for_model(cls, _model_name: str, *, revision: str | None) -> None:
+            def for_model(cls, _model_name: str, **_kwargs: object) -> None:
                 return None
 
         monkeypatch.setitem(sys.modules, "gguf", None)

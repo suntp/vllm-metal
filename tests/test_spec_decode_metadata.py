@@ -56,7 +56,6 @@ def _scheduler_output(
         total_num_scheduled_tokens=sum(num_scheduled.values()),
         scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
         scheduled_encoder_inputs={},
-        num_common_prefix_blocks=[],
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
         num_invalid_spec_tokens=num_invalid_spec_tokens,
@@ -266,7 +265,7 @@ class TestSpecDecodePolicy:
             decode_token_ids=[],
             prefill_reqs=[SimpleNamespace(req_id="r0")],
             prefill_token_ids=[token_id],
-            prefill_result_modes=["new_final"],
+            prefill_result_modes=["final"],
             request_states={"r0": state},
         )
         assert result == ([("r0", state)] if eligible else [])
@@ -466,8 +465,8 @@ class TestGemma4MTPDraftSeeds:
             prefill_reqs=[final_prefill, intermediate_prefill],
             prefill_token_ids=[11, 12],
             prefill_result_modes=[
-                "new_final",
-                "intermediate" if skip_reason == "intermediate" else "new_final",
+                "final",
+                "intermediate" if skip_reason == "intermediate" else "final",
             ],
             request_states={
                 "p0": _request_state(),

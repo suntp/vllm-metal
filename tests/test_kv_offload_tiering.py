@@ -3,6 +3,7 @@
 
 import hashlib
 import uuid
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -13,7 +14,7 @@ from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.tiering.base import TransferJob
 
 from tests.kv_offload_helpers import (
-    gpu_spec,
+    device_ptrs,
     make_region,
     make_storage,
     make_turboquant_storage,
@@ -22,8 +23,11 @@ from tests.kv_offload_helpers import (
     snapshot_blocks,
     zero_blocks,
 )
+from vllm_metal.v1.kv_offload.config import AUTO_POOL_KEY
 from vllm_metal.v1.kv_offload.fs_tier import MetalFileSystemTierManager
 from vllm_metal.v1.kv_offload.spec import MetalTieringOffloadingSpec
+
+_SPEC_LOGGER = "vllm_metal.v1.kv_offload.spec"
 
 NUM_CHUNKS = 4
 BLOCKS_PER_CHUNK = 2
@@ -57,7 +61,9 @@ def test_memoryview_round_trips_chunk_rows(turboquant: bool) -> None:
     try:
         randomize(storage)
         original = snapshot_blocks(storage, [3, 4])
-        assert worker.submit_store(1, gpu_spec([3, 4]), CPULoadStoreSpec([1]))
+        assert worker.submit_store(
+            1, device_ptrs(worker, [3, 4]), CPULoadStoreSpec([1])
+        )
 
         # Address rows as tiering/fs/io.py does. Move chunk 1 to chunk 3, so
         # a carve that disagrees with the view cannot cancel out.
@@ -69,7 +75,7 @@ def test_memoryview_round_trips_chunk_rows(turboquant: bool) -> None:
         flat[row : 2 * row] = b"\x00" * row
 
         zero_blocks(storage, [3, 4])
-        assert worker.submit_load(2, CPULoadStoreSpec([3]), gpu_spec([3, 4]))
+        assert worker.submit_load(2, CPULoadStoreSpec([3]), device_ptrs(worker, [3, 4]))
         for a, b in zip(original, snapshot_blocks(storage, [3, 4]), strict=True):
             np.testing.assert_array_equal(a, b)
     finally:
@@ -181,13 +187,14 @@ def test_released_pool_round_trips_after_reuse() -> None:
     scheduler = _attach(storage, None, engine_id)
     try:
         randomize(storage)
-        assert worker.submit_store(1, gpu_spec([3, 4]), CPULoadStoreSpec([1]))
+        ptrs = device_ptrs(worker, [3, 4])
+        assert worker.submit_store(1, ptrs, CPULoadStoreSpec([1]))
         worker.release_host_pool()
         worker.restore_host_pool()
 
         randomize(storage, seed=1)
         original = snapshot_blocks(storage, [3, 4])
-        assert worker.submit_store(2, gpu_spec([3, 4]), CPULoadStoreSpec([1]))
+        assert worker.submit_store(2, ptrs, CPULoadStoreSpec([1]))
         row = scheduler.total_size_bytes // NUM_CHUNKS
         assert bytes(scheduler._base[row : 2 * row].numpy()) == bytes(
             worker.region._base[row : 2 * row].numpy()
@@ -195,7 +202,7 @@ def test_released_pool_round_trips_after_reuse() -> None:
         assert any(scheduler._base[row : 2 * row].numpy())
 
         zero_blocks(storage, [3, 4])
-        assert worker.submit_load(3, CPULoadStoreSpec([1]), gpu_spec([3, 4]))
+        assert worker.submit_load(3, CPULoadStoreSpec([1]), ptrs)
         for a, b in zip(original, snapshot_blocks(storage, [3, 4]), strict=True):
             np.testing.assert_array_equal(a, b)
     finally:
@@ -236,6 +243,7 @@ def _offloading_config(
     tokens_per_block: int = 16,
     extra_config: dict | None = None,
     enable_kv_cache_events: bool = False,
+    max_model_len: int = 0,
 ):
     """A real ``OffloadingConfig``, built without a model download."""
     from vllm.v1.kv_offload.config import (
@@ -256,7 +264,9 @@ def _offloading_config(
         enable_kv_cache_events=enable_kv_cache_events,
         extra_config=extra_config or {"cpu_bytes_to_use": 64 << 20},
         engine_id="test-engine",
-        model=OffloadingModelConfig(name="test-model", dtype="float16"),
+        model=OffloadingModelConfig(
+            name="test-model", dtype="float16", max_model_len=max_model_len
+        ),
         cache=OffloadingCacheConfig(
             tokens_per_hash=tokens_per_block, blocks_per_chunk=blocks_per_chunk
         ),
@@ -294,9 +304,58 @@ def test_tiering_spec_builds_manager_through_upstream(tmp_path) -> None:
     assert isinstance(tier, MetalFileSystemTierManager)
 
 
+@pytest.mark.parametrize(
+    ("blocks_per_chunk", "max_model_len", "disk_tier", "auto_pool", "needs"),
+    [
+        (1, 16 * 4097, True, False, 4097),
+        (2, 32 * 2049, False, True, 2049),
+        # One token short of 4097 chunks: only whole chunks count.
+        (1, 16 * 4097 - 1, True, False, None),
+    ],
+)
+def test_pool_under_one_request_warns(
+    tmp_path,
+    caplog,
+    blocks_per_chunk: int,
+    max_model_len: int,
+    disk_tier: bool,
+    auto_pool: bool,
+    needs: int | None,
+) -> None:
+    """The 64 MiB pool holds 4096 blocks of 16 KiB."""
+    extra_config: dict = {"cpu_bytes_to_use": 64 << 20}
+    if disk_tier:
+        extra_config["secondary_tiers"] = [
+            {"type": "fs", "root_dir": str(tmp_path), "max_size_gib": 1}
+        ]
+    if auto_pool:
+        extra_config[AUTO_POOL_KEY] = True
+    config = _offloading_config(
+        blocks_per_chunk=blocks_per_chunk,
+        extra_config=extra_config,
+        max_model_len=max_model_len,
+    )
+    # Its own region: other tests leave one under the default id.
+    config = replace(config, engine_id=f"test-{uuid.uuid4().hex[:8]}")
+    spec = MetalTieringOffloadingSpec(config)
+    assert spec.num_chunks == 4096 // blocks_per_chunk
+    with caplog.at_level("WARNING", logger=_SPEC_LOGGER):
+        spec.get_manager().shutdown()
+
+    if needs is None:
+        assert "host pool holds" not in caplog.text
+        return
+    assert f"one --max-model-len request needs {needs}." in caplog.text
+    # Both cases need just over 1/16 GiB, rounded up to 0.07.
+    assert "--kv-offloading-size to 0.07 GiB or more" in caplog.text
+    assert ("can stall" in caplog.text) == disk_tier
+    assert ("This is the default pool." in caplog.text) == auto_pool
+    assert ("GiB or more, or use a shorter" in caplog.text) == (not auto_pool)
+
+
 def test_reset_empties_the_host_pool_index() -> None:
-    """Sleep frees the pool's pages. That is only safe because the reset
-    vLLM runs first leaves no hit that would read them."""
+    """Sleep frees the pool's pages. That is only safe because the connector's
+    reset runs first and leaves no hit that would read them."""
     manager = MetalTieringOffloadingSpec(_offloading_config()).get_manager()
     try:
         ctx = ReqContext(req_id="r-sleep")
