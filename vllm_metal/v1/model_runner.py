@@ -744,7 +744,9 @@ class MetalModelRunner:
             self._model_lifecycle.install_pooling_backend()
 
         spec = self.vllm_config.speculative_config
-        if spec is not None and spec.method in ("dflash", "dspark"):
+        if is_qwen_mtp(spec):
+            self._drafter = QwenMTPProposer.build(self)
+        elif spec is not None and spec.method in ("dflash", "dspark"):
             from vllm_metal.v1.dflash_proposer import DFlashProposer
             from vllm_metal.v1.dspark_proposer import DSparkProposer
 
@@ -1369,9 +1371,8 @@ class MetalModelRunner:
         if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
             self._drafter = Gemma4MTPProposer(self)
         elif is_qwen_mtp(spec):
-            # The MTP layer keeps request-local KV only, so num_blocks and
-            # block_size are unused here.
-            self._drafter = QwenMTPProposer.build(self)
+            if not isinstance(self._drafter, QwenMTPProposer):
+                raise RuntimeError("Qwen MTP drafter was not loaded before KV profiling")
         elif spec.method in ("dflash", "dspark"):
             from vllm_metal.v1.block_draft_proposer import BlockDraftProposer
 

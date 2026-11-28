@@ -7,11 +7,11 @@ for method behavior and configuration details.
 | | MTP | Draft model | N-gram |
 |---|---|---|---|
 | `--speculative-config` method | `mtp` | `draft_model` | `ngram` |
-| Target models | Gemma4 | Non-hybrid paged-attention models | Non-hybrid paged-attention models and hybrid GDN targets |
-| Draft source | Matching Gemma4 assistant checkpoint | Separate smaller model | Prompt and output token history |
+| Target models | Gemma4 and Qwen3.5-family GDN models | Non-hybrid paged-attention models | Non-hybrid paged-attention models and hybrid GDN targets |
+| Draft source | Matching Gemma4 assistant or Qwen MTP layer | Separate smaller model | Prompt and output token history |
 | `num_speculative_tokens` | Configurable (2–3 typical) | Configurable (3–5 typical) | Configurable (3–5 typical) |
-| Additional model weights | Assistant checkpoint | Draft model | None |
-| Additional KV cache | None; reads target KV | Second scheduler-managed cache | None |
+| Additional model weights | Assistant or MTP layer | Draft model | None |
+| Additional KV cache | Gemma4 shares target KV. Qwen keeps request-local KV. | Second scheduler-managed cache | None |
 
 Experimental [DFlash serving](dflash.md) is also available for a qualified Qwen3
 target/draft pair, with scheduler-owned prefix reuse. It supports fixed widths and
@@ -72,6 +72,21 @@ text-only n-gram speculation and the Qwen family's native MTP layer.
   before enabling it.
 
 The MLX backend rejects other hybrid speculative pairings at startup.
+
+## Qwen3.5-family MTP
+
+On the default MLX backend, pass `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'`.
+The proposer loads the target checkpoint's `mtp.*` weights before KV profiling
+and shares the target embedding and output head. For a conversion with the
+MTP weights in a separate checkpoint, also pass
+`--additional-config '{"qwen_mtp_drafter":"/path/to/matching-split-drafter"}'`.
+
+Each active drafter cache grows outside the scheduler's target KV pool. Its
+payload per cached token is `2 × MTP layers × KV heads × head dimension × bytes per element`.
+For Qwen3.8-27B with one layer, four KV heads, head dimension 256 and BF16 KV,
+allow 4 KiB per token, or 128 MiB for 32,768 cached tokens per request.
+The MLX cache also allocates in chunks and temporarily holds draft lookahead.
+Allow headroom for the sum across active requests when sizing the target KV pool.
 
 ## Gemma4 MTP
 
