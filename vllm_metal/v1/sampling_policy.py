@@ -81,9 +81,15 @@ def has_structured_outputs(params: SamplingParams) -> bool:
     return getattr(params, "structured_outputs", None) is not None
 
 
-def _allows_token_constraints(params: SamplingParams, allow_constraints: bool) -> bool:
-    return not has_token_constraints(params) or (
-        allow_constraints and not has_structured_outputs(params)
+def _allows_history_processors(
+    params: SamplingParams, allow_constraints: bool, allow_penalties: bool
+) -> bool:
+    constrained = has_token_constraints(params)
+    penalized = has_penalties(params)
+    return (
+        (allow_constraints or not constrained)
+        and (allow_penalties or not penalized)
+        and (not (constrained or penalized) or not has_structured_outputs(params))
     )
 
 
@@ -123,22 +129,21 @@ def params_allow_native_greedy(
     output_lengths: Sequence[int] | None = None,
     *,
     allow_constraints: bool = False,
+    allow_penalties: bool = False,
 ) -> bool:
     """Whether MLX argmax matches *sampling_params_list* exactly.
 
-    Greedy temperature with no candidate filters (top-k/top-p), no
-    penalties, no sample logprobs, no logit bias, and no row still pending its
-    min-tokens mask. Synchronous callers can opt into token constraints with
-    resolved output histories. ``None`` counts every row as having generated
-    nothing.
+    Greedy temperature with no candidate filters (top-k/top-p), sample
+    logprobs, logit bias or pending min-tokens mask. Synchronous callers can
+    opt into token constraints and penalties with resolved histories.
+    ``None`` counts every row as having generated nothing.
     """
     return not any_min_tokens_pending(sampling_params_list, output_lengths) and all(
         is_greedy_temperature(params)
         and params.top_k <= 0
         and params.top_p == 1.0
-        and not has_penalties(params)
         and not needs_sample_logprobs(params)
-        and _allows_token_constraints(params, allow_constraints)
+        and _allows_history_processors(params, allow_constraints, allow_penalties)
         and not has_logit_bias(params)
         for params in sampling_params_list
     )
@@ -150,6 +155,7 @@ def params_allow_native_random(
     *,
     allow_seed: bool = False,
     allow_constraints: bool = False,
+    allow_penalties: bool = False,
 ) -> bool:
     """Whether the native MLX sampler supports *sampling_params_list*.
 
@@ -158,18 +164,17 @@ def params_allow_native_random(
     random sampling and differ in top-k/top-p/min-p. Seeded rows need
     ``allow_seed`` (their keys are derived from the seed and output
     position). Requests with sample logprobs, structured outputs, or
-    ``logit_bias`` stay on the torch path. Synchronous callers can apply token
-    constraints with ``allow_constraints``. An empty batch has no rows to
-    draw for, so it is never eligible.
+    ``logit_bias`` stay on the torch path. Synchronous callers can opt into
+    token constraints and penalties with resolved histories. An empty batch
+    has no rows to draw for, so it is never eligible.
     """
     if not sampling_params_list:
         return False
     return not any_min_tokens_pending(sampling_params_list, output_lengths) and all(
         (allow_seed or params.seed is None)
-        and not has_penalties(params)
         and not needs_sample_logprobs(params)
         and not has_structured_outputs(params)
-        and _allows_token_constraints(params, allow_constraints)
+        and _allows_history_processors(params, allow_constraints, allow_penalties)
         and not has_logit_bias(params)
         for params in sampling_params_list
     )

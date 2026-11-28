@@ -319,6 +319,30 @@ class TestSamplingPolicyMatrix:
             params_allow_native_random(params, allow_constraints=True) is sync_allowed
         )
 
+    @pytest.mark.parametrize(
+        ("options", "expected"),
+        [
+            ({}, True),
+            ({"structured_outputs": StructuredOutputsParams(choice=["yes"])}, False),
+        ],
+    )
+    def test_penalties_and_constraints_require_both_opt_ins(self, options, expected):
+        params = [
+            _sp(
+                temperature=0.0,
+                allowed_token_ids=[1, 2],
+                presence_penalty=0.5,
+                **options,
+            )
+        ]
+        for allows in (params_allow_native_greedy, params_allow_native_random):
+            assert not allows(params)
+            assert not allows(params, allow_penalties=True)
+            assert not allows(params, allow_constraints=True)
+            assert (
+                allows(params, allow_penalties=True, allow_constraints=True) is expected
+            )
+
     def test_length_mismatch_raises_only_without_a_pending_row(self) -> None:
         """The min-tokens reduction short-circuits before zip-strict can
         validate a trailing extra length — the pre-policy gate behavior."""

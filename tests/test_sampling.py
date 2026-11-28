@@ -358,10 +358,10 @@ class TestSamplerDevicePolicy:
         ("overrides", "native"),
         [
             (None, False),
-            ({"repetition_penalty": 1.1}, False),
+            ({"repetition_penalty": 1.1}, True),
             ({"logprobs": 1}, False),
             ({"logprob_token_ids": [1, 2]}, False),
-            ({"presence_penalty": 0.5}, False),
+            ({"presence_penalty": 0.5}, True),
             ({"allowed_token_ids": [1, 2]}, True),
         ],
     )

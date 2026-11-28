@@ -23,6 +23,7 @@ from vllm_metal.v1.logits_processors import (
     LogitsProcessors,
 )
 from vllm_metal.v1.native_constraints import apply_native_constraints
+from vllm_metal.v1.native_penalties import apply_native_penalties
 from vllm_metal.v1.sampling import Sampler, SamplingMetadata
 from vllm_metal.v1.sampling.builtin_logits_processors import (
     LogitBiasLogitsProcessor,
@@ -189,12 +190,15 @@ class SamplingBatch:
             for i in self.generators
         )
 
-    def can_use_native_greedy(self, *, allow_constraints: bool = False) -> bool:
+    def can_use_native_greedy(
+        self, *, allow_constraints: bool = False, allow_penalties: bool = False
+    ) -> bool:
         """Return whether MLX argmax matches the requested sampling behavior."""
         return params_allow_native_greedy(
             self.sampling_params_list,
             self.output_lengths,
             allow_constraints=allow_constraints,
+            allow_penalties=allow_penalties,
         )
 
     @classmethod
@@ -728,7 +732,8 @@ def sample_from_logits(
     """Sample tokens from pre-sliced 2D logits ``(batch_size, vocab)``.
 
     Chooses native MLX greedy or random sampling for eligible requests.
-    Synchronous sampling can apply token constraints with committed histories.
+    Synchronous sampling applies token constraints before penalties, using
+    committed histories.
     Other requests, including those asking for sample logprobs, use the
     vLLM torch sampler on ``SamplingBatch.SAMPLER_DEVICE``.
 
@@ -736,23 +741,37 @@ def sample_from_logits(
     caller's array; callers pass logits they do not read again.
     """
     params = batch.sampling_params_list
-    native_greedy = batch.can_use_native_greedy(allow_constraints=True)
+    native_greedy = batch.can_use_native_greedy(
+        allow_constraints=True, allow_penalties=True
+    )
     native_random = (
         not native_greedy
         and next_native_rng_key is not None
         and batch.generators_are_seeded()
         and params_allow_native_random(
-            params, batch.output_lengths, allow_seed=True, allow_constraints=True
+            params,
+            batch.output_lengths,
+            allow_seed=True,
+            allow_constraints=True,
+            allow_penalties=True,
         )
     )
     if native_greedy or native_random:
         constrained = any(map(has_token_constraints, params))
+        penalized = not batch.no_penalties
         native_logits: mx.array | None = logits_2d
-        if constrained or native_random:
+        if constrained or penalized or native_random:
             native_logits = native_logits[..., : batch.vocab_size]
         if constrained:
             native_logits = apply_native_constraints(
                 native_logits, params, batch.output_token_id_lists
+            )
+        if penalized and native_logits is not None:
+            native_logits = apply_native_penalties(
+                native_logits,
+                params,
+                batch.prompt_token_id_lists,
+                batch.output_token_id_lists,
             )
         if native_logits is not None:
             if native_greedy:

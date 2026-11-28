@@ -8,7 +8,9 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
 from tests.stub_runner import make_stub_runner
+from vllm_metal.v1 import sampling_batch
 from vllm_metal.v1.native_constraints import apply_native_constraints
+from vllm_metal.v1.native_penalties import apply_native_penalties
 from vllm_metal.v1.sampling import Sampler
 from vllm_metal.v1.sampling_batch import (
     SamplingBatch,
@@ -759,3 +761,146 @@ class TestNativeConstraints:
         params = SamplingParams(allowed_token_ids=allowed)
         params._bad_words_token_ids = bad_words
         assert apply_native_constraints(mx.array([[0.0, 1.0]]), [params], [[]]) is None
+
+
+class TestNativePenalties:
+    @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+    def test_counts_signs_and_prompt_membership_match_torch(self, dtype):
+        params = [
+            SamplingParams(
+                repetition_penalty=1.5, frequency_penalty=0.5, presence_penalty=-0.25
+            ),
+            SamplingParams(
+                repetition_penalty=0.5, frequency_penalty=-0.5, presence_penalty=0.75
+            ),
+            SamplingParams(),
+            SamplingParams(frequency_penalty=0.25),
+        ]
+        prompts = [[0, 0, 2], [1, 3], [], [0] * 20]
+        outputs = [[1, 1, 1, 2], [2, 2, 4], [-1], [4] * 257]
+        raw = [[4.0, 3.0, -2.0, 0.0, -1.0, float("-inf")]] * 4
+        batch = SamplingBatch(params, prompts, outputs, vocab_size=6)
+        expected = Sampler.apply_penalties(
+            torch.tensor(raw), batch.make_sampling_metadata(), outputs
+        )
+        logits = mx.array(raw, dtype=dtype)
+        actual = apply_native_penalties(logits, params, prompts, outputs)
+
+        assert actual is not None
+        assert actual.dtype == mx.float32
+        torch.testing.assert_close(torch.tensor(actual.tolist()), expected)
+        assert actual[0, 0].item() == pytest.approx(4 / 1.5)
+        assert actual[0, 1].item() == pytest.approx(0.75)
+        assert actual[3, 4].item() == pytest.approx(-65.25)
+        assert logits.tolist() == raw
+
+    @pytest.mark.parametrize("random_row", [False, True])
+    def test_sync_penalties_keep_seed_and_mixed_row_alignment(
+        self, monkeypatch, random_row
+    ):
+        params = [
+            SamplingParams(temperature=0, repetition_penalty=2),
+            SamplingParams(
+                temperature=0.8 if random_row else 0,
+                top_k=1,
+                frequency_penalty=1,
+                seed=17,
+            ),
+        ]
+        batch = SamplingBatch(params, [[0], [0]], [[], [0, 0]], vocab_size=3)
+        sampler = Sampler()
+        monkeypatch.setattr(
+            sampler, "forward", lambda *_: pytest.fail("unexpected Torch fallback")
+        )
+        logits = mx.array([[4.0, 3.0, 0.0, 99.0], [4.0, 3.0, 0.0, 99.0]])
+        result = sample_from_logits(
+            logits,
+            batch,
+            sampler,
+            next_native_rng_key=lambda: pytest.fail("seeded row used the engine key"),
+        )
+        assert result.token_ids == [1, 1]
+        assert not params_allow_native_greedy(params, batch.output_lengths)
+        assert not params_allow_native_random(
+            params, batch.output_lengths, allow_seed=True
+        )
+
+    @pytest.mark.parametrize("temperature", [0.0, 0.8])
+    def test_sync_applies_masks_before_penalties(self, monkeypatch, temperature):
+        sp = SamplingParams(
+            temperature=temperature,
+            top_k=1,
+            seed=17,
+            allowed_token_ids=[0, 1, 2, 3],
+            repetition_penalty=2,
+            frequency_penalty=0.5,
+            presence_penalty=0.25,
+        )
+        sp._bad_words_token_ids = [[1, 0]]
+        logits = mx.array([[10.0, -4.0, 6.0, 4.0, 9.0, 100.0]])
+        batch = SamplingBatch([sp], [[2]], [[1]], vocab_size=5)
+        sampler = Sampler()
+        monkeypatch.setattr(
+            sampler, "forward", lambda *_: pytest.fail("unexpected Torch fallback")
+        )
+
+        def check_masked_scores(scores, *args):
+            assert scores.tolist() == [[-mx.inf, -4.0, 6.0, 4.0, -mx.inf]]
+            return apply_native_penalties(scores, *args)
+
+        monkeypatch.setattr(
+            sampling_batch, "apply_native_penalties", check_masked_scores
+        )
+        result = sample_from_logits(
+            logits, batch, sampler, next_native_rng_key=lambda: mx.random.key(0)
+        )
+        assert result.token_ids == [3]
+
+    @pytest.mark.parametrize(
+        "exhausted", [False, True], ids=["pending-output", "exhausted-mask"]
+    )
+    def test_ineligible_processors_fall_back_with_original_logits(
+        self, monkeypatch, exhausted
+    ):
+        params = SamplingParams(
+            temperature=0.8, presence_penalty=0.5, allowed_token_ids=[1]
+        )
+        outputs = [[-1]]
+        if exhausted:
+            params._bad_words_token_ids = [[1]]
+            outputs = [[]]
+            monkeypatch.setattr(
+                sampling_batch,
+                "apply_native_penalties",
+                lambda *_: pytest.fail("penalties reached an exhausted mask"),
+            )
+        batch = SamplingBatch([params], [[0]], outputs, vocab_size=2)
+        logits = mx.array([[2.0, 1.0]])
+        sampler = Sampler()
+        forward = sampler.forward
+        seen = []
+
+        def record(scores, metadata):
+            seen.append(scores.tolist())
+            return forward(scores, metadata)
+
+        monkeypatch.setattr(sampler, "forward", record)
+        sample_from_logits(
+            logits,
+            batch,
+            sampler,
+            next_native_rng_key=lambda: pytest.fail("fallback advanced native RNG"),
+        )
+        assert seen == [[[2.0, 1.0]]]
+
+    @pytest.mark.parametrize(
+        ("prompt", "output"),
+        [([2], []), ([], [2]), ([3], [])],
+        ids=["prompt-at-boundary", "output-at-boundary", "prompt-beyond-boundary"],
+    )
+    def test_out_of_vocab_history_stays_out_of_scatter(self, prompt, output):
+        params = [SamplingParams(repetition_penalty=1.2)]
+        assert (
+            apply_native_penalties(mx.array([[0.0, 1.0]]), params, [prompt], [output])
+            is None
+        )
