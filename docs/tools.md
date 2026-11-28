@@ -41,8 +41,8 @@ python -m tools.check_parity \
 
 `--method dflash` and `--method draft_model` select external draft models.
 For a Qwen3.5-family target with bundled MTP weights, use `--method mtp`.
-For a split Qwen MTP checkpoint, keep the target as the vLLM model and pass
-the split weights to the Metal proposer:
+Both commands below keep the target as the vLLM model and pass the split
+weights to the Metal proposer.
 
 ```bash
 python tools/check_parity.py --model /path/to/target --method mtp \

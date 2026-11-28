@@ -48,7 +48,7 @@ def run_engine(args):
     )
     if spec is not None and args.dspark_draft_topk is not None:
         spec["dspark_draft_topk"] = args.dspark_draft_topk
-    additional = dict(args.additional_config or {})
+    additional = dict(getattr(args, "additional_config", None) or {})
     if spec is None:
         additional.pop(QWEN_MTP_DRAFTER_KEY, None)
         additional.pop(DSPARK_DRAFT_QUANTIZATION_KEY, None)
@@ -313,12 +313,15 @@ def run(args) -> bool:
                     "-m",
                     "tools.check_parity",
                     *sys.argv[1:],
+                    *(
+                        ["--additional-config", json.dumps(additional)]
+                        if additional
+                        else []
+                    ),
                     "--model",
                     args.target,
                     "--draft",
                     args.draft,
-                    "--additional-config",
-                    json.dumps(additional),
                     "--output-dir",
                     str(args.output_dir),
                     "--worker",
