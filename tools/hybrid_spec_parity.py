@@ -29,6 +29,8 @@ import sys
 import time
 from pathlib import Path
 
+from vllm_metal.config import QWEN_MTP_DRAFTER_KEY
+
 MODEL_DEFAULT = os.environ.get("QWEN35_MODEL_PATH", "Qwen/Qwen3.5-0.8B")
 GPU_MEMORY_UTILIZATION = 0.5
 NUM_SPECULATIVE_TOKENS = 3
@@ -98,7 +100,7 @@ def build_restore_prompt(prompt, generated, checkpoint):
     return history[: checkpoint + 1]
 
 
-def speculative_config(method, draft_model=None):
+def speculative_config(method):
     if method == "ngram":
         return {
             "method": "ngram",
@@ -106,10 +108,7 @@ def speculative_config(method, draft_model=None):
             "prompt_lookup_min": 2,
             "prompt_lookup_max": 3,
         }
-    config = {"method": "mtp", "num_speculative_tokens": NUM_SPECULATIVE_TOKENS}
-    if draft_model is not None:
-        config["model"] = draft_model
-    return config
+    return {"method": "mtp", "num_speculative_tokens": NUM_SPECULATIVE_TOKENS}
 
 
 def run_child(
@@ -234,7 +233,9 @@ def run_child(
             "block_size": 160,
         }
         if enable_spec:
-            kwargs["speculative_config"] = speculative_config(method, draft_model)
+            kwargs["speculative_config"] = speculative_config(method)
+            if draft_model is not None:
+                kwargs["additional_config"] = {QWEN_MTP_DRAFTER_KEY: draft_model}
         llm = LLM(**kwargs)
 
         tok = llm.get_tokenizer()
@@ -438,7 +439,12 @@ def main() -> int:
     ok = True
     if args.draft_model and args.method != "mtp":
         parser.error("--draft-model requires --method mtp")
-    reports = {"model": args.model, "method": args.method, "modes": {}}
+    reports = {
+        "model": args.model,
+        "method": args.method,
+        "draft_model": args.draft_model,
+        "modes": {},
+    }
     for prefix_caching in (False, True):
         mode = "align" if prefix_caching else "none"
         report = run_pair(args.model, prefix_caching, args.method, args.draft_model)

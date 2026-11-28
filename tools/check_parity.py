@@ -506,7 +506,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--additional-config",
-        help="JSON passed to vllm serve --additional-config (serving side only)",
+        type=json.loads,
+        help="JSON object for the serving engines (e.g. qwen_mtp_drafter with --method mtp)",
     )
     parser.add_argument("--generate-reference", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -520,6 +521,10 @@ def main() -> None:
         args.speculative_config, dict
     ):
         parser.error("--speculative-config must be a JSON object")
+    if args.additional_config is not None and not isinstance(
+        args.additional_config, dict
+    ):
+        parser.error("--additional-config must be a JSON object")
     if args.method is not None:
         if args.reference_backend != "mlx-lm":
             parser.error("--method requires the mlx-lm reference backend")
@@ -575,7 +580,9 @@ def main() -> None:
         tuple(args.batch_size),
         args.output_dir,
         args.gpu_memory_utilization,
-        args.additional_config,
+        json.dumps(args.additional_config)
+        if args.additional_config is not None
+        else None,
         args.trust_remote_code,
         speculative_config=args.speculative_config,
         reference_backend=args.reference_backend,
